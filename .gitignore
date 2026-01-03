@@ -1,0 +1,26 @@
+# secrets
+config.py
+.env
+
+# runtime data
+data/prefs.json
+
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# venv
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+services:
+  linkdownloaderbot:
+    build: .
+    container_name: linkdownloaderbot
+    restart: unless-stopped
+    volumes:
+      - ./config.py:/app/config.py:ro
+      - ./main.py:/app/main.py:ro
+      - ./data:/app/data
