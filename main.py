@@ -30,6 +30,10 @@ YTDLP_CONCURRENT_FRAGMENTS = 4
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 PREFS_PATH = os.path.join(DATA_DIR, "prefs.json")
 
+# About (for help messages)
+AUTHOR_NAME = "Avazbek Olimov"
+REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
+
 
 # =========================
 # Telegram init
@@ -72,6 +76,22 @@ def _safe_send_message(chat_id: int, text: str, message_thread_id: Optional[int]
             kwargs["message_thread_id"] = message_thread_id
 
         _bot_call(bot.send_message, chat_id, text, **kwargs)
+    except Exception:
+        pass
+
+
+def _safe_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> None:
+    # Requirement: no notifications, no preview + HTML allowed
+    try:
+        kwargs: Dict[str, Any] = {
+            "disable_web_page_preview": True,
+            "disable_notification": True,
+            "parse_mode": "HTML",
+        }
+        if isinstance(message_thread_id, int):
+            kwargs["message_thread_id"] = message_thread_id
+
+        _bot_call(bot.send_message, chat_id, html_text, **kwargs)
     except Exception:
         pass
 
@@ -340,7 +360,16 @@ def _get_bot_username_lower() -> str:
         return ""
 
 
+def _get_bot_id() -> int:
+    try:
+        me = _bot_call(bot.get_me)
+        return int(getattr(me, "id", 0) or 0)
+    except Exception:
+        return 0
+
+
 BOT_USERNAME_LOWER = _get_bot_username_lower()
+BOT_ID = _get_bot_id()
 
 
 def _contains_bot_mention(text: str) -> bool:
@@ -367,6 +396,66 @@ def _contains_sender_self_mention_or_me(text: str, sender_username: Optional[str
         return re.search(rf"@{re.escape(sender_username.lower())}\b", t) is not None
 
     return False
+
+
+# =========================
+# Help / About text
+# =========================
+
+def _help_text_html(is_group: bool) -> str:
+    bot_mention = f"@{BOT_USERNAME_LOWER}" if BOT_USERNAME_LOWER else "@<bot>"
+
+    if is_group:
+        usage = (
+            "<b>Как пользоваться</b>\n"
+            "• Просто отправляйте ссылку на видео в группу — бот скачает видео, отправит его и затем удалит исходную ссылку.\n"
+            "• Подпись под видео: кликабельная «Ссылка на видео …» + «От Имя Фамилия».\n\n"
+            "<b>Как отключить авто-скачивание для себя</b>\n"
+            f"• Напишите в группе: {bot_mention} @ВашНик\n"
+            "  (можно также написать «me» или «я» вместо ника)\n"
+            "• Повторите команду — включится обратно.\n\n"
+            "<b>Режим вручную (когда Вы отключились ясно)</b>\n"
+            f"• Чтобы скачать: {bot_mention} <ссылка>\n"
+        )
+    else:
+        usage = (
+            "<b>Я бот для групп</b>\n"
+            "Я скачиваю видео по ссылкам (YouTube/Instagram/TikTok/VK/X/Facebook/Telegram и др.) и публикую видео в группе.\n\n"
+            "<b>Что нужно сделать</b>\n"
+            "1) Добавьте меня в группу.\n"
+            "2) Дайте права администратора и разрешение удалять сообщения.\n\n"
+            "<b>Как работает по умолчанию</b>\n"
+            "• Любая ссылка на видео в группе → скачивание → отправка видео → удаление исходной ссылки.\n\n"
+            "<b>Как отключить авто-скачивание для себя</b>\n"
+            f"• В группе напишите: {bot_mention} @ВашНик\n"
+            "  (или «me» / «я»)\n"
+            "• Повторите — включится обратно.\n\n"
+            "<b>Когда авто отключено</b>\n"
+            f"• Скачивание только так: {bot_mention} <ссылка>\n"
+        )
+
+    author = _html_escape_text(AUTHOR_NAME)
+    repo_attr = _html_escape_attr(REPO_URL)
+
+    return (
+        f"{usage}\n"
+        f"Автор: {author}\n"
+        f'<a href="{repo_attr}">Ссылка на репозиторий</a>'
+    )
+
+
+def _try_set_commands() -> None:
+    try:
+        commands = [
+            telebot.types.BotCommand("start", "Инструкция"),
+            telebot.types.BotCommand("help", "Инструкция"),
+        ]
+        _bot_call(bot.set_my_commands, commands)
+    except Exception:
+        pass
+
+
+_try_set_commands()
 
 
 # =========================
@@ -434,6 +523,74 @@ def _worker_loop() -> None:
 for _ in range(WORKERS):
     t = threading.Thread(target=_worker_loop, daemon=True)
     t.start()
+
+
+# =========================
+# Service: bot added to group
+# =========================
+
+@bot.message_handler(content_types=["new_chat_members"])
+def handle_new_chat_members(message):
+    try:
+        if message.chat.type not in ("group", "supergroup"):
+            return
+
+        new_members = getattr(message, "new_chat_members", None) or []
+        if not new_members:
+            return
+
+        is_me = False
+        for u in new_members:
+            try:
+                uid = int(getattr(u, "id", 0) or 0)
+            except Exception:
+                uid = 0
+            uname = (getattr(u, "username", "") or "").lower()
+            if (BOT_ID and uid == BOT_ID) or (BOT_USERNAME_LOWER and uname == BOT_USERNAME_LOWER):
+                is_me = True
+                break
+
+        if not is_me:
+            return
+
+        chat_id = int(message.chat.id)
+        message_thread_id = getattr(message, "message_thread_id", None)
+
+        _safe_send_message_html(chat_id, _help_text_html(is_group=True), message_thread_id=message_thread_id)
+    except Exception:
+        pass
+
+
+# =========================
+# Private: /start, /help, any text
+# =========================
+
+@bot.message_handler(commands=["start", "help"])
+def handle_start_help(message):
+    try:
+        chat_type = getattr(message.chat, "type", "")
+        chat_id = int(message.chat.id)
+        message_thread_id = getattr(message, "message_thread_id", None)
+
+        if chat_type == "private":
+            _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+            return
+
+        if chat_type in ("group", "supergroup"):
+            _safe_send_message_html(chat_id, _help_text_html(is_group=True), message_thread_id=message_thread_id)
+            return
+    except Exception:
+        pass
+
+
+@bot.message_handler(func=lambda m: getattr(m.chat, "type", "") == "private", content_types=["text"])
+def handle_private_any_text(message):
+    try:
+        chat_id = int(message.chat.id)
+        message_thread_id = getattr(message, "message_thread_id", None)
+        _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+    except Exception:
+        pass
 
 
 # =========================
