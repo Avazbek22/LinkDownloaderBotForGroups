@@ -65,7 +65,7 @@ def _extract_first_url(text: str) -> Optional[str]:
     return url
 
 
-def _safe_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> None:
+def _try_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> bool:
     # Requirement: no notifications, no preview
     try:
         kwargs: Dict[str, Any] = {
@@ -76,11 +76,12 @@ def _safe_send_message(chat_id: int, text: str, message_thread_id: Optional[int]
             kwargs["message_thread_id"] = message_thread_id
 
         _bot_call(bot.send_message, chat_id, text, **kwargs)
+        return True
     except Exception:
-        pass
+        return False
 
 
-def _safe_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> None:
+def _try_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> bool:
     # Requirement: no notifications, no preview + HTML allowed
     try:
         kwargs: Dict[str, Any] = {
@@ -92,8 +93,17 @@ def _safe_send_message_html(chat_id: int, html_text: str, message_thread_id: Opt
             kwargs["message_thread_id"] = message_thread_id
 
         _bot_call(bot.send_message, chat_id, html_text, **kwargs)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _safe_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> None:
+    _try_send_message(chat_id, text, message_thread_id=message_thread_id)
+
+
+def _safe_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> None:
+    _try_send_message_html(chat_id, html_text, message_thread_id=message_thread_id)
 
 
 def _safe_delete_message(chat_id: int, message_id: int) -> bool:
@@ -289,7 +299,12 @@ def _ensure_prefs_loaded() -> None:
             return
 
         if not os.path.exists(PREFS_PATH):
-            _prefs_cache = {"version": 1, "opt_out": {}}
+            _prefs_cache = {
+                "version": 2,
+                "opt_out": {},
+                "welcomed_groups": {},
+                "welcomed_private": {},
+            }
             _save_prefs_locked()
             return
 
@@ -298,11 +313,27 @@ def _ensure_prefs_loaded() -> None:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("prefs not dict")
+
             if "opt_out" not in data or not isinstance(data.get("opt_out"), dict):
                 data["opt_out"] = {}
+
+            if "welcomed_groups" not in data or not isinstance(data.get("welcomed_groups"), dict):
+                data["welcomed_groups"] = {}
+
+            if "welcomed_private" not in data or not isinstance(data.get("welcomed_private"), dict):
+                data["welcomed_private"] = {}
+
+            if "version" not in data:
+                data["version"] = 2
+
             _prefs_cache = data
         except Exception:
-            _prefs_cache = {"version": 1, "opt_out": {}}
+            _prefs_cache = {
+                "version": 2,
+                "opt_out": {},
+                "welcomed_groups": {},
+                "welcomed_private": {},
+            }
             _save_prefs_locked()
 
 
@@ -345,6 +376,32 @@ def _toggle_opt_out(chat_id: int, user_id: int) -> bool:
 
         _save_prefs_locked()
         return new_value
+
+
+def _was_group_welcomed(chat_id: int) -> bool:
+    _ensure_prefs_loaded()
+    with _prefs_lock:
+        return bool(_prefs_cache.get("welcomed_groups", {}).get(str(chat_id), False))
+
+
+def _mark_group_welcomed(chat_id: int) -> None:
+    _ensure_prefs_loaded()
+    with _prefs_lock:
+        _prefs_cache.setdefault("welcomed_groups", {})[str(chat_id)] = True
+        _save_prefs_locked()
+
+
+def _was_private_welcomed(user_id: int) -> bool:
+    _ensure_prefs_loaded()
+    with _prefs_lock:
+        return bool(_prefs_cache.get("welcomed_private", {}).get(str(user_id), False))
+
+
+def _mark_private_welcomed(user_id: int) -> None:
+    _ensure_prefs_loaded()
+    with _prefs_lock:
+        _prefs_cache.setdefault("welcomed_private", {})[str(user_id)] = True
+        _save_prefs_locked()
 
 
 # =========================
@@ -414,7 +471,7 @@ def _help_text_html(is_group: bool) -> str:
             f"• Напишите в группе: {bot_mention} @ВашНик\n"
             "  (можно также написать «me» или «я» вместо ника)\n"
             "• Повторите команду — включится обратно.\n\n"
-            "<b>Режим вручную (когда Вы отключились ясно)</b>\n"
+            "<b>Режим вручную (когда Вы отключились)</b>\n"
             f"• Чтобы скачать: {bot_mention} <ссылка>\n"
         )
     else:
@@ -442,6 +499,27 @@ def _help_text_html(is_group: bool) -> str:
         f"Автор: {author}\n"
         f'<a href="{repo_attr}">Ссылка на репозиторий</a>'
     )
+
+
+def _bot_admin_hint_html(chat_id: int) -> str:
+    """
+    Небольшая подсказка, если бот не админ (чтобы пользователи понимали,
+    почему ссылки не удаляются).
+    """
+    try:
+        if not BOT_ID:
+            return ""
+        cm = _bot_call(bot.get_chat_member, chat_id, BOT_ID)
+        status = (getattr(cm, "status", "") or "").lower()
+        is_admin = status in ("administrator", "creator")
+        if is_admin:
+            return ""
+        return (
+            "⚠️ <b>Важно</b>\n"
+            "Чтобы бот мог <b>удалять исходные ссылки</b>, назначьте его администратором и включите право «Удалять сообщения».\n\n"
+        )
+    except Exception:
+        return ""
 
 
 def _try_set_commands() -> None:
@@ -526,7 +604,7 @@ for _ in range(WORKERS):
 
 
 # =========================
-# Service: bot added to group
+# Service: bot added to group (one-time per group)
 # =========================
 
 @bot.message_handler(content_types=["new_chat_members"])
@@ -556,13 +634,21 @@ def handle_new_chat_members(message):
         chat_id = int(message.chat.id)
         message_thread_id = getattr(message, "message_thread_id", None)
 
-        _safe_send_message_html(chat_id, _help_text_html(is_group=True), message_thread_id=message_thread_id)
+        # One-time per group
+        if _was_group_welcomed(chat_id):
+            return
+
+        html_text = _bot_admin_hint_html(chat_id) + _help_text_html(is_group=True)
+
+        if _try_send_message_html(chat_id, html_text, message_thread_id=message_thread_id):
+            _mark_group_welcomed(chat_id)
+
     except Exception:
         pass
 
 
 # =========================
-# Private: /start, /help, any text
+# Private: /start, /help, any text (one-time welcome per user)
 # =========================
 
 @bot.message_handler(commands=["start", "help"])
@@ -573,7 +659,21 @@ def handle_start_help(message):
         message_thread_id = getattr(message, "message_thread_id", None)
 
         if chat_type == "private":
-            _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+            user_id = int(getattr(message.from_user, "id", 0) or 0)
+
+            # /help всегда показывает полную инструкцию
+            if (message.text or "").strip().lower().startswith("/help"):
+                _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+                _mark_private_welcomed(user_id)
+                return
+
+            # /start — один раз полная инструкция, дальше коротко
+            if not _was_private_welcomed(user_id):
+                _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+                _mark_private_welcomed(user_id)
+            else:
+                _safe_send_message(chat_id, "Инструкция уже отправлялась. Нажмите /help чтобы показать её снова.",
+                                   message_thread_id=message_thread_id)
             return
 
         if chat_type in ("group", "supergroup"):
@@ -587,8 +687,15 @@ def handle_start_help(message):
 def handle_private_any_text(message):
     try:
         chat_id = int(message.chat.id)
+        user_id = int(getattr(message.from_user, "id", 0) or 0)
         message_thread_id = getattr(message, "message_thread_id", None)
-        _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+
+        if not _was_private_welcomed(user_id):
+            _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
+            _mark_private_welcomed(user_id)
+            return
+
+        _safe_send_message(chat_id, "Нажмите /help чтобы увидеть инструкцию.", message_thread_id=message_thread_id)
     except Exception:
         pass
 
