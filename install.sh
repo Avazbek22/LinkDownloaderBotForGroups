@@ -3,16 +3,19 @@ set -euo pipefail
 
 REPO="https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 BRANCH="main"
+
 install_dir="${INSTALL_DIR:-$PWD/LinkDownloaderBotForGroups}"
-SERVICE_NAME="linkdownloaderbot"
-COMPOSE_PROJECT="linkdownloaderbotforgroups"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
+SERVICE_KEY="${SERVICE_KEY:-linkdownloaderbot}"   # имя сервиса в docker-compose.yml
+
 PYTHON_BIN="python3"
 VENV_DIR=".venv"
 
-say() { echo -e "\n\033[1m\033[36m$*\033[0m"; }
-ok()  { echo -e "\033[32m✔\033[0m $*"; }
-warn(){ echo -e "\033[33m⚠\033[0m $*" >&2; }
-die() { echo -e "\033[31m✖\033[0m $*" >&2; exit 1; }
+# ---------- UI helpers ----------
+say()  { echo -e "\n\033[1m\033[36m$*\033[0m"; }
+ok()   { echo -e "\033[32m✔\033[0m $*"; }
+warn() { echo -e "\033[33m⚠\033[0m $*" >&2; }
+die()  { echo -e "\033[31m✖\033[0m $*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -33,7 +36,7 @@ apt_install() {
 read_yes_no() {
   local prompt="$1"
   local default="${2:-Y}"
-  local ans
+  local ans=""
   read -r -p "$prompt " ans || true
   ans="${ans:-$default}"
   case "$ans" in
@@ -54,13 +57,14 @@ detect_compose() {
   return 1
 }
 
+# ---------- deps ----------
 ensure_deps_basic() {
   say "Installing dependencies"
-  apt_install git curl ca-certificates ffmpeg "$PYTHON_BIN" "$PYTHON_BIN-venv" "$PYTHON_BIN-pip
-" || true
+  apt_install git curl ca-certificates ffmpeg "$PYTHON_BIN" "$PYTHON_BIN-venv" "$PYTHON_BIN-pip" || true
   ok "Dependencies are installed (or already present)."
 }
 
+# ---------- repo ----------
 clone_or_update_repo() {
   say "Repository"
   if [[ -d "$install_dir/.git" ]]; then
@@ -74,36 +78,7 @@ clone_or_update_repo() {
   ok "Repo is ready."
 }
 
-read_bot_token() {
-  local token="${BOT_TOKEN:-}"
-
-  if [[ -z "$token" ]]; then
-    say "Enter your Telegram bot token."
-    warn "Input is hidden by default (security). Paste the token and press Enter."
-    warn "If you really want the token to be visible while typing/pasting, run: SHOW_TOKEN_INPUT=1 ./install.sh"
-    if [[ "${SHOW_TOKEN_INPUT:-0}" == "1" ]]; then
-      read -r -p "BOT_TOKEN: " token
-    else
-      read -r -s -p "BOT_TOKEN: " token
-      echo
-    fi
-  fi
-
-  # cleanup (handles Windows CRLF and accidental spaces)
-  token="$(printf '%s' "$token" | tr -d '\r\n' | xargs)"
-
-  if [[ -z "$token" ]]; then
-    die "Empty BOT_TOKEN."
-  fi
-
-  # basic sanity check (do not block on it, just warn)
-  if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]; then
-    warn "BOT_TOKEN format looks unusual. If the bot doesn't start, re-check the token in BotFather."
-  fi
-
-  echo "$token"
-}
-
+# ---------- token / env ----------
 mask_token() {
   local t="$1"
   local len="${#t}"
@@ -114,13 +89,48 @@ mask_token() {
   echo "${t:0:5}...${t: -5} ($len chars)"
 }
 
+read_bot_token() {
+  local token="${BOT_TOKEN:-}"
+
+  if [[ -z "$token" ]]; then
+    # ВАЖНО: всё, что не токен — только в stderr, чтобы $(read_bot_token) не захватывал мусор
+    warn ""
+    warn "Enter your Telegram bot token."
+    warn "Input is hidden by default (security). Paste the token and press Enter."
+    warn "If you really want visible input, run: SHOW_TOKEN_INPUT=1 ./install.sh"
+
+    if [[ "${SHOW_TOKEN_INPUT:-0}" == "1" ]]; then
+      >&2 printf "BOT_TOKEN: "
+      read -r token || true
+    else
+      >&2 printf "BOT_TOKEN: "
+      read -r -s token || true
+      >&2 echo
+    fi
+  fi
+
+  # cleanup (handles Windows CRLF and accidental spaces)
+  token="$(printf '%s' "$token" | tr -d '\r\n' | xargs)"
+
+  if [[ -z "$token" ]]; then
+    die "Empty BOT_TOKEN."
+  fi
+
+  # basic sanity check (warn only)
+  if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]; then
+    warn "BOT_TOKEN format looks unusual. If the bot doesn't start, re-check the token in BotFather."
+  fi
+
+  # stdout MUST contain only token
+  printf '%s' "$token"
+}
+
 write_env_and_config() {
   local env_path="$install_dir/.env"
   local cfg_path="$install_dir/config.py"
 
   say "Config"
 
-  # 1) Ensure .env with BOT_TOKEN (do not overwrite a non-empty existing token unless forced)
   local existing_token=""
   if [[ -f "$env_path" ]]; then
     existing_token="$(grep -m1 '^BOT_TOKEN=' "$env_path" | cut -d= -f2- | tr -d '\r\n' | xargs || true)"
@@ -135,12 +145,19 @@ write_env_and_config() {
     ok "Using existing .env BOT_TOKEN: $(mask_token "$token")"
   else
     token="$(read_bot_token)"
-    printf 'BOT_TOKEN=%s\n' "$token" > "$env_path"
+    {
+      echo "BOT_TOKEN=$token"
+      echo "# Optional:"
+      echo "# LOGS_CHAT_ID=123456789"
+      echo "# MAX_FILESIZE=52428800"
+      echo "# OUTPUT_FOLDER=/tmp/yt-dlp-telegram"
+      echo "# COOKIES_FILE=/app/cookies.txt"
+    } > "$env_path"
     chmod 600 "$env_path" 2>/dev/null || true
     ok ".env written: $(mask_token "$token")"
   fi
 
-  # 2) Create config.py (no secrets inside). Keep existing unless forced.
+  # config.py без секретов (как у Вас сейчас рабочий вариант)
   if [[ -f "$cfg_path" && "${FORCE_CONFIG:-0}" != "1" ]]; then
     ok "config.py already exists — keeping it."
     return 0
@@ -184,75 +201,7 @@ PY
   ok "config.py written (no secrets)."
 }
 
-patch_docker_compose_safely() {
-  local compose_path="$install_dir/docker-compose.yml"
-  [[ -f "$compose_path" ]] || die "docker-compose.yml not found in $install_dir"
-
-  say "docker-compose.yml patch"
-
-  cp -a "$compose_path" "$compose_path.bak.$(date +%s)"
-
-  # Ensure env_file: .env
-  if ! grep -qE '^\s*env_file:\s*$' "$compose_path"; then
-    awk '
-      BEGIN{added=0}
-      /container_name:/ && added==0{
-        print $0
-        print "    env_file:"
-        print "      - .env"
-        added=1
-        next
-      }
-      {print $0}
-      END{
-        if(added==0){
-          # fallback: add under service block start
-        }
-      }
-    ' "$compose_path" > "$compose_path.tmp" && mv "$compose_path.tmp" "$compose_path"
-    ok "Added env_file: .env"
-  else
-    ok "env_file already present"
-  fi
-
-  # Ensure volumes include config and data (main.py is already present in repo compose)
-  if ! grep -q './config.py:/app/config.py:ro' "$compose_path"; then
-    awk '
-      BEGIN{invol=0; added=0}
-      /^\s*volumes:\s*$/ {invol=1; print; next}
-      invol==1 && added==0 && /^\s*-\s*\.\// {
-        print "      - ./config.py:/app/config.py:ro"
-        added=1
-      }
-      {print}
-    ' "$compose_path" > "$compose_path.tmp" && mv "$compose_path.tmp" "$compose_path"
-    ok "Ensured config.py mount"
-  else
-    ok "config.py mount already present"
-  fi
-
-  if ! grep -q './data:/app/data' "$compose_path"; then
-    awk '
-      BEGIN{invol=0}
-      /^\s*volumes:\s*$/ {invol=1; print; next}
-      invol==1 && /^\s*-\s*\./ {print; next}
-      invol==1 && /^\s*$/ {print "      - ./data:/app/data"; invol=0; next}
-      {print}
-    ' "$compose_path" > "$compose_path.tmp" && mv "$compose_path.tmp" "$compose_path"
-    ok "Ensured data mount"
-  else
-    ok "data mount already present"
-  fi
-}
-
-stop_conflicting_containers() {
-  say "Stopping conflicting containers (if any)"
-  if need_cmd docker; then
-    docker ps -a --format '{{.Names}}' | grep -q "^$SERVICE_NAME$" && docker rm -f "$SERVICE_NAME" >/dev/null 2>&1 || true
-  fi
-  ok "Done."
-}
-
+# ---------- docker ----------
 ensure_docker() {
   say "Docker"
   if ! need_cmd docker; then
@@ -260,37 +209,71 @@ ensure_docker() {
     apt_install docker.io
   fi
 
-  local compose_cmd
+  local compose_cmd=""
   compose_cmd="$(detect_compose)" || true
   if [[ -z "${compose_cmd:-}" ]]; then
     warn "Docker Compose not found. Installing docker-compose..."
     apt_install docker-compose
   fi
+
   ok "Docker is ready."
+}
+
+ensure_compose_override() {
+  # НЕ ТРОГАЕМ docker-compose.yml (чтобы git pull не конфликтовал).
+  # Делаем docker-compose.override.yml, который compose подхватит автоматически.
+  local override_path="$install_dir/docker-compose.override.yml"
+
+  say "Docker Compose override"
+  cat > "$override_path" <<YML
+services:
+  ${SERVICE_KEY}:
+    env_file:
+      - .env
+    volumes:
+      - ./config.py:/app/config.py:ro
+      - ./data:/app/data
+YML
+
+  ok "Written: docker-compose.override.yml (no changes to docker-compose.yml)."
+}
+
+stop_conflicting_containers() {
+  say "Stopping old container (if any)"
+  docker rm -f linkdownloaderbot 2>/dev/null || true
+  ok "Done."
 }
 
 run_with_compose() {
   say "Running with Docker Compose"
   local compose_cmd
   compose_cmd="$(detect_compose)" || die "docker compose / docker-compose not found"
+
   cd "$install_dir"
+
+  # data folder for prefs.json etc.
+  mkdir -p data
+
   $compose_cmd -p "$COMPOSE_PROJECT" up -d --build
-  ok "Started. Check logs:"
+  ok "Started. Logs:"
   echo "  cd \"$install_dir\""
   echo "  $compose_cmd -p \"$COMPOSE_PROJECT\" logs -f --tail=200"
 }
 
+# ---------- system mode ----------
 install_system_mode() {
   say "System mode (venv)"
   cd "$install_dir"
+
   if [[ ! -d "$VENV_DIR" ]]; then
     "$PYTHON_BIN" -m venv "$VENV_DIR"
     ok "venv created: $VENV_DIR"
   fi
+
   "$VENV_DIR/bin/pip" install -r requirements.txt
   ok "Dependencies installed."
 
-  warn "Systemd service generation is not included here; Docker mode is recommended on servers."
+  warn "Systemd generation is not included here; Docker mode is recommended on servers."
   echo "Run manually:"
   echo "  cd \"$install_dir\""
   echo "  $VENV_DIR/bin/python main.py"
@@ -305,7 +288,7 @@ main() {
 
   if read_yes_no "Install & run using Docker? [Y/n]" "Y"; then
     ensure_docker
-    patch_docker_compose_safely
+    ensure_compose_override
     stop_conflicting_containers
     run_with_compose
   else
