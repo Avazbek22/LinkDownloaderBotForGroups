@@ -1,11 +1,18 @@
-# Copy this file to "config.py" and edit values.
+import os
 
-token = "PUT_YOUR_BOT_TOKEN_HERE"  # telegram bot token (from @BotFather)
+# Example config (no secrets stored here).
+# Put your real BOT_TOKEN into .env (or set it as an environment variable).
 
-logs = None  # logs chat id (optional). Example: -1001234567890
+token = (os.getenv("BOT_TOKEN") or "").strip()
+if not token:
+    raise RuntimeError("BOT_TOKEN is not set. Put it into .env or environment variables.")
 
-max_filesize = 50_000_000  # bytes (Telegram Bot API bot upload limit is usually 50 MB)
+logs_raw = (os.getenv("LOGS_CHAT_ID") or "").strip()
+logs = int(logs_raw) if logs_raw else None
 
-output_folder = "/tmp/yt-dlp-telegram"  # temp folder inside container
+max_filesize_raw = (os.getenv("MAX_FILESIZE") or "").strip()
+max_filesize = int(max_filesize_raw) if max_filesize_raw else 50 * 1024 * 1024
 
-cookies_file = None  # optional: path to cookies.txt inside container (advanced)
+output_folder = (os.getenv("OUTPUT_FOLDER") or "/tmp/yt-dlp-telegram").strip() or "/tmp/yt-dlp-telegram"
+
+cookies_file = (os.getenv("COOKIES_FILE") or "").strip() or None
