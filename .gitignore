@@ -1,26 +1,11 @@
-# secrets
-config.py
-.env
-
-# runtime data
-data/prefs.json
-
-# python junk
+# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-
-# venv
 .venv/
 venv/
 
-# IDE
-.idea/
-.vscode/
+# Secrets
+.env
 
-# OS
-.DS_Store
-Thumbs.db
+# Runtime / cache
+data/
