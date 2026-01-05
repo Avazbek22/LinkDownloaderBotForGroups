@@ -133,74 +133,106 @@ def _log_request(message, url: str) -> None:
         pass
 
 
+def _is_intermediate_ytdlp_file(prefix: str, filename: str) -> bool:
+    """
+    yt-dlp промежуточные файлы при separate выглядят как:
+    PREFIX.f137.mp4, PREFIX.f140.m4a, PREFIX.f248.webm и т.п.
+    """
+    if not filename.startswith(prefix + "."):
+        return False
+    # .part / .ytdl / temp сразу считаем мусором/промежуточным
+    low = filename.lower()
+    if low.endswith(".part") or low.endswith(".ytdl") or low.endswith(".tmp") or low.endswith(".temp"):
+        return True
+    # PREFIX.f<digits>.ext
+    return re.match(rf"^{re.escape(prefix)}\.f\d+\.", filename) is not None
+
+
 def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str) -> Optional[str]:
     """
-    Улучшено аккуратно (без изменения UX):
-    - сначала requested_downloads[*].filepath
-    - затем поиск по prefix, предпочитая .mp4 и самый свежий файл
+    КРИТИЧНО: сначала ищем финальный файл PREFIX.mp4.
+    Именно он является результатом merge и содержит аудио.
     """
-    # 1) preferred: requested_downloads[*].filepath
+    # 0) Best: final merged/progressive file by outtmpl base
+    final_mp4 = os.path.join(output_folder, f"{prefix}.mp4")
+    if os.path.exists(final_mp4):
+        return final_mp4
+
+    # 1) Sometimes yt-dlp gives final path in these keys
     try:
-        reqs = info.get("requested_downloads") or []
-        # prefer mp4 if multiple
-        mp4_candidates = []
-        other_candidates = []
-        for r in reqs:
-            fp = r.get("filepath")
+        for key in ("filepath", "_filename"):
+            fp = info.get(key)
             if fp and os.path.exists(fp):
-                if fp.lower().endswith(".mp4"):
-                    mp4_candidates.append(fp)
-                else:
-                    other_candidates.append(fp)
-        if mp4_candidates:
-            return mp4_candidates[0]
-        if other_candidates:
-            return other_candidates[0]
+                return fp
     except Exception:
         pass
 
-    # 2) fallback: search by prefix in output folder
+    # 2) If info has requested_downloads, НЕ берём первый попавшийся mp4 (это часто video-only).
+    # Берём лучше "не промежуточный" и предпочитаем тот, что без ".f123."
     try:
-        best_fp = None
-        best_mtime = -1.0
-        best_is_mp4 = False
+        reqs = info.get("requested_downloads") or []
+        candidates = []
+        for r in reqs:
+            fp = r.get("filepath")
+            if not fp or not os.path.exists(fp):
+                continue
+            fn = os.path.basename(fp)
+            candidates.append(fp)
 
+        # Prefer non-intermediate
+        non_intermediate = [fp for fp in candidates if not _is_intermediate_ytdlp_file(prefix, os.path.basename(fp))]
+        if non_intermediate:
+            # Prefer mp4 among them
+            mp4 = [fp for fp in non_intermediate if fp.lower().endswith(".mp4")]
+            return mp4[0] if mp4 else non_intermediate[0]
+    except Exception:
+        pass
+
+    # 3) Fallback: scan folder, prefer exact PREFIX.<ext> (without .f123), then mp4, newest
+    try:
+        files = []
         for fn in os.listdir(output_folder):
             if not fn.startswith(prefix):
+                continue
+            low = fn.lower()
+            if low.endswith(".part") or low.endswith(".ytdl") or low.endswith(".tmp") or low.endswith(".temp"):
                 continue
             fp = os.path.join(output_folder, fn)
             if not os.path.exists(fp):
                 continue
+            files.append(fp)
 
-            is_mp4 = fn.lower().endswith(".mp4")
-            try:
-                mtime = float(os.path.getmtime(fp))
-            except Exception:
-                mtime = 0.0
+        if not files:
+            return None
 
-            # prefer mp4; within same type prefer newest
-            if best_fp is None:
-                best_fp = fp
-                best_mtime = mtime
-                best_is_mp4 = is_mp4
-                continue
+        # Prefer "base" file: PREFIX.<ext> (no extra dots except ext)
+        base_like = []
+        for fp in files:
+            fn = os.path.basename(fp)
+            if fn.startswith(prefix + ".") and fn.count(".") == 1:
+                base_like.append(fp)
 
-            if is_mp4 and not best_is_mp4:
-                best_fp = fp
-                best_mtime = mtime
-                best_is_mp4 = True
-                continue
+        if base_like:
+            mp4 = [fp for fp in base_like if fp.lower().endswith(".mp4")]
+            if mp4:
+                return mp4[0]
+            return base_like[0]
 
-            if is_mp4 == best_is_mp4 and mtime >= best_mtime:
-                best_fp = fp
-                best_mtime = mtime
-                best_is_mp4 = is_mp4
+        # Else prefer mp4 that is not intermediate
+        non_intermediate_mp4 = [
+            fp for fp in files
+            if fp.lower().endswith(".mp4") and not _is_intermediate_ytdlp_file(prefix, os.path.basename(fp))
+        ]
+        if non_intermediate_mp4:
+            # newest
+            non_intermediate_mp4.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return non_intermediate_mp4[0]
 
-        return best_fp
+        # last resort: newest file
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return files[0]
     except Exception:
-        pass
-
-    return None
+        return None
 
 
 def _cleanup_files(prefix: str, output_folder: str) -> None:
@@ -218,7 +250,7 @@ def _cleanup_files(prefix: str, output_folder: str) -> None:
 
 
 # =========================
-# Download planning (match main.py 1 logic)
+# Download planning (match main.py 1 behavior)
 # =========================
 
 def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
@@ -229,10 +261,6 @@ def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
 
 
 def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
-    """
-    Возвращает (size_bytes, confident).
-    Этот расчёт здесь не для блокировки, а чтобы максимально повторить “планирование” первого бота.
-    """
     fs = fmt.get("filesize")
     if isinstance(fs, int) and fs > 0:
         return fs, True
@@ -250,10 +278,22 @@ def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optiona
     return None, False
 
 
+def _vcodec_pref_rank(vcodec: Any) -> int:
+    """
+    Чтобы избегать ситуаций "чёрный экран" из-за неподдерживаемых кодеков Telegram,
+    отдаём приоритет H.264 (avc1) внутри mp4. Это соответствует поведению первого бота,
+    который чаще всего выбирает progressive mp4 (обычно avc1+aac).
+    """
+    s = str(vcodec or "")
+    return 2 if s.startswith("avc1") else 1
+
+
+def _acodec_pref_rank(acodec: Any) -> int:
+    s = str(acodec or "")
+    return 2 if s.startswith("mp4a") else 1
+
+
 def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Как в первом боте: лучший progressive MP4 (video+audio в одном файле).
-    """
     best = None
     best_key = None
 
@@ -270,7 +310,11 @@ def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         height = f.get("height") or 0
         fps = f.get("fps") or 0
         tbr = f.get("tbr") or 0
-        key = (int(height), int(fps), float(tbr))
+
+        v_rank = _vcodec_pref_rank(f.get("vcodec"))
+        a_rank = _acodec_pref_rank(f.get("acodec"))
+
+        key = (int(v_rank), int(a_rank), int(height), int(fps), float(tbr))
 
         if best is None or key > best_key:
             best = {
@@ -284,9 +328,6 @@ def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Как в первом боте: лучший mp4 video-only + лучший m4a/mp4 audio-only.
-    """
     dur = _duration_sec(meta)
 
     best_v = None
@@ -308,7 +349,9 @@ def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             height = f.get("height") or 0
             fps = f.get("fps") or 0
             tbr = f.get("tbr") or 0
-            key = (int(height), int(fps), float(tbr))
+
+            v_rank = _vcodec_pref_rank(vcodec)
+            key = (int(v_rank), int(height), int(fps), float(tbr))
 
             if best_v is None or key > best_v_key:
                 size, conf = _format_size_bytes(f, dur)
@@ -322,7 +365,8 @@ def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 continue
 
             abr = f.get("abr") or f.get("tbr") or 0
-            key = float(abr)
+            a_rank = _acodec_pref_rank(acodec)
+            key = (int(a_rank), float(abr))
 
             if best_a is None or key > best_a_key:
                 size, conf = _format_size_bytes(f, dur)
@@ -342,11 +386,6 @@ def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _build_video_plan_like_main1(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    1) progressive mp4 (предпочтение как в первом боте)
-    2) separate mp4+m4a
-    3) иначе None (дальше используем старый fallback)
-    """
     p = _best_progressive_mp4(meta)
     if p:
         return p
@@ -360,10 +399,9 @@ def _build_video_plan_like_main1(meta: Dict[str, Any]) -> Optional[Dict[str, Any
 
 def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
     """
-    Исправлено: выбор формата теперь совпадает по логике с первым ботом:
-    - сначала progressive mp4 (обычно меньше и стабильнее)
-    - затем mp4 video-only + m4a/mp4 audio-only
-    - merge_output_format ставим только когда реально склеиваем
+    Исправлено:
+    - выбор формата как у первого бота (progressive mp4 -> separate mp4+m4a)
+    - merge_output_format только когда реально separate
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -380,7 +418,6 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     }
 
-    # 1) meta first (like main.py 1 planning)
     meta_opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -397,14 +434,13 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
 
     plan = _build_video_plan_like_main1(meta)
 
-    # 2) download using the plan; if no plan, keep your old fallback as last resort
     if plan:
         format_value = str(plan.get("format_spec"))
         merge_value = plan.get("merge_output_format")
     else:
-        # Your original fallback (but as last resort)
+        # Ваш прежний fallback как самый последний вариант
         format_value = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-        merge_value = "mp4"  # keep original behavior for fallback only
+        merge_value = "mp4"
 
     ydl_opts: Dict[str, Any] = {
         "format": format_value,
@@ -420,7 +456,6 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
         "http_headers": http_headers,
     }
 
-    # IMPORTANT: set merge_output_format only when needed
     if merge_value:
         ydl_opts["merge_output_format"] = str(merge_value)
 
@@ -505,7 +540,6 @@ def _html_escape_text(s: str) -> str:
 
 
 def _html_escape_attr(s: str) -> str:
-    # for href="...": escape quotes too
     return html.escape(s or "", quote=True)
 
 
@@ -582,11 +616,6 @@ def _is_opted_out(chat_id: int, user_id: int) -> bool:
 
 
 def _toggle_opt_out(chat_id: int, user_id: int) -> bool:
-    """
-    Returns new state:
-    True  -> opted out (auto disabled, needs mention)
-    False -> auto enabled
-    """
     _ensure_prefs_loaded()
     with _prefs_lock:
         opt_out = _prefs_cache.setdefault("opt_out", {})
@@ -730,10 +759,6 @@ def _help_text_html(is_group: bool) -> str:
 
 
 def _bot_admin_hint_html(chat_id: int) -> str:
-    """
-    Небольшая подсказка, если бот не админ (чтобы пользователи понимали,
-    почему ссылки не удаляются).
-    """
     try:
         if not BOT_ID:
             return ""
@@ -793,7 +818,6 @@ def _process_job(job_dict: Dict[str, Any]) -> None:
         if not file_path or not os.path.exists(file_path):
             raise RuntimeError("Downloaded file not found")
 
-        # Make the first line clickable (HTML link) to the original URL
         url_attr = _html_escape_attr(job.url)
         source_text = _html_escape_text(job.source_name)
         sender_text = _html_escape_text(job.sender_full_name)
@@ -862,7 +886,6 @@ def handle_new_chat_members(message):
         chat_id = int(message.chat.id)
         message_thread_id = getattr(message, "message_thread_id", None)
 
-        # One-time per group
         if _was_group_welcomed(chat_id):
             return
 
@@ -889,13 +912,11 @@ def handle_start_help(message):
         if chat_type == "private":
             user_id = int(getattr(message.from_user, "id", 0) or 0)
 
-            # /help всегда показывает полную инструкцию
             if (message.text or "").strip().lower().startswith("/help"):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
                 return
 
-            # /start — один раз полная инструкция, дальше коротко
             if not _was_private_welcomed(user_id):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
@@ -953,7 +974,6 @@ def handle_group_messages(message):
         message_thread_id = getattr(message, "message_thread_id", None)
         bot_mentioned = _contains_bot_mention(text)
 
-        # Toggle opt-out (self only)
         sender_username = getattr(message.from_user, "username", None)
         if bot_mentioned and _contains_sender_self_mention_or_me(text, sender_username):
             new_opt_out = _toggle_opt_out(chat_id, user_id)
@@ -990,13 +1010,9 @@ def handle_group_messages(message):
 
         opted_out = _is_opted_out(chat_id, user_id)
 
-        # If user opted out -> only handle explicit mention with URL
         if opted_out and not bot_mentioned:
             return
 
-        # Fail behavior:
-        # - auto: silent
-        # - explicit mention (when opted out): notify "Не удалось скачать" (silent)
         notify_on_fail = bool(opted_out and bot_mentioned)
 
         job = {
