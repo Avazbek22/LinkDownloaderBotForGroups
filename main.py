@@ -7,8 +7,9 @@ import re
 import uuid
 import queue
 import threading
+import subprocess
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 import telebot
@@ -34,9 +35,8 @@ PREFS_PATH = os.path.join(DATA_DIR, "prefs.json")
 AUTHOR_NAME = "Avazbek Olimov"
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 
-# In practice: avoid sending audio-only as video (black screen + sound)
+# Avoid sending audio-only as video
 _AUDIO_ONLY_EXTS = {".m4a", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".flac"}
-# Telegram best compatibility
 _PREFERRED_VIDEO_EXT = ".mp4"
 
 
@@ -71,7 +71,6 @@ def _extract_first_url(text: str) -> Optional[str]:
 
 
 def _try_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> bool:
-    # Requirement: no notifications, no preview
     try:
         kwargs: Dict[str, Any] = {
             "disable_web_page_preview": True,
@@ -87,7 +86,6 @@ def _try_send_message(chat_id: int, text: str, message_thread_id: Optional[int] 
 
 
 def _try_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> bool:
-    # Requirement: no notifications, no preview + HTML allowed
     try:
         kwargs: Dict[str, Any] = {
             "disable_web_page_preview": True,
@@ -155,12 +153,58 @@ def _is_good_downloaded_file(fp: str) -> bool:
         return False
 
 
+def _has_audio_stream(file_path: str) -> bool:
+    """
+    True if file contains at least one audio stream (ffprobe).
+    """
+    try:
+        if not _is_good_downloaded_file(file_path):
+            return False
+
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "json", file_path],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if p.returncode != 0:
+            return False
+
+        data = json.loads(p.stdout or "{}")
+        streams = data.get("streams") or []
+        return bool(isinstance(streams, list) and len(streams) > 0)
+    except Exception:
+        return False
+
+
+def _find_final_mp4(prefix: str, output_folder: str) -> Optional[str]:
+    fp = os.path.join(output_folder, f"{prefix}.mp4")
+    if _is_good_downloaded_file(fp):
+        return fp
+    return None
+
+
 def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str) -> Optional[str]:
     """
-    Prefer real finished video files.
-    Important: never pick .part and never pick audio-only if we can avoid it.
+    IMPORTANT:
+    1) Always prefer final merged file: prefix.mp4
+    2) Otherwise fallback to info/requested_downloads
+    3) Never pick .part
     """
-    # 1) preferred: requested_downloads[*].filepath
+    # 0) best: final merged/progressive file
+    final_mp4 = _find_final_mp4(prefix, output_folder)
+    if final_mp4:
+        return final_mp4
+
+    # 1) try some common fields
+    try:
+        fp = info.get("filepath") or info.get("_filename")
+        if fp and _is_good_downloaded_file(fp):
+            return fp
+    except Exception:
+        pass
+
+    # 2) requested_downloads[*].filepath (may include intermediates)
     try:
         reqs = info.get("requested_downloads") or []
         candidates: List[str] = []
@@ -169,12 +213,12 @@ def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str)
             if fp and _is_good_downloaded_file(fp):
                 candidates.append(fp)
 
-        # Prefer mp4 if present
+        # Prefer mp4
         for fp in candidates:
             if fp.lower().endswith(_PREFERRED_VIDEO_EXT):
                 return fp
 
-        # Otherwise return first good candidate (but avoid audio-only)
+        # Prefer non-audio
         for fp in candidates:
             ext = os.path.splitext(fp)[1].lower()
             if ext and ext not in _AUDIO_ONLY_EXTS:
@@ -184,7 +228,7 @@ def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str)
     except Exception:
         pass
 
-    # 2) fallback: search by prefix in output folder
+    # 3) fallback: search by prefix in folder
     try:
         if not os.path.isdir(output_folder):
             return None
@@ -193,13 +237,18 @@ def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str)
         if not files:
             return None
 
+        # Prefer prefix.mp4 if появилась чуть позже
+        final_mp4 = _find_final_mp4(prefix, output_folder)
+        if final_mp4:
+            return final_mp4
+
         # Prefer mp4
         for fn in files:
             fp = os.path.join(output_folder, fn)
             if fp.lower().endswith(_PREFERRED_VIDEO_EXT) and _is_good_downloaded_file(fp):
                 return fp
 
-        # Prefer non-audio, non-part
+        # Prefer non-audio
         for fn in files:
             fp = os.path.join(output_folder, fn)
             if not _is_good_downloaded_file(fp):
@@ -208,7 +257,7 @@ def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str)
             if ext and ext not in _AUDIO_ONLY_EXTS:
                 return fp
 
-        # Last resort: any good file
+        # Any good
         for fn in files:
             fp = os.path.join(output_folder, fn)
             if _is_good_downloaded_file(fp):
@@ -221,6 +270,8 @@ def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str)
 
 def _cleanup_files(prefix: str, output_folder: str) -> None:
     try:
+        if not os.path.isdir(output_folder):
+            return
         for fn in os.listdir(output_folder):
             if fn.startswith(prefix):
                 fp = os.path.join(output_folder, fn)
@@ -233,170 +284,26 @@ def _cleanup_files(prefix: str, output_folder: str) -> None:
         pass
 
 
-def _format_size_bytes(fmt: Dict[str, Any]) -> Optional[int]:
+def _format_candidates_for_download(url: str) -> List[str]:
     """
-    Like predecessor: only use confident sources:
-    - filesize
-    - filesize_approx
+    Order matters. First candidates target Telegram-friendly YouTube (H.264 + m4a).
+    Then fall back to generic logic.
     """
-    fs = fmt.get("filesize")
-    if isinstance(fs, int) and fs > 0:
-        return fs
-    fsa = fmt.get("filesize_approx")
-    if isinstance(fsa, int) and fsa > 0:
-        return fsa
-    return None
+    # Prefer H.264 (avc1) + AAC (m4a), and https (avoid HLS if possible)
+    return [
+        # Best for Telegram: H.264 mp4 video + m4a audio
+        "bv*[vcodec^=avc1][ext=mp4][protocol^=https]+ba[ext=m4a][protocol^=https]/"
+        "b[vcodec^=avc1][ext=mp4][protocol^=https]/"
+        "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/"
+        "b[vcodec^=avc1][ext=mp4]/"
+        "b[ext=mp4]",
 
+        # Generic mp4 merge (Ваш старый формат)
+        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
 
-def _prefer_codec_score(vcodec: str) -> int:
-    """
-    Keep Telegram-friendly preference.
-    Higher is better.
-    """
-    v = (vcodec or "").lower()
-    if v.startswith("avc1"):   # H.264
-        return 30
-    if v.startswith("hev1") or v.startswith("hvc1"):  # HEVC
-        return 20
-    if v.startswith("av01"):   # AV1
-        return 10
-    return 0
-
-
-def _pick_best_progressive_mp4(meta: Dict[str, Any]) -> Optional[str]:
-    """
-    Prefer progressive mp4 (video+audio in one stream), like predecessor does first.
-    But we only accept it if size is known and <= MAX_SEND_BYTES.
-    """
-    best_id = None
-    best_key = None
-
-    for f in meta.get("formats", []) or []:
-        try:
-            if f.get("ext") != "mp4":
-                continue
-            if f.get("vcodec") == "none" or f.get("acodec") == "none":
-                continue
-
-            size = _format_size_bytes(f)
-            if not isinstance(size, int) or size <= 0:
-                continue
-            if size > MAX_SEND_BYTES:
-                continue
-
-            height = int(f.get("height") or 0)
-            fps = int(f.get("fps") or 0)
-            tbr = float(f.get("tbr") or 0.0)
-            codec_score = _prefer_codec_score(str(f.get("vcodec") or ""))
-
-            key = (height, fps, tbr, codec_score)
-            if best_id is None or key > best_key:
-                best_id = str(f.get("format_id"))
-                best_key = key
-        except Exception:
-            continue
-
-    return best_id
-
-
-def _pick_best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[str]:
-    """
-    Prefer separate mp4 video-only + m4a audio-only (merge to mp4),
-    but only when combined size is known and <= MAX_SEND_BYTES.
-    """
-    videos: List[Dict[str, Any]] = []
-    audios: List[Dict[str, Any]] = []
-
-    for f in meta.get("formats", []) or []:
-        try:
-            ext = f.get("ext")
-            vcodec = f.get("vcodec")
-            acodec = f.get("acodec")
-
-            size = _format_size_bytes(f)
-
-            # video-only mp4
-            if ext == "mp4" and vcodec != "none" and acodec == "none":
-                if not isinstance(size, int) or size <= 0:
-                    continue
-                height = int(f.get("height") or 0)
-                fps = int(f.get("fps") or 0)
-                tbr = float(f.get("tbr") or 0.0)
-                codec_score = _prefer_codec_score(str(vcodec or ""))
-                videos.append({
-                    "id": str(f.get("format_id")),
-                    "size": int(size),
-                    "key": (height, fps, tbr, codec_score),
-                })
-                continue
-
-            # audio-only m4a (or mp4 audio-only)
-            if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
-                if not isinstance(size, int) or size <= 0:
-                    continue
-                abr = float(f.get("abr") or f.get("tbr") or 0.0)
-                audios.append({
-                    "id": str(f.get("format_id")),
-                    "size": int(size),
-                    "key": abr,
-                })
-                continue
-        except Exception:
-            continue
-
-    if not videos or not audios:
-        return None
-
-    videos.sort(key=lambda x: x["key"], reverse=True)
-    audios.sort(key=lambda x: x["key"], reverse=True)
-
-    # Choose the best quality pair that fits size limit.
-    # Try top videos first, and for each pick best audio that fits.
-    for v in videos[:30]:
-        if v["size"] >= MAX_SEND_BYTES:
-            continue
-
-        remaining = MAX_SEND_BYTES - v["size"]
-        for a in audios[:20]:
-            if a["size"] <= remaining:
-                return f'{v["id"]}+{a["id"]}'
-
-    return None
-
-
-def _choose_format_for_url(url: str) -> Tuple[str, Optional[str]]:
-    """
-    Returns (format_spec, merge_output_format).
-    - Try progressive mp4 within limit (like predecessor idea).
-    - Else try separate mp4+m4a within limit.
-    - Else fallback to safe-ish selector with progressive first.
-    """
-    try:
-        meta_opts: Dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-        }
-        with yt_dlp.YoutubeDL(meta_opts) as ydl:
-            meta = ydl.extract_info(url, download=False)
-
-        if isinstance(meta, dict):
-            prog = _pick_best_progressive_mp4(meta)
-            if prog:
-                return prog, None
-
-            sep = _pick_best_separate_mp4_m4a(meta)
-            if sep:
-                return sep, "mp4"
-    except Exception:
-        pass
-
-    # Fallback: keep old behavior, but put progressive mp4 first
-    # 1) b[ext=mp4] (progressive mp4 if available)
-    # 2) separate mp4+m4a
-    # 3) last resort any best
-    fmt = "b[ext=mp4]/bv*[ext=mp4]+ba[ext=m4a]/b/bv*+ba"
-    return fmt, "mp4"
+        # Last fallback
+        "b[ext=mp4]/best",
+    ]
 
 
 def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
@@ -404,36 +311,68 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
 
     outtmpl = os.path.join(output_folder, f"{out_prefix}.%(ext)s")
 
-    format_spec, merge_fmt = _choose_format_for_url(url)
-
-    ydl_opts: Dict[str, Any] = {
-        "format": format_spec,
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
-        "max_filesize": MAX_SEND_BYTES,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        },
-    }
-
-    # merge only when needed/known
-    if merge_fmt:
-        ydl_opts["merge_output_format"] = merge_fmt
-
     cookies_file = getattr(config, "cookies_file", None)
+    cookiefile = None
     if isinstance(cookies_file, str) and cookies_file.strip():
         if os.path.exists(cookies_file.strip()):
-            ydl_opts["cookiefile"] = cookies_file.strip()
+            cookiefile = cookies_file.strip()
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+    last_error: Optional[Exception] = None
+
+    for fmt in _format_candidates_for_download(url):
+        # clean leftovers from previous attempt for same prefix
+        _cleanup_files(out_prefix, output_folder)
+
+        ydl_opts: Dict[str, Any] = {
+            "format": fmt,
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 20,
+            "max_filesize": MAX_SEND_BYTES,
+            "prefer_ffmpeg": True,
+            # Make mp4 stream-friendly for Telegram clients
+            "postprocessor_args": ["-movflags", "+faststart"],
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+        }
+
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+            fp = _find_downloaded_file(info, out_prefix, output_folder)
+            if not fp or not os.path.exists(fp):
+                raise RuntimeError("Downloaded file not found")
+
+            ext = os.path.splitext(fp)[1].lower()
+            if ext in _AUDIO_ONLY_EXTS:
+                raise RuntimeError("Audio-only file produced (no video)")
+
+            # Ensure final mp4 contains audio (prevents 'video-only' intermediates)
+            if not _has_audio_stream(fp):
+                raise RuntimeError("No audio stream in resulting video (video-only output)")
+
+            return info
+
+        except Exception as e:
+            last_error = e
+            continue
+
+    # if all formats failed
+    if last_error:
+        raise last_error
+    raise RuntimeError("Download failed")
 
 
 def _send_video_no_reply(
@@ -510,7 +449,6 @@ def _html_escape_text(s: str) -> str:
 
 
 def _html_escape_attr(s: str) -> str:
-    # for href="...": escape quotes too
     return html.escape(s or "", quote=True)
 
 
@@ -587,11 +525,6 @@ def _is_opted_out(chat_id: int, user_id: int) -> bool:
 
 
 def _toggle_opt_out(chat_id: int, user_id: int) -> bool:
-    """
-    Returns new state:
-    True  -> opted out (auto disabled, needs mention)
-    False -> auto enabled
-    """
     _ensure_prefs_loaded()
     with _prefs_lock:
         opt_out = _prefs_cache.setdefault("opt_out", {})
@@ -735,10 +668,6 @@ def _help_text_html(is_group: bool) -> str:
 
 
 def _bot_admin_hint_html(chat_id: int) -> str:
-    """
-    Подсказка, если бот не админ (чтобы пользователи понимали,
-    почему ссылки не удаляются).
-    """
     try:
         if not BOT_ID:
             return ""
@@ -788,7 +717,6 @@ class Job:
 
 def _process_job(job_dict: Dict[str, Any]) -> None:
     job = Job(**job_dict)
-
     output_folder = getattr(config, "output_folder", "/tmp/yt-dlp-telegram") or "/tmp/yt-dlp-telegram"
 
     try:
@@ -800,10 +728,11 @@ def _process_job(job_dict: Dict[str, Any]) -> None:
 
         ext = os.path.splitext(file_path)[1].lower()
         if ext in _AUDIO_ONLY_EXTS:
-            # Prevent "black screen + sound": do not send audio-only as video
             raise RuntimeError("Downloaded audio-only file; video download failed")
 
-        # Make the first line clickable (HTML link) to the original URL
+        if not _has_audio_stream(file_path):
+            raise RuntimeError("No audio stream in resulting video")
+
         url_attr = _html_escape_attr(job.url)
         source_text = _html_escape_text(job.source_name)
         sender_text = _html_escape_text(job.sender_full_name)
@@ -872,7 +801,6 @@ def handle_new_chat_members(message):
         chat_id = int(message.chat.id)
         message_thread_id = getattr(message, "message_thread_id", None)
 
-        # One-time per group
         if _was_group_welcomed(chat_id):
             return
 
@@ -899,13 +827,11 @@ def handle_start_help(message):
         if chat_type == "private":
             user_id = int(getattr(message.from_user, "id", 0) or 0)
 
-            # /help always shows full instruction
             if (message.text or "").strip().lower().startswith("/help"):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
                 return
 
-            # /start — once full, next times short
             if not _was_private_welcomed(user_id):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
@@ -966,15 +892,11 @@ def handle_group_messages(message):
         message_thread_id = getattr(message, "message_thread_id", None)
         bot_mentioned = _contains_bot_mention(text)
 
-        # Toggle opt-out (self only)
         sender_username = getattr(message.from_user, "username", None)
         if bot_mentioned and _contains_sender_self_mention_or_me(text, sender_username):
             new_opt_out = _toggle_opt_out(chat_id, user_id)
 
-            if sender_username:
-                who = f"@{sender_username}"
-            else:
-                who = _format_sender_name(message)
+            who = f"@{sender_username}" if sender_username else _format_sender_name(message)
 
             if new_opt_out:
                 msg = (
@@ -1003,13 +925,9 @@ def handle_group_messages(message):
 
         opted_out = _is_opted_out(chat_id, user_id)
 
-        # If user opted out -> only handle explicit mention with URL
         if opted_out and not bot_mentioned:
             return
 
-        # Fail behavior:
-        # - auto: silent
-        # - explicit mention (when opted out): notify "Не удалось скачать" (silent)
         notify_on_fail = bool(opted_out and bot_mentioned)
 
         job = {
