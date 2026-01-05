@@ -8,7 +8,7 @@ import uuid
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlparse
 
 import telebot
@@ -33,6 +33,11 @@ PREFS_PATH = os.path.join(DATA_DIR, "prefs.json")
 # About (for help messages)
 AUTHOR_NAME = "Avazbek Olimov"
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
+
+# In practice: avoid sending audio-only as video (black screen + sound)
+_AUDIO_ONLY_EXTS = {".m4a", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".flac"}
+# Telegram best compatibility
+_PREFERRED_VIDEO_EXT = ".mp4"
 
 
 # =========================
@@ -133,24 +138,81 @@ def _log_request(message, url: str) -> None:
         pass
 
 
+def _is_good_downloaded_file(fp: str) -> bool:
+    try:
+        if not fp or not isinstance(fp, str):
+            return False
+        if not os.path.exists(fp):
+            return False
+        base = os.path.basename(fp).lower()
+        if base.endswith(".part") or base.endswith(".ytdl"):
+            return False
+        size = os.path.getsize(fp)
+        if not isinstance(size, int) or size <= 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str) -> Optional[str]:
+    """
+    Prefer real finished video files.
+    Important: never pick .part and never pick audio-only if we can avoid it.
+    """
     # 1) preferred: requested_downloads[*].filepath
     try:
         reqs = info.get("requested_downloads") or []
+        candidates: List[str] = []
         for r in reqs:
             fp = r.get("filepath")
-            if fp and os.path.exists(fp):
+            if fp and _is_good_downloaded_file(fp):
+                candidates.append(fp)
+
+        # Prefer mp4 if present
+        for fp in candidates:
+            if fp.lower().endswith(_PREFERRED_VIDEO_EXT):
                 return fp
+
+        # Otherwise return first good candidate (but avoid audio-only)
+        for fp in candidates:
+            ext = os.path.splitext(fp)[1].lower()
+            if ext and ext not in _AUDIO_ONLY_EXTS:
+                return fp
+
+        return candidates[0] if candidates else None
     except Exception:
         pass
 
     # 2) fallback: search by prefix in output folder
     try:
-        for fn in os.listdir(output_folder):
-            if fn.startswith(prefix):
-                fp = os.path.join(output_folder, fn)
-                if os.path.exists(fp):
-                    return fp
+        if not os.path.isdir(output_folder):
+            return None
+
+        files = [fn for fn in os.listdir(output_folder) if fn.startswith(prefix)]
+        if not files:
+            return None
+
+        # Prefer mp4
+        for fn in files:
+            fp = os.path.join(output_folder, fn)
+            if fp.lower().endswith(_PREFERRED_VIDEO_EXT) and _is_good_downloaded_file(fp):
+                return fp
+
+        # Prefer non-audio, non-part
+        for fn in files:
+            fp = os.path.join(output_folder, fn)
+            if not _is_good_downloaded_file(fp):
+                continue
+            ext = os.path.splitext(fp)[1].lower()
+            if ext and ext not in _AUDIO_ONLY_EXTS:
+                return fp
+
+        # Last resort: any good file
+        for fn in files:
+            fp = os.path.join(output_folder, fn)
+            if _is_good_downloaded_file(fp):
+                return fp
     except Exception:
         pass
 
@@ -171,14 +233,181 @@ def _cleanup_files(prefix: str, output_folder: str) -> None:
         pass
 
 
+def _format_size_bytes(fmt: Dict[str, Any]) -> Optional[int]:
+    """
+    Like predecessor: only use confident sources:
+    - filesize
+    - filesize_approx
+    """
+    fs = fmt.get("filesize")
+    if isinstance(fs, int) and fs > 0:
+        return fs
+    fsa = fmt.get("filesize_approx")
+    if isinstance(fsa, int) and fsa > 0:
+        return fsa
+    return None
+
+
+def _prefer_codec_score(vcodec: str) -> int:
+    """
+    Keep Telegram-friendly preference.
+    Higher is better.
+    """
+    v = (vcodec or "").lower()
+    if v.startswith("avc1"):   # H.264
+        return 30
+    if v.startswith("hev1") or v.startswith("hvc1"):  # HEVC
+        return 20
+    if v.startswith("av01"):   # AV1
+        return 10
+    return 0
+
+
+def _pick_best_progressive_mp4(meta: Dict[str, Any]) -> Optional[str]:
+    """
+    Prefer progressive mp4 (video+audio in one stream), like predecessor does first.
+    But we only accept it if size is known and <= MAX_SEND_BYTES.
+    """
+    best_id = None
+    best_key = None
+
+    for f in meta.get("formats", []) or []:
+        try:
+            if f.get("ext") != "mp4":
+                continue
+            if f.get("vcodec") == "none" or f.get("acodec") == "none":
+                continue
+
+            size = _format_size_bytes(f)
+            if not isinstance(size, int) or size <= 0:
+                continue
+            if size > MAX_SEND_BYTES:
+                continue
+
+            height = int(f.get("height") or 0)
+            fps = int(f.get("fps") or 0)
+            tbr = float(f.get("tbr") or 0.0)
+            codec_score = _prefer_codec_score(str(f.get("vcodec") or ""))
+
+            key = (height, fps, tbr, codec_score)
+            if best_id is None or key > best_key:
+                best_id = str(f.get("format_id"))
+                best_key = key
+        except Exception:
+            continue
+
+    return best_id
+
+
+def _pick_best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[str]:
+    """
+    Prefer separate mp4 video-only + m4a audio-only (merge to mp4),
+    but only when combined size is known and <= MAX_SEND_BYTES.
+    """
+    videos: List[Dict[str, Any]] = []
+    audios: List[Dict[str, Any]] = []
+
+    for f in meta.get("formats", []) or []:
+        try:
+            ext = f.get("ext")
+            vcodec = f.get("vcodec")
+            acodec = f.get("acodec")
+
+            size = _format_size_bytes(f)
+
+            # video-only mp4
+            if ext == "mp4" and vcodec != "none" and acodec == "none":
+                if not isinstance(size, int) or size <= 0:
+                    continue
+                height = int(f.get("height") or 0)
+                fps = int(f.get("fps") or 0)
+                tbr = float(f.get("tbr") or 0.0)
+                codec_score = _prefer_codec_score(str(vcodec or ""))
+                videos.append({
+                    "id": str(f.get("format_id")),
+                    "size": int(size),
+                    "key": (height, fps, tbr, codec_score),
+                })
+                continue
+
+            # audio-only m4a (or mp4 audio-only)
+            if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
+                if not isinstance(size, int) or size <= 0:
+                    continue
+                abr = float(f.get("abr") or f.get("tbr") or 0.0)
+                audios.append({
+                    "id": str(f.get("format_id")),
+                    "size": int(size),
+                    "key": abr,
+                })
+                continue
+        except Exception:
+            continue
+
+    if not videos or not audios:
+        return None
+
+    videos.sort(key=lambda x: x["key"], reverse=True)
+    audios.sort(key=lambda x: x["key"], reverse=True)
+
+    # Choose the best quality pair that fits size limit.
+    # Try top videos first, and for each pick best audio that fits.
+    for v in videos[:30]:
+        if v["size"] >= MAX_SEND_BYTES:
+            continue
+
+        remaining = MAX_SEND_BYTES - v["size"]
+        for a in audios[:20]:
+            if a["size"] <= remaining:
+                return f'{v["id"]}+{a["id"]}'
+
+    return None
+
+
+def _choose_format_for_url(url: str) -> Tuple[str, Optional[str]]:
+    """
+    Returns (format_spec, merge_output_format).
+    - Try progressive mp4 within limit (like predecessor idea).
+    - Else try separate mp4+m4a within limit.
+    - Else fallback to safe-ish selector with progressive first.
+    """
+    try:
+        meta_opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(meta_opts) as ydl:
+            meta = ydl.extract_info(url, download=False)
+
+        if isinstance(meta, dict):
+            prog = _pick_best_progressive_mp4(meta)
+            if prog:
+                return prog, None
+
+            sep = _pick_best_separate_mp4_m4a(meta)
+            if sep:
+                return sep, "mp4"
+    except Exception:
+        pass
+
+    # Fallback: keep old behavior, but put progressive mp4 first
+    # 1) b[ext=mp4] (progressive mp4 if available)
+    # 2) separate mp4+m4a
+    # 3) last resort any best
+    fmt = "b[ext=mp4]/bv*[ext=mp4]+ba[ext=m4a]/b/bv*+ba"
+    return fmt, "mp4"
+
+
 def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
     os.makedirs(output_folder, exist_ok=True)
 
     outtmpl = os.path.join(output_folder, f"{out_prefix}.%(ext)s")
 
+    format_spec, merge_fmt = _choose_format_for_url(url)
+
     ydl_opts: Dict[str, Any] = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-        "merge_output_format": "mp4",
+        "format": format_spec,
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
@@ -193,6 +422,10 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         },
     }
+
+    # merge only when needed/known
+    if merge_fmt:
+        ydl_opts["merge_output_format"] = merge_fmt
 
     cookies_file = getattr(config, "cookies_file", None)
     if isinstance(cookies_file, str) and cookies_file.strip():
@@ -503,7 +736,7 @@ def _help_text_html(is_group: bool) -> str:
 
 def _bot_admin_hint_html(chat_id: int) -> str:
     """
-    Небольшая подсказка, если бот не админ (чтобы пользователи понимали,
+    Подсказка, если бот не админ (чтобы пользователи понимали,
     почему ссылки не удаляются).
     """
     try:
@@ -564,6 +797,11 @@ def _process_job(job_dict: Dict[str, Any]) -> None:
 
         if not file_path or not os.path.exists(file_path):
             raise RuntimeError("Downloaded file not found")
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in _AUDIO_ONLY_EXTS:
+            # Prevent "black screen + sound": do not send audio-only as video
+            raise RuntimeError("Downloaded audio-only file; video download failed")
 
         # Make the first line clickable (HTML link) to the original URL
         url_attr = _html_escape_attr(job.url)
@@ -661,19 +899,22 @@ def handle_start_help(message):
         if chat_type == "private":
             user_id = int(getattr(message.from_user, "id", 0) or 0)
 
-            # /help всегда показывает полную инструкцию
+            # /help always shows full instruction
             if (message.text or "").strip().lower().startswith("/help"):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
                 return
 
-            # /start — один раз полная инструкция, дальше коротко
+            # /start — once full, next times short
             if not _was_private_welcomed(user_id):
                 _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
                 _mark_private_welcomed(user_id)
             else:
-                _safe_send_message(chat_id, "Инструкция уже отправлялась. Нажмите /help чтобы показать её снова.",
-                                   message_thread_id=message_thread_id)
+                _safe_send_message(
+                    chat_id,
+                    "Инструкция уже отправлялась. Нажмите /help чтобы показать её снова.",
+                    message_thread_id=message_thread_id
+                )
             return
 
         if chat_type in ("group", "supergroup"):
