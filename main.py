@@ -8,7 +8,7 @@ import uuid
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 
 import telebot
@@ -134,23 +134,69 @@ def _log_request(message, url: str) -> None:
 
 
 def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str) -> Optional[str]:
+    """
+    Улучшено аккуратно (без изменения UX):
+    - сначала requested_downloads[*].filepath
+    - затем поиск по prefix, предпочитая .mp4 и самый свежий файл
+    """
     # 1) preferred: requested_downloads[*].filepath
     try:
         reqs = info.get("requested_downloads") or []
+        # prefer mp4 if multiple
+        mp4_candidates = []
+        other_candidates = []
         for r in reqs:
             fp = r.get("filepath")
             if fp and os.path.exists(fp):
-                return fp
+                if fp.lower().endswith(".mp4"):
+                    mp4_candidates.append(fp)
+                else:
+                    other_candidates.append(fp)
+        if mp4_candidates:
+            return mp4_candidates[0]
+        if other_candidates:
+            return other_candidates[0]
     except Exception:
         pass
 
     # 2) fallback: search by prefix in output folder
     try:
+        best_fp = None
+        best_mtime = -1.0
+        best_is_mp4 = False
+
         for fn in os.listdir(output_folder):
-            if fn.startswith(prefix):
-                fp = os.path.join(output_folder, fn)
-                if os.path.exists(fp):
-                    return fp
+            if not fn.startswith(prefix):
+                continue
+            fp = os.path.join(output_folder, fn)
+            if not os.path.exists(fp):
+                continue
+
+            is_mp4 = fn.lower().endswith(".mp4")
+            try:
+                mtime = float(os.path.getmtime(fp))
+            except Exception:
+                mtime = 0.0
+
+            # prefer mp4; within same type prefer newest
+            if best_fp is None:
+                best_fp = fp
+                best_mtime = mtime
+                best_is_mp4 = is_mp4
+                continue
+
+            if is_mp4 and not best_is_mp4:
+                best_fp = fp
+                best_mtime = mtime
+                best_is_mp4 = True
+                continue
+
+            if is_mp4 == best_is_mp4 and mtime >= best_mtime:
+                best_fp = fp
+                best_mtime = mtime
+                best_is_mp4 = is_mp4
+
+        return best_fp
     except Exception:
         pass
 
@@ -171,14 +217,197 @@ def _cleanup_files(prefix: str, output_folder: str) -> None:
         pass
 
 
+# =========================
+# Download planning (match main.py 1 logic)
+# =========================
+
+def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
+    dur = meta.get("duration")
+    if isinstance(dur, (int, float)) and dur > 0:
+        return int(dur)
+    return None
+
+
+def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
+    """
+    Возвращает (size_bytes, confident).
+    Этот расчёт здесь не для блокировки, а чтобы максимально повторить “планирование” первого бота.
+    """
+    fs = fmt.get("filesize")
+    if isinstance(fs, int) and fs > 0:
+        return fs, True
+
+    fsa = fmt.get("filesize_approx")
+    if isinstance(fsa, int) and fsa > 0:
+        return fsa, True
+
+    tbr = fmt.get("tbr")  # Kbps
+    if dur and isinstance(tbr, (int, float)) and tbr > 0:
+        est = int(dur * (float(tbr) * 1000.0 / 8.0))
+        if est > 0:
+            return est, False
+
+    return None, False
+
+
+def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Как в первом боте: лучший progressive MP4 (video+audio в одном файле).
+    """
+    best = None
+    best_key = None
+
+    for f in meta.get("formats", []) or []:
+        if f.get("ext") != "mp4":
+            continue
+        if f.get("vcodec") == "none" or f.get("acodec") == "none":
+            continue
+
+        fid = f.get("format_id")
+        if not fid:
+            continue
+
+        height = f.get("height") or 0
+        fps = f.get("fps") or 0
+        tbr = f.get("tbr") or 0
+        key = (int(height), int(fps), float(tbr))
+
+        if best is None or key > best_key:
+            best = {
+                "kind": "progressive",
+                "format_spec": str(fid),
+                "merge_output_format": None,
+            }
+            best_key = key
+
+    return best
+
+
+def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Как в первом боте: лучший mp4 video-only + лучший m4a/mp4 audio-only.
+    """
+    dur = _duration_sec(meta)
+
+    best_v = None
+    best_v_key = None
+    best_a = None
+    best_a_key = None
+
+    for f in meta.get("formats", []) or []:
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
+        ext = f.get("ext")
+
+        # video-only mp4
+        if ext == "mp4" and vcodec != "none" and acodec == "none":
+            fid = f.get("format_id")
+            if not fid:
+                continue
+
+            height = f.get("height") or 0
+            fps = f.get("fps") or 0
+            tbr = f.get("tbr") or 0
+            key = (int(height), int(fps), float(tbr))
+
+            if best_v is None or key > best_v_key:
+                size, conf = _format_size_bytes(f, dur)
+                best_v = {"f": f, "size": size, "conf": conf}
+                best_v_key = key
+
+        # audio-only m4a/mp4
+        if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
+            fid = f.get("format_id")
+            if not fid:
+                continue
+
+            abr = f.get("abr") or f.get("tbr") or 0
+            key = float(abr)
+
+            if best_a is None or key > best_a_key:
+                size, conf = _format_size_bytes(f, dur)
+                best_a = {"f": f, "size": size, "conf": conf}
+                best_a_key = key
+
+    if not best_v or not best_a:
+        return None
+
+    vf = best_v["f"]
+    af = best_a["f"]
+    return {
+        "kind": "separate",
+        "format_spec": f"{vf.get('format_id')}+{af.get('format_id')}",
+        "merge_output_format": "mp4",
+    }
+
+
+def _build_video_plan_like_main1(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    1) progressive mp4 (предпочтение как в первом боте)
+    2) separate mp4+m4a
+    3) иначе None (дальше используем старый fallback)
+    """
+    p = _best_progressive_mp4(meta)
+    if p:
+        return p
+
+    p = _best_separate_mp4_m4a(meta)
+    if p:
+        return p
+
+    return None
+
+
 def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
+    """
+    Исправлено: выбор формата теперь совпадает по логике с первым ботом:
+    - сначала progressive mp4 (обычно меньше и стабильнее)
+    - затем mp4 video-only + m4a/mp4 audio-only
+    - merge_output_format ставим только когда реально склеиваем
+    """
     os.makedirs(output_folder, exist_ok=True)
 
     outtmpl = os.path.join(output_folder, f"{out_prefix}.%(ext)s")
 
+    cookies_file = getattr(config, "cookies_file", None)
+    cookiefile_value = None
+    if isinstance(cookies_file, str) and cookies_file.strip():
+        if os.path.exists(cookies_file.strip()):
+            cookiefile_value = cookies_file.strip()
+
+    http_headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    }
+
+    # 1) meta first (like main.py 1 planning)
+    meta_opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "retries": 5,
+        "http_headers": http_headers,
+    }
+    if cookiefile_value:
+        meta_opts["cookiefile"] = cookiefile_value
+
+    with yt_dlp.YoutubeDL(meta_opts) as ydl:
+        meta = ydl.extract_info(url, download=False)
+
+    plan = _build_video_plan_like_main1(meta)
+
+    # 2) download using the plan; if no plan, keep your old fallback as last resort
+    if plan:
+        format_value = str(plan.get("format_spec"))
+        merge_value = plan.get("merge_output_format")
+    else:
+        # Your original fallback (but as last resort)
+        format_value = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+        merge_value = "mp4"  # keep original behavior for fallback only
+
     ydl_opts: Dict[str, Any] = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-        "merge_output_format": "mp4",
+        "format": format_value,
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
@@ -188,16 +417,15 @@ def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[
         "fragment_retries": 5,
         "socket_timeout": 20,
         "max_filesize": MAX_SEND_BYTES,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        },
+        "http_headers": http_headers,
     }
 
-    cookies_file = getattr(config, "cookies_file", None)
-    if isinstance(cookies_file, str) and cookies_file.strip():
-        if os.path.exists(cookies_file.strip()):
-            ydl_opts["cookiefile"] = cookies_file.strip()
+    # IMPORTANT: set merge_output_format only when needed
+    if merge_value:
+        ydl_opts["merge_output_format"] = str(merge_value)
+
+    if cookiefile_value:
+        ydl_opts["cookiefile"] = cookiefile_value
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
@@ -655,7 +883,7 @@ def handle_new_chat_members(message):
 def handle_start_help(message):
     try:
         chat_type = getattr(message.chat, "type", "")
-        chat_id = int(message.chat.id)
+        chat_id = int(getattr(message.chat, "id", 0) or 0)
         message_thread_id = getattr(message, "message_thread_id", None)
 
         if chat_type == "private":
