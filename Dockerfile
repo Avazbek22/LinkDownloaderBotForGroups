@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-      ffmpeg ca-certificates \
+      ffmpeg ca-certificates nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

@@ -8,13 +8,13 @@ import uuid
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
 import telebot
-import yt_dlp
 
 import config
+from app.download_backend import download_with_ytdlp
 
 
 # =========================
@@ -249,221 +249,14 @@ def _cleanup_files(prefix: str, output_folder: str) -> None:
         pass
 
 
-# =========================
-# Download planning (match main.py 1 behavior)
-# =========================
-
-def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
-    dur = meta.get("duration")
-    if isinstance(dur, (int, float)) and dur > 0:
-        return int(dur)
-    return None
-
-
-def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
-    fs = fmt.get("filesize")
-    if isinstance(fs, int) and fs > 0:
-        return fs, True
-
-    fsa = fmt.get("filesize_approx")
-    if isinstance(fsa, int) and fsa > 0:
-        return fsa, True
-
-    tbr = fmt.get("tbr")  # Kbps
-    if dur and isinstance(tbr, (int, float)) and tbr > 0:
-        est = int(dur * (float(tbr) * 1000.0 / 8.0))
-        if est > 0:
-            return est, False
-
-    return None, False
-
-
-def _vcodec_pref_rank(vcodec: Any) -> int:
-    """
-    Чтобы избегать ситуаций "чёрный экран" из-за неподдерживаемых кодеков Telegram,
-    отдаём приоритет H.264 (avc1) внутри mp4. Это соответствует поведению первого бота,
-    который чаще всего выбирает progressive mp4 (обычно avc1+aac).
-    """
-    s = str(vcodec or "")
-    return 2 if s.startswith("avc1") else 1
-
-
-def _acodec_pref_rank(acodec: Any) -> int:
-    s = str(acodec or "")
-    return 2 if s.startswith("mp4a") else 1
-
-
-def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    best = None
-    best_key = None
-
-    for f in meta.get("formats", []) or []:
-        if f.get("ext") != "mp4":
-            continue
-        if f.get("vcodec") == "none" or f.get("acodec") == "none":
-            continue
-
-        fid = f.get("format_id")
-        if not fid:
-            continue
-
-        height = f.get("height") or 0
-        fps = f.get("fps") or 0
-        tbr = f.get("tbr") or 0
-
-        v_rank = _vcodec_pref_rank(f.get("vcodec"))
-        a_rank = _acodec_pref_rank(f.get("acodec"))
-
-        key = (int(v_rank), int(a_rank), int(height), int(fps), float(tbr))
-
-        if best is None or key > best_key:
-            best = {
-                "kind": "progressive",
-                "format_spec": str(fid),
-                "merge_output_format": None,
-            }
-            best_key = key
-
-    return best
-
-
-def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    dur = _duration_sec(meta)
-
-    best_v = None
-    best_v_key = None
-    best_a = None
-    best_a_key = None
-
-    for f in meta.get("formats", []) or []:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-
-        # video-only mp4
-        if ext == "mp4" and vcodec != "none" and acodec == "none":
-            fid = f.get("format_id")
-            if not fid:
-                continue
-
-            height = f.get("height") or 0
-            fps = f.get("fps") or 0
-            tbr = f.get("tbr") or 0
-
-            v_rank = _vcodec_pref_rank(vcodec)
-            key = (int(v_rank), int(height), int(fps), float(tbr))
-
-            if best_v is None or key > best_v_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_v = {"f": f, "size": size, "conf": conf}
-                best_v_key = key
-
-        # audio-only m4a/mp4
-        if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
-            fid = f.get("format_id")
-            if not fid:
-                continue
-
-            abr = f.get("abr") or f.get("tbr") or 0
-            a_rank = _acodec_pref_rank(acodec)
-            key = (int(a_rank), float(abr))
-
-            if best_a is None or key > best_a_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_a = {"f": f, "size": size, "conf": conf}
-                best_a_key = key
-
-    if not best_v or not best_a:
-        return None
-
-    vf = best_v["f"]
-    af = best_a["f"]
-    return {
-        "kind": "separate",
-        "format_spec": f"{vf.get('format_id')}+{af.get('format_id')}",
-        "merge_output_format": "mp4",
-    }
-
-
-def _build_video_plan_like_main1(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    p = _best_progressive_mp4(meta)
-    if p:
-        return p
-
-    p = _best_separate_mp4_m4a(meta)
-    if p:
-        return p
-
-    return None
-
-
 def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
-    """
-    Исправлено:
-    - выбор формата как у первого бота (progressive mp4 -> separate mp4+m4a)
-    - merge_output_format только когда реально separate
-    """
-    os.makedirs(output_folder, exist_ok=True)
-
-    outtmpl = os.path.join(output_folder, f"{out_prefix}.%(ext)s")
-
-    cookies_file = getattr(config, "cookies_file", None)
-    cookiefile_value = None
-    if isinstance(cookies_file, str) and cookies_file.strip():
-        if os.path.exists(cookies_file.strip()):
-            cookiefile_value = cookies_file.strip()
-
-    http_headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    }
-
-    meta_opts: Dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 20,
-        "retries": 5,
-        "http_headers": http_headers,
-    }
-    if cookiefile_value:
-        meta_opts["cookiefile"] = cookiefile_value
-
-    with yt_dlp.YoutubeDL(meta_opts) as ydl:
-        meta = ydl.extract_info(url, download=False)
-
-    plan = _build_video_plan_like_main1(meta)
-
-    if plan:
-        format_value = str(plan.get("format_spec"))
-        merge_value = plan.get("merge_output_format")
-    else:
-        # Ваш прежний fallback как самый последний вариант
-        format_value = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-        merge_value = "mp4"
-
-    ydl_opts: Dict[str, Any] = {
-        "format": format_value,
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
-        "max_filesize": MAX_SEND_BYTES,
-        "http_headers": http_headers,
-    }
-
-    if merge_value:
-        ydl_opts["merge_output_format"] = str(merge_value)
-
-    if cookiefile_value:
-        ydl_opts["cookiefile"] = cookiefile_value
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+    return download_with_ytdlp(
+        url=url,
+        out_prefix=out_prefix,
+        output_folder=output_folder,
+        max_send_bytes=MAX_SEND_BYTES,
+        concurrent_fragments=YTDLP_CONCURRENT_FRAGMENTS,
+    )
 
 
 def _send_video_no_reply(
