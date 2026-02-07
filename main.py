@@ -522,7 +522,7 @@ def _help_text_html(is_group: bool) -> str:
             "  (можно также написать «me» или «я» вместо ника)\n"
             "• Повторите команду — включится обратно.\n\n"
             "<b>Режим вручную (когда Вы отключились)</b>\n"
-            f"• Чтобы скачать: {bot_mention} <ссылка>\n"
+            f"• Чтобы скачать: {bot_mention} &lt;ссылка&gt;\n"
         )
     else:
         usage = (
@@ -538,7 +538,7 @@ def _help_text_html(is_group: bool) -> str:
             "  (или «me» / «я»)\n"
             "• Повторите — включится обратно.\n\n"
             "<b>Когда авто отключено</b>\n"
-            f"• Скачивание только так: {bot_mention} <ссылка>\n"
+            f"• Скачивание только так: {bot_mention} &lt;ссылка&gt;\n"
         )
 
     author = _html_escape_text(AUTHOR_NAME)
