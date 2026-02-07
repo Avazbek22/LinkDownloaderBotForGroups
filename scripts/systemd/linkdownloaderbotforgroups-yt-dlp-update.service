@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly yt-dlp updater for LinkDownloaderBotForGroups
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+Environment=ROOT_DIR=__INSTALL_DIR__
+Environment=COMPOSE_PROJECT=__COMPOSE_PROJECT__
+Environment=SERVICE_KEY=__SERVICE_KEY__
+ExecStart=/usr/bin/env bash __INSTALL_DIR__/scripts/update-ytdlp.sh
+
+[Install]
+WantedBy=multi-user.target

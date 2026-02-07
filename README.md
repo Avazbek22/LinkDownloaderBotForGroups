@@ -98,6 +98,12 @@ BOT_TOKEN=123456789:AA...your_token_here
 # MAX_FILESIZE=52428800
 # OUTPUT_FOLDER=/tmp/yt-dlp-telegram
 # COOKIES_FILE=/app/cookies.txt
+YTDLP_JS_RUNTIMES=node
+YTDLP_REMOTE_COMPONENTS=ejs:github
+YTDLP_INSTAGRAM_IMPERSONATE=chrome
+YTDLP_INSTAGRAM_RETRIES=8
+YTDLP_INSTAGRAM_FRAGMENT_RETRIES=8
+YTDLP_INSTAGRAM_SOCKET_TIMEOUT=30
 ```
 
 ### Переменные окружения
@@ -107,6 +113,12 @@ BOT_TOKEN=123456789:AA...your_token_here
 * **MAX_FILESIZE** *(опционально)* — максимальный размер файла в байтах (по умолчанию 50 MB).
 * **OUTPUT_FOLDER** *(опционально)* — временная папка для загрузок (по умолчанию `/tmp/yt-dlp-telegram`).
 * **COOKIES_FILE** *(опционально)* — путь к cookies-файлу (если нужно для сложных сайтов/авторизации).
+* **YTDLP_JS_RUNTIMES** *(по умолчанию `node`)* — JS runtime для YouTube extractor.
+* **YTDLP_REMOTE_COMPONENTS** *(по умолчанию `ejs:github`)* — удалённые EJS-компоненты для устойчивости YouTube.
+* **YTDLP_INSTAGRAM_IMPERSONATE** *(по умолчанию `chrome`)* — профиль impersonation для Instagram.
+* **YTDLP_INSTAGRAM_RETRIES** *(по умолчанию `8`)* — retries для Instagram.
+* **YTDLP_INSTAGRAM_FRAGMENT_RETRIES** *(по умолчанию `8`)* — fragment retries для Instagram.
+* **YTDLP_INSTAGRAM_SOCKET_TIMEOUT** *(по умолчанию `30`)* — socket timeout для Instagram.
 
 ---
 

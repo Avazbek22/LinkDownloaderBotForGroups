@@ -7,6 +7,8 @@ BRANCH="main"
 install_dir="${INSTALL_DIR:-$PWD/LinkDownloaderBotForGroups}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
 SERVICE_KEY="${SERVICE_KEY:-linkdownloaderbot}"   # имя сервиса в docker-compose.yml
+UPDATER_SERVICE_NAME="${UPDATER_SERVICE_NAME:-linkdownloaderbotforgroups-yt-dlp-update.service}"
+UPDATER_TIMER_NAME="${UPDATER_TIMER_NAME:-linkdownloaderbotforgroups-yt-dlp-update.timer}"
 
 PYTHON_BIN="python3"
 VENV_DIR=".venv"
@@ -60,8 +62,24 @@ detect_compose() {
 # ---------- deps ----------
 ensure_deps_basic() {
   say "Installing dependencies"
-  apt_install git curl ca-certificates ffmpeg "$PYTHON_BIN" "$PYTHON_BIN-venv" "$PYTHON_BIN-pip" || true
+  apt_install git curl ca-certificates ffmpeg nodejs "$PYTHON_BIN" "$PYTHON_BIN-venv" "$PYTHON_BIN-pip" || true
   ok "Dependencies are installed (or already present)."
+}
+
+ensure_env_key() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+
+  if [[ ! -f "$env_file" ]]; then
+    return 0
+  fi
+
+  if grep -q "^${key}=" "$env_file"; then
+    return 0
+  fi
+
+  echo "${key}=${value}" >> "$env_file"
 }
 
 # ---------- repo ----------
@@ -152,10 +170,23 @@ write_env_and_config() {
       echo "# MAX_FILESIZE=52428800"
       echo "# OUTPUT_FOLDER=/tmp/yt-dlp-telegram"
       echo "# COOKIES_FILE=/app/cookies.txt"
+      echo "YTDLP_JS_RUNTIMES=node"
+      echo "YTDLP_REMOTE_COMPONENTS=ejs:github"
+      echo "YTDLP_INSTAGRAM_IMPERSONATE=chrome"
+      echo "YTDLP_INSTAGRAM_RETRIES=8"
+      echo "YTDLP_INSTAGRAM_FRAGMENT_RETRIES=8"
+      echo "YTDLP_INSTAGRAM_SOCKET_TIMEOUT=30"
     } > "$env_path"
     chmod 600 "$env_path" 2>/dev/null || true
     ok ".env written: $(mask_token "$token")"
   fi
+
+  ensure_env_key "$env_path" "YTDLP_JS_RUNTIMES" "node"
+  ensure_env_key "$env_path" "YTDLP_REMOTE_COMPONENTS" "ejs:github"
+  ensure_env_key "$env_path" "YTDLP_INSTAGRAM_IMPERSONATE" "chrome"
+  ensure_env_key "$env_path" "YTDLP_INSTAGRAM_RETRIES" "8"
+  ensure_env_key "$env_path" "YTDLP_INSTAGRAM_FRAGMENT_RETRIES" "8"
+  ensure_env_key "$env_path" "YTDLP_INSTAGRAM_SOCKET_TIMEOUT" "30"
 
   # config.py без секретов (как у Вас сейчас рабочий вариант)
   if [[ -f "$cfg_path" && "${FORCE_CONFIG:-0}" != "1" ]]; then
@@ -279,6 +310,35 @@ install_system_mode() {
   echo "  $VENV_DIR/bin/python main.py"
 }
 
+install_nightly_updater() {
+  say "Nightly yt-dlp updater"
+
+  if ! need_cmd systemctl || [[ ! -d /run/systemd/system ]]; then
+    warn "systemd is unavailable. Skipping nightly updater setup (graceful fallback)."
+    return 0
+  fi
+
+  local service_tpl="$install_dir/scripts/systemd/linkdownloaderbotforgroups-yt-dlp-update.service"
+  local timer_tpl="$install_dir/scripts/systemd/linkdownloaderbotforgroups-yt-dlp-update.timer"
+  local service_out="/etc/systemd/system/$UPDATER_SERVICE_NAME"
+  local timer_out="/etc/systemd/system/$UPDATER_TIMER_NAME"
+
+  [[ -f "$service_tpl" ]] || { warn "Missing $service_tpl"; return 0; }
+  [[ -f "$timer_tpl" ]] || { warn "Missing $timer_tpl"; return 0; }
+
+  sed \
+    -e "s|__INSTALL_DIR__|$install_dir|g" \
+    -e "s|__COMPOSE_PROJECT__|$COMPOSE_PROJECT|g" \
+    -e "s|__SERVICE_KEY__|$SERVICE_KEY|g" \
+    "$service_tpl" | as_root tee "$service_out" >/dev/null
+
+  as_root cp "$timer_tpl" "$timer_out"
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "$UPDATER_TIMER_NAME"
+  ok "Nightly updater enabled: $UPDATER_TIMER_NAME"
+}
+
 main() {
   say "LinkDownloaderBotForGroups installer"
 
@@ -294,6 +354,8 @@ main() {
   else
     install_system_mode
   fi
+
+  install_nightly_updater
 }
 
 main "$@"
