@@ -52,6 +52,21 @@ validate_checkout() {
   fi
 }
 
+requires_container_update() {
+  local path
+  while IFS= read -r path; do
+    case "$path" in
+      README.md | LICENSE | CONTRIBUTING.md | CODE_OF_CONDUCT.md | SECURITY.md | requirements-dev.txt | \
+        pyproject.toml | .github/* | tests/*)
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done < <(git diff --name-only --diff-filter=ACDMRTUXB "$old_commit" "$target_commit")
+  return 1
+}
+
 wait_until_running() {
   local container_id running restart_count attempt stable_checks=0
   for ((attempt = 1; attempt <= 15; attempt++)); do
@@ -110,6 +125,13 @@ main() {
     log "deployment ref is not a fast-forward from commit=$old_commit"
     return 1
   }
+
+  if ! requires_container_update; then
+    log "non-runtime update detected; container restart skipped commit=$target_commit"
+    git checkout -q -B "$DEPLOY_BRANCH" "$target_commit"
+    rm -f "$FAILED_SHA_FILE"
+    return 0
+  fi
 
   docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || {
     log "current image is unavailable: $IMAGE_NAME"

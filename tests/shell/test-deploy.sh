@@ -19,6 +19,7 @@ case "$*" in
   *"rev-parse refs/remotes/origin/main"*) cat "$FAKE_STATE_DIR/target" ;;
   *"branch --show-current"*) echo main ;;
   *"merge-base --is-ancestor"*) exit 0 ;;
+  *"diff --name-only --diff-filter=ACDMRTUXB"*) cat "$FAKE_STATE_DIR/changes" ;;
   *"checkout -q -B"*) printf '%s\n' "${!#}" >"$FAKE_STATE_DIR/head" ;;
 esac
 FAKE_GIT
@@ -58,6 +59,7 @@ prepare_case() {
   : >"$case_root/docker-compose.yml"
   printf '%s\n' old-commit >"$case_root/head"
   printf '%s\n' new-commit >"$case_root/target"
+  printf '%s\n' main.py >"$case_root/changes"
   : >"$case_root/commands.log"
   make_fake_commands "$case_root/bin"
 }
@@ -81,6 +83,27 @@ run_deployer "$success_root"
 [[ "$(<"$success_root/head")" == "new-commit" ]]
 grep -q 'deployment successful commit=new-commit' "$success_root/logs/deploy-"*.log
 grep -q 'docker compose .* build --pull linkdownloaderbot' "$success_root/commands.log"
+
+for non_runtime_path in README.md tests/test_example.py .github/workflows/ci.yml; do
+  case_name="$(printf '%s' "$non_runtime_path" | tr '/.' '--')"
+  non_runtime_root="$TEST_ROOT/non-runtime-$case_name"
+  prepare_case "$non_runtime_root"
+  printf '%s\n' "$non_runtime_path" >"$non_runtime_root/changes"
+  run_deployer "$non_runtime_root"
+  [[ "$(<"$non_runtime_root/head")" == "new-commit" ]]
+  grep -q 'non-runtime update detected; container restart skipped commit=new-commit' \
+    "$non_runtime_root/logs/deploy-"*.log
+  if grep -q 'docker compose .* build\|docker compose .* up' "$non_runtime_root/commands.log"; then
+    echo "non-runtime change unexpectedly touched the container: $non_runtime_path" >&2
+    exit 1
+  fi
+done
+
+mixed_root="$TEST_ROOT/mixed"
+prepare_case "$mixed_root"
+printf '%s\n' README.md app/settings.py >"$mixed_root/changes"
+run_deployer "$mixed_root"
+grep -q 'docker compose .* build --pull linkdownloaderbot' "$mixed_root/commands.log"
 
 failure_root="$TEST_ROOT/failure"
 prepare_case "$failure_root"

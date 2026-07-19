@@ -168,6 +168,8 @@ When a new commit appears, the deployer:
 
 The failed commit is not retried until a newer commit appears. Runtime configuration and persistent data remain on the VPS. For safer maintenance, protect `main` and require the included CI checks before merging pull requests.
 
+Changes limited to documentation, repository metadata, development dependencies, or tests update the server checkout without rebuilding or restarting the running bot. Mixed commits and every unknown file are treated as runtime changes and receive the full deployment procedure.
+
 Useful commands:
 
 ```bash
