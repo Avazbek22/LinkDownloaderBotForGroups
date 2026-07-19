@@ -11,6 +11,7 @@ from app.download_backend import (
     MediaMetadata,
     display_source_name,
     download_metadata,
+    has_downloadable_video,
     select_format,
     select_format_candidates,
 )
@@ -22,6 +23,15 @@ def test_source_names_use_brand_spelling() -> None:
     assert display_source_name("TikTok") == "TikTok"
     assert display_source_name("VKontakte") == "VK"
     assert display_source_name("CustomExtractor") == "CustomExtractor"
+
+
+def test_video_metadata_detection_ignores_audio_and_articles() -> None:
+    assert has_downloadable_video({"formats": [{"ext": "mp4", "vcodec": "avc1.4d401f", "acodec": "mp4a.40.2"}]})
+    assert has_downloadable_video(
+        {"formats": [{"ext": "mp4", "vcodec": None, "acodec": None, "url": "https://cdn.example/video.mp4"}]}
+    )
+    assert not has_downloadable_video({"formats": [{"ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2"}]})
+    assert not has_downloadable_video({"id": "article", "title": "News article"})
 
 
 def test_selects_best_format_that_fits() -> None:

@@ -181,6 +181,25 @@ def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None
     return plan.format_spec, plan.merge_output_format
 
 
+def has_downloadable_video(info: dict[str, Any]) -> bool:
+    """Return whether extractor metadata positively identifies a video stream."""
+    candidates = [info, *(item for item in info.get("formats", []) if isinstance(item, dict))]
+    for candidate in candidates:
+        video_codec = candidate.get("vcodec")
+        if video_codec not in {None, "none"}:
+            return True
+        if (
+            candidate.get("ext") == "mp4"
+            and video_codec is None
+            and candidate.get("acodec") is None
+            and bool(candidate.get("url"))
+        ):
+            # Some direct progressive MP4 entries (notably Instagram) omit
+            # codec metadata. The final ffprobe validation remains authoritative.
+            return True
+    return any(has_downloadable_video(entry) for entry in info.get("entries", []) if isinstance(entry, dict))
+
+
 def _csv(raw: str) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 

@@ -83,7 +83,11 @@ def test_three_requests_download_and_upload_once(tmp_path, monkeypatch) -> None:
 
     metadata = MediaMetadata(
         url="https://example.com/video",
-        info={"id": "video", "extractor": "Test"},
+        info={
+            "id": "video",
+            "extractor": "Test",
+            "formats": [{"format_id": "video", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        },
         media_key="test:video",
         source_name="Test",
     )
@@ -245,7 +249,7 @@ def test_accepted_group_link_gets_eyes(tmp_path, monkeypatch) -> None:
     app.coordinator.abort(flight)
 
 
-def test_full_queue_replaces_eyes_with_failure(tmp_path, monkeypatch) -> None:
+def test_full_queue_clears_unconfirmed_eyes(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(replace(_settings(tmp_path), max_queue=1))
     fake = FakeBot()
     app.bot = fake
@@ -261,10 +265,10 @@ def test_full_queue_replaces_eyes_with_failure(tmp_path, monkeypatch) -> None:
 
     app._handle_group_message(message)
 
-    assert [item[2] for item in fake.reactions] == ["👀", "👎"]
+    assert [item[2] for item in fake.reactions] == ["👀", None]
 
 
-def test_metadata_failure_replaces_eyes_for_every_joined_job(tmp_path, monkeypatch) -> None:
+def test_metadata_failure_clears_eyes_for_every_joined_job(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()
     app.bot = fake
@@ -292,7 +296,45 @@ def test_metadata_failure_replaces_eyes_for_every_joined_job(tmp_path, monkeypat
     by_message: dict[int, list[str]] = {}
     for _, message_id, emoji, _ in fake.reactions:
         by_message.setdefault(message_id, []).append(emoji)
-    assert by_message == {10: ["👀", "👎"], 11: ["👀", "👎"]}
+    assert by_message == {10: ["👀", None], 11: ["👀", None]}
+
+
+def test_non_video_metadata_clears_eyes_without_downvote(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "news",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/news",
+        "https://example.com/news",
+        "User",
+        True,
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    metadata = MediaMetadata(
+        url=job.url,
+        info={
+            "id": "article",
+            "extractor": "Generic",
+            "formats": [{"format_id": "audio", "ext": "m4a", "vcodec": "none", "acodec": "aac"}],
+        },
+        media_key="generic:article",
+        source_name="News",
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+    assert fake.sends == []
+    assert fake.deletes == []
 
 
 def test_short_language_command_changes_group_language(tmp_path, monkeypatch) -> None:

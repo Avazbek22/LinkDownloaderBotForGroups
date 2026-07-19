@@ -20,6 +20,7 @@ from app.download_backend import (
     download_metadata,
     extract_metadata,
     find_downloaded_file,
+    has_downloadable_video,
 )
 from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job
@@ -136,8 +137,12 @@ class BotApplication:
                 self.log.exception("uncaught worker error")
                 self._operator_alert("A download worker failed unexpectedly. Check bot.log.")
                 if flight is not None:
+                    jobs = list(flight.jobs)
                     self.coordinator.abort(flight)
-                    self._after_failure_many(list(flight.jobs))
+                    if flight.media_key is None:
+                        self._clear_status_many(jobs)
+                    else:
+                        self._after_failure_many(jobs)
             finally:
                 self.queue.task_done()
 
@@ -187,9 +192,23 @@ class BotApplication:
             final_url = metadata.info.get("webpage_url")
             if isinstance(final_url, str):
                 validate_public_url(final_url)
-        except Exception:
-            self.log.exception("metadata failed job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
-            self._after_failure_many(self.coordinator.abort(flight))
+        except Exception as exc:
+            self.log.info(
+                "link ignored after media probe job_id=%s url=%s error=%s",
+                first.job_id,
+                safe_url_for_log(first.url),
+                type(exc).__name__,
+            )
+            self._clear_status_many(self.coordinator.abort(flight))
+            return
+
+        if not has_downloadable_video(metadata.info):
+            self.log.info(
+                "link ignored because no video was found job_id=%s url=%s",
+                first.job_id,
+                safe_url_for_log(first.url),
+            )
+            self._clear_status_many(self.coordinator.abort(flight))
             return
 
         media_key = f"{metadata.media_key}:mp4-h264-v2:{self.settings.max_filesize}"
@@ -360,6 +379,10 @@ class BotApplication:
     def _after_failure_many(self, jobs: list[Job]) -> None:
         for job in jobs:
             self._after_failure(job)
+
+    def _clear_status_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            self._clear_status_reaction(job)
 
     def _set_status_reaction(self, job: Job, emoji: str) -> bool:
         if not self.settings.status_reactions:
@@ -632,14 +655,14 @@ class BotApplication:
                 self.log.info("job queued job_id=%s chat_id=%s url=%s", job.job_id, chat_id, safe_url_for_log(url))
             except queue.Full:
                 self.coordinator.abort(flight)
-                self._after_failure(job)
+                self._clear_status_reaction(job)
                 self.log.warning("queue full job_id=%s chat_id=%s", job.job_id, chat_id)
                 self._operator_alert("The download queue is full. Check bot.log.")
         except UnsafeUrlError:
             self.log.warning("unsafe URL rejected chat_id=%s", getattr(message.chat, "id", None), exc_info=True)
         except Exception:
             if job is not None:
-                self._after_failure(job)
+                self._clear_status_reaction(job)
             self.log.exception("group handler failed chat_id=%s", getattr(message.chat, "id", None))
 
     @staticmethod

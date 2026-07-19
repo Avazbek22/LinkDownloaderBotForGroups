@@ -67,6 +67,8 @@ Instead, it uses reactions:
 | 👎 | The download failed |
 | 👍 | The video was posted, but the original link was kept |
 
+If the link turns out to be an ordinary article or another page without video, the bot simply removes 👀 and leaves the message untouched.
+
 When everything succeeds, the original link can be removed automatically.
 
 ### Faster when the same video appears again
