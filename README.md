@@ -1,219 +1,544 @@
+<div align="center">
+
 # Link Downloader Bot for Telegram Groups
 
-A quiet, self-hosted Telegram bot that replaces video links with the actual video. It is designed for small private groups: paste a supported link, and the bot downloads the video, posts it silently in the same topic, then removes the original message only after success.
+### Turn video links into clean Telegram posts — automatically.
 
-The bot intentionally sends no “downloading” or failure messages for automatic requests. A 👀 reaction means the link is being processed; a retained link changes to 👎 on failure or 👍 after success. If reactions are unavailable in a chat, the bot keeps working silently. Technical reasons are written to the rotating log.
+A self-hosted Telegram bot for group chats.  
+Someone shares a video link, and the bot quietly replaces it with the actual video.
 
-## Highlights
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![yt-dlp](https://img.shields.io/badge/powered_by-yt--dlp-FF0000)](https://github.com/yt-dlp/yt-dlp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- Supports YouTube, Instagram, TikTok, VK, X, Facebook and many other sites through [yt-dlp](https://github.com/yt-dlp/yt-dlp).
-- Silent messages and no link previews.
-- Quiet status reactions instead of progress messages.
-- Telegram forum topic support.
-- English and Russian interface; English is the default.
-- Per-user automatic-download opt-out.
-- Safe public-URL validation against local and private network addresses.
-- Bounded worker queue and concurrent downloads.
-- Single-flight deduplication: simultaneous copies of the same video are downloaded once.
-- Reuses Telegram `file_id`, avoiding repeated downloads and uploads.
-- Five-minute disk cache with automatic cleanup.
-- Atomic JSON storage with backups and migration from the legacy `prefs.json`.
-- Daily rotating logs retained for 60 days.
-- Reproducible Docker deployment with automatic application and yt-dlp updates, both with rollback.
+**YouTube · Instagram · TikTok · VK · X / Twitter · Facebook · and many more**
+
+[Install](#quick-start) ·
+[How it works](#how-it-works) ·
+[Features](#why-this-bot) ·
+[Configuration](#configuration) ·
+[Contributing](#contributing)
+
+</div>
+
+---
+
+## What does it change?
+
+Without the bot, a group message often looks like this:
+
+```text
+https://example.com/video/123456
+```
+
+With the bot, the same message becomes a normal Telegram video:
+
+```text
+🎬 Native video
+🔗 Clickable link to the original source
+👤 Name of the person who shared it
+```
+
+The group stays cleaner, videos are easier to watch, and nobody has to open a browser or use a separate download bot.
+
+## Why this bot?
+
+### Built for groups, not private chats
+
+There is no need to forward links to another bot, wait for menus, choose formats, and send the result back.
+
+Members simply post links as usual.
+
+### Quiet by design
+
+The bot does not fill the chat with messages like:
+
+- “Downloading…”
+- “Please wait…”
+- “Processing…”
+- “An error occurred…”
+
+Instead, it uses reactions:
+
+| Reaction | Meaning |
+|---|---|
+| 👀 | The link is being processed |
+| 👎 | The download failed |
+| 👍 | The video was posted, but the original link was kept |
+
+When everything succeeds, the original link can be removed automatically.
+
+### Faster when the same video appears again
+
+If the same video is shared more than once, the bot can reuse the copy already stored by Telegram.
+
+That means:
+
+- no second download;
+- no second upload;
+- less traffic;
+- less waiting;
+- lower VPS load.
+
+If several people post the same video at the same time, the bot downloads it only once and delivers it to everyone who requested it.
+
+### Works inside Telegram forum topics
+
+A link posted in a topic is replaced with a video in that same topic. The bot does not move the conversation somewhere else.
+
+### Self-hosted and under your control
+
+You run the bot on your own VPS:
+
+- your Telegram token stays on your server;
+- your settings stay on your server;
+- you control updates and limits;
+- there is no third-party subscription;
+- the project is open source.
+
+## Typical use cases
+
+This project is useful for:
+
+- private groups of friends;
+- Telegram communities;
+- news and discussion groups;
+- creator and moderation teams;
+- groups where video links are shared frequently;
+- self-hosters who do not want to depend on public downloader bots.
 
 ## How it works
 
 1. A member posts a video link.
-2. After accepting the job, the bot reacts with 👀 and quietly downloads the video.
-3. The bot publishes the video silently in the same chat topic.
-4. After a successful upload, it removes the original link if it has permission; otherwise it changes the reaction to 👍.
-5. If processing fails, the original link remains with a 👎 reaction.
+2. The bot marks it with 👀.
+3. The video is downloaded and posted silently.
+4. The caption keeps a link to the original source and the sender's name.
+5. After a successful upload, the original link is removed when the bot has permission.
+6. If something fails, the original message remains available.
 
-When the same video is posted again, the bot normally sends the existing Telegram media by `file_id`. Captions and sender attribution are still generated independently for every group.
+```mermaid
+flowchart LR
+    A[Member posts a video link] --> B[Bot processes it quietly]
+    B --> C[Video appears in the same chat or topic]
+    C --> D[Original link is removed after success]
+```
+
+## Why this project is different
+
+| Capability | Link Downloader Bot |
+|---|---|
+| Made specifically for Telegram groups | ✅ |
+| Works without a `/download` command | ✅ |
+| Does not spam the chat with progress messages | ✅ |
+| Keeps videos in the same forum topic | ✅ |
+| Remembers previously uploaded videos | ✅ |
+| Avoids duplicate simultaneous downloads | ✅ |
+| Can delete the original link only after success | ✅ |
+| Supports English and Russian | ✅ |
+| Runs on your own VPS | ✅ |
+| Includes Docker installation and safe updates | ✅ |
+
+## Supported sites
+
+The bot uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports a large number of video websites.
+
+Common examples:
+
+- YouTube
+- Instagram
+- TikTok
+- VK
+- X / Twitter
+- Facebook
+
+Support for individual websites can change when those websites change their APIs or protection systems. The project includes an optional nightly yt-dlp updater to help keep extractors current.
+
+Some websites may require cookies. DRM-protected content is not supported.
+
+## Quick start
+
+### You need
+
+- a Debian or Ubuntu VPS;
+- a Telegram bot token from [@BotFather](https://t.me/BotFather);
+- permission to add the bot to your group.
+
+Docker and other required packages can be installed automatically by the installer.
+
+### Install
+
+```bash
+sudo git clone \
+  https://github.com/Avazbek22/LinkDownloaderBotForGroups.git \
+  /opt/linkdownloaderbot
+
+sudo bash /opt/linkdownloaderbot/install.sh
+```
+
+The installer asks for the Telegram bot token, builds the container, starts the bot, and prepares automatic updates when systemd is available.
+
+To update an existing installation, run the same command again:
+
+```bash
+sudo bash /opt/linkdownloaderbot/install.sh
+```
+
+Your `.env`, settings, cache metadata, and logs are preserved.
 
 ## Telegram setup
 
-Create a bot with [@BotFather](https://t.me/BotFather), then:
+Create a bot through [@BotFather](https://t.me/BotFather), then:
 
-1. Disable **Group Privacy** under **Bot Settings → Group Privacy**. Otherwise the bot cannot see ordinary group messages.
-2. Add the bot to a group.
-3. Grant **Delete messages** if original links should be removed.
+1. Open **Bot Settings**.
+2. Open **Group Privacy**.
+3. Disable Group Privacy.
+4. Add the bot to your Telegram group.
+5. Grant **Delete messages** permission when you want original links removed.
 
 No other administrator rights are required.
 
-## Installation
+After startup, send:
 
-On a clean Debian or Ubuntu VPS, clone the repository you want to follow and run its installer:
-
-```bash
-sudo git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git /opt/linkdownloaderbot
-sudo bash /opt/linkdownloaderbot/install.sh
+```text
+/help
 ```
 
-The installer asks only for the Telegram bot token. It installs missing prerequisites, creates the local configuration, starts the bot, and enables safe automatic updates. Running it again updates the installation without replacing `.env`, `data/`, or `logs/`.
+## Basic usage
 
-To run your own fork, use its clone URL instead:
+For normal use, members only need to post a supported link.
 
-```bash
-sudo git clone https://github.com/YOUR_NAME/LinkDownloaderBotForGroups.git /opt/linkdownloaderbot
-sudo bash /opt/linkdownloaderbot/install.sh
+```text
+https://www.youtube.com/watch?v=...
 ```
 
-The installer detects the repository's `origin`, so a fork follows its own `main` branch and never the original owner's repository. The bot token remains only in `/opt/linkdownloaderbot/.env`; it is not sent to GitHub. The installer refuses automatic updates when tracked server files contain local changes.
+No command is required.
 
-For a manual Docker setup without the installer:
+### Commands
+
+| Command | What it does |
+|---|---|
+| `/start` | Show the introduction |
+| `/help` | Show usage instructions |
+| `/en` | Change the group language to English |
+| `/ru` | Change the group language to Russian |
+| `/settings` | Show group settings |
+| `/delete_original on` | Delete processed links after success |
+| `/delete_original off` | Keep original links |
+
+Language and group settings can be changed only by group administrators.
+
+### Personal opt-out
+
+A member can disable automatic downloads only for themselves:
+
+```text
+@BotName me
+```
+
+or:
+
+```text
+@BotName я
+```
+
+After opting out, that member can still request a download manually:
+
+```text
+@BotName https://example.com/video
+```
+
+Other members are not affected.
+
+## Manual Docker installation
 
 ```bash
 git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git
 cd LinkDownloaderBotForGroups
+
 cp .env-example .env
 nano .env
+
 docker compose up -d --build
 docker compose logs -f --tail=200
 ```
 
+Only `BOT_TOKEN` is required for a basic setup.
+
 ## Configuration
 
-Only `BOT_TOKEN` is required.
+The default settings are suitable for a small private bot.
 
-| Variable | Default | Description |
+The most useful options are:
+
+| Variable | Default | Purpose |
 |---|---:|---|
-| `BOT_TOKEN` | — | Telegram bot token |
-| `LOGS_CHAT_ID` | empty | Optional chat for future critical operational notifications |
-| `MAX_FILESIZE` | `52428800` | Maximum upload size in bytes |
-| `WORKERS` | `2` | Concurrent download workers |
-| `MAX_QUEUE` | `200` | In-memory queue capacity |
-| `UPLOAD_WORKERS` | `2` | Concurrent local-file uploads to Telegram |
-| `JOB_TIMEOUT_SECONDS` | `900` | Download deadline |
-| `DEFAULT_LANGUAGE` | `en` | Default UI language: `en` or `ru` |
-| `DELETE_ORIGINAL` | `true` | Remove a link after successful delivery |
-| `MEDIA_CACHE_ENABLED` | `true` | Enable disk and Telegram `file_id` caches |
-| `STATUS_REACTIONS` | `true` | Use 👀 while processing and 👎/👍 for retained links |
-| `DISK_CACHE_MAX_FILES` | `5` | Maximum recent media files on disk |
-| `DISK_CACHE_TTL_SECONDS` | `300` | Disk-cache lifetime after last use |
-| `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum persistent Telegram media entries |
-| `FILE_ID_CACHE_TTL_DAYS` | `30` | Telegram media-cache lifetime |
-| `COOKIES_FILE` | empty | Optional cookies file; `/app/data/cookies.txt` is convenient in Docker |
-| `LOG_LEVEL` | `INFO` | Python logging level |
-| `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Concurrent fragments per download |
+| `BOT_TOKEN` | required | Telegram bot token |
+| `DEFAULT_LANGUAGE` | `en` | Default language: `en` or `ru` |
+| `DELETE_ORIGINAL` | `true` | Remove links after successful delivery |
+| `MAX_FILESIZE` | `52428800` | Maximum video size in bytes |
+| `WORKERS` | `2` | Simultaneous downloads |
+| `UPLOAD_WORKERS` | `2` | Simultaneous Telegram uploads |
+| `MAX_QUEUE` | `200` | Number of waiting requests |
+| `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
+| `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
+| `STATUS_REACTIONS` | `true` | Show 👀, 👎, and 👍 reactions |
+| `COOKIES_FILE` | empty | Optional cookies file for restricted websites |
+| `LOG_LEVEL` | `INFO` | Logging detail level |
 
-See [.env-example](.env-example) for yt-dlp site-specific options.
+See [`.env-example`](.env-example) for all available settings.
 
-## Commands
+### Small VPS profile
 
-- `/start` and `/help` — show instructions.
-- `/en` or `/ru` — change the language; group administrators only.
-- `/settings` — show the current group settings; group administrators only.
-- `/delete_original on` or `/delete_original off` — configure successful-link deletion; group administrators only.
-- `@BotName me` or `@BotName я` — toggle automatic downloads for yourself.
-- When opted out, use `@BotName <link>` for a manual download.
+For a low-traffic bot on a VPS with limited memory:
 
-The bot remains silent for ordinary automatic failures by design.
+```env
+WORKERS=1
+UPLOAD_WORKERS=1
+MAX_QUEUE=30
+YTDLP_CONCURRENT_FRAGMENTS=2
+DISK_CACHE_MAX_FILES=3
+```
 
-## Persistent data
+<details>
+<summary><strong>Advanced configuration</strong></summary>
 
-Runtime state is stored in `data/`:
+| Variable | Default | Purpose |
+|---|---:|---|
+| `LOGS_CHAT_ID` | empty | Optional operator chat for critical notifications |
+| `DISK_CACHE_MAX_FILES` | `5` | Maximum recent files kept on disk |
+| `DISK_CACHE_TTL_SECONDS` | `300` | Lifetime of recent disk files |
+| `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum remembered Telegram media entries |
+| `FILE_ID_CACHE_TTL_DAYS` | `30` | Lifetime of Telegram media entries |
+| `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallel download fragments |
+| `YTDLP_JS_RUNTIMES` | `node` | JavaScript runtime for yt-dlp |
+| `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Optional yt-dlp components |
+| `YTDLP_INSTAGRAM_IMPERSONATE` | `chrome` | Browser impersonation for Instagram |
+| `YTDLP_INSTAGRAM_RETRIES` | `8` | Instagram request retries |
+| `YTDLP_INSTAGRAM_FRAGMENT_RETRIES` | `8` | Instagram fragment retries |
+| `YTDLP_INSTAGRAM_SOCKET_TIMEOUT` | `30` | Instagram timeout in seconds |
+
+</details>
+
+## What happens when a video is shared twice?
+
+The bot tries to avoid repeated work at several levels:
+
+1. Equal links posted at the same time are grouped into one job.
+2. Different links that point to the same video are detected after metadata extraction.
+3. Recently downloaded files can be reused from the disk cache.
+4. Previously uploaded Telegram videos can be sent again using their `file_id`.
+
+This is especially useful in several groups or active communities, where the same popular video may be shared repeatedly.
+
+## Data and privacy
+
+The bot stores only the data needed to operate:
 
 ```text
 data/
-├── settings.json       # per-chat language and settings
-├── users.json          # per-user opt-out choices
+├── settings.json       # group language and preferences
+├── users.json          # personal opt-out choices
 ├── state.json          # welcome and migration state
-├── media_cache.json    # Telegram file_id cache
-└── cache/              # short-lived downloaded media
+├── media_cache.json    # reusable Telegram media references
+└── cache/              # temporary video files
 ```
 
-Writes use a temporary file, `fsync`, and atomic replacement. A last-known-good `.bak` file is retained. Invalid JSON is quarantined rather than silently overwritten. Existing `data/prefs.json` is imported once and left untouched as a fallback.
+Temporary media files are cleaned automatically.
+
+Settings are written safely with temporary files and backups. If a JSON file becomes corrupted, the bot quarantines it and attempts to restore the last valid copy.
 
 ## Logs
 
-Application logs are written to stdout and `logs/bot.log`. They rotate daily at UTC midnight, with 60 daily files retained. Query strings are omitted from logged URLs to reduce accidental exposure of tokens.
+View container logs:
 
 ```bash
 docker compose logs -f --tail=200
-ls -la logs/
 ```
 
-## Automatic yt-dlp updates
+Application logs are also written to:
 
-Video extractors change frequently. `install.sh` enables a nightly systemd timer when systemd is available. The updater:
+```text
+logs/bot.log
+```
 
-1. preserves the current Docker image as a rollback image;
-2. refreshes only the yt-dlp image layer;
-3. runs an import/version smoke test;
-4. recreates the service;
-5. restores the previous image if the new container does not stay running.
+They rotate daily. Old files are removed automatically after the retention period.
 
-Updater output is stored in daily `logs/updater-YYYY-MM-DD.log` files and retained for 60 days.
+Sensitive URL query parameters are not written to logs.
+
+<details>
+<summary><strong>Limit Docker log size</strong></summary>
+
+Add this to the service in `docker-compose.yml`:
+
+```yaml
+logging:
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+```
+
+</details>
+
+## Updates and recovery
+
+Video websites change frequently, so yt-dlp may need regular updates.
+
+On systemd-based installations, the installer can enable:
+
+- a nightly yt-dlp update;
+- automatic application updates from the installation repository.
+
+Updates are tested before the running bot is replaced. If the new version fails to start correctly, the previous version is restored.
+
+Your token, settings, logs, and persistent data are not replaced.
+
+<details>
+<summary><strong>Useful update commands</strong></summary>
 
 ```bash
 systemctl status linkdownloaderbotforgroups-yt-dlp-update.timer
-sudo systemctl start linkdownloaderbotforgroups-yt-dlp-update.service
+
+sudo systemctl start \
+  linkdownloaderbotforgroups-yt-dlp-update.service
 ```
-
-Other dependencies are deliberately updated through reviewed pull requests instead of unattended nightly upgrades.
-
-## Automatic application updates
-
-On a systemd VPS, the installer enables a timer that checks the installation's own `origin/main` every two minutes. This works identically for the original repository and forks—there are no deployment branches, GitHub secrets, webhooks, or inbound SSH access to configure.
-
-When a new commit appears, the deployer:
-
-1. accepts only a fast-forward update and refuses tracked local modifications;
-2. preserves the current image for rollback;
-3. builds the new image before replacing the running bot;
-4. verifies the application and Telegram token with `getMe`;
-5. starts the new container and checks that it remains stable;
-6. restores the previous commit and image if any step fails.
-
-The failed commit is not retried until a newer commit appears. Runtime configuration and persistent data remain on the VPS. For safer maintenance, protect `main` and require the included CI checks before merging pull requests.
-
-Changes limited to documentation, repository metadata, development dependencies, or tests update the server checkout without rebuilding or restarting the running bot. Mixed commits and every unknown file are treated as runtime changes and receive the full deployment procedure.
-
-Useful commands:
 
 ```bash
 systemctl status linkdownloaderbotforgroups-deploy.timer
-systemctl start linkdownloaderbotforgroups-deploy.service
-tail -f /opt/linkdownloaderbot/logs/deploy-$(date -u +%Y-%m-%d).log
+
+sudo systemctl start \
+  linkdownloaderbotforgroups-deploy.service
 ```
 
-To stop automatic application updates without stopping the bot:
+Disable automatic application updates:
 
 ```bash
-systemctl disable --now linkdownloaderbotforgroups-deploy.timer
+sudo systemctl disable --now \
+  linkdownloaderbotforgroups-deploy.timer
 ```
+
+</details>
+
+## Security
+
+The project rejects links that point to:
+
+- localhost;
+- private networks;
+- loopback addresses;
+- link-local addresses;
+- non-public IP destinations;
+- URLs containing usernames or passwords.
+
+The Docker container runs with a read-only filesystem where possible and without additional privileges.
+
+Secrets, cookies, downloaded media, and logs are excluded from Git.
+
+For a public or untrusted deployment, host-level firewall rules are still recommended. Application checks reduce risk but cannot replace network isolation in every possible redirect or DNS-rebinding case.
+
+Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
+
+## Troubleshooting
+
+### The bot ignores ordinary group messages
+
+Disable **Group Privacy** in BotFather and restart the bot.
+
+### Videos are posted, but links are not removed
+
+Grant the bot permission to delete messages, or use:
+
+```text
+/delete_original off
+```
+
+### A website suddenly stops working
+
+Update yt-dlp and inspect the logs:
+
+```bash
+sudo systemctl start \
+  linkdownloaderbotforgroups-yt-dlp-update.service
+
+docker compose logs --tail=200
+```
+
+Some websites may require fresh cookies.
+
+### The bot does not start
+
+```bash
+docker compose ps
+docker compose logs --tail=200
+```
+
+Check that `.env` contains a valid `BOT_TOKEN`.
 
 ## Development
 
 Python 3.11 or newer is supported.
 
 ```bash
+git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git
+cd LinkDownloaderBotForGroups
+
 python -m venv .venv
 source .venv/bin/activate
+
 python -m pip install -r requirements-dev.txt
+
 python -m ruff check .
 python -m ruff format --check .
 python -m pytest
+docker build -t linkdownloaderbotforgroups:test .
 ```
 
-The tests do not require a real Telegram token or live video sites.
-
-## Security and privacy
-
-- Secrets belong in `.env`, which is excluded from Git and Docker build context.
-- URLs containing credentials or resolving to non-public IPv4/IPv6 addresses are rejected.
-- The application runs as an unprivileged user after preparing its two writable directories.
-- The container filesystem is read-only except for `data`, `logs`, and `/tmp`.
-- Full URL query strings are not written to application logs.
-- For an internet-facing deployment, also block private-network egress in the host firewall. Application-level DNS checks reduce SSRF risk but cannot replace network-level egress policy against every redirect or DNS-rebinding scenario.
-
-Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
-
-## Legal notice
-
-Use the bot only for content you are allowed to download and share. Site terms, copyright law and local regulations remain the operator's responsibility. This project does not bypass DRM.
+Tests do not require a real Telegram token or live video websites.
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. The project is released under the [MIT License](LICENSE).
+Contributions are welcome.
+
+Good contribution areas include:
+
+- clearer documentation;
+- new translations;
+- better support for individual video websites;
+- Telegram group and topic improvements;
+- tests;
+- deployment improvements;
+- lower-resource operating modes;
+- cache and queue improvements.
+
+Before opening a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+For bugs and feature requests, use [GitHub Issues](https://github.com/Avazbek22/LinkDownloaderBotForGroups/issues).
+
+## Legal notice
+
+Use this project only for content you are allowed to download and share.
+
+The operator is responsible for complying with:
+
+- website terms;
+- copyright law;
+- privacy rules;
+- Telegram rules;
+- local regulations.
+
+This project does not bypass DRM and does not grant rights to third-party content.
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+---
+
+<div align="center">
+
+**A cleaner way to share videos in Telegram groups.**
+
+⭐ Star the repository if the project is useful to you.
+
+</div>
