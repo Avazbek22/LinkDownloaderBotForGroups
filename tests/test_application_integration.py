@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.sends = []
         self.deletes = []
+        self.reactions = []
 
     def send_video(self, *, video, **kwargs):
         self.sends.append((video, kwargs))
@@ -20,6 +22,11 @@ class FakeBot:
 
     def delete_message(self, chat_id, message_id):
         self.deletes.append((chat_id, message_id))
+
+    def set_message_reaction(self, chat_id, message_id, reaction, **kwargs):
+        emoji = reaction[0].emoji if reaction else None
+        self.reactions.append((chat_id, message_id, emoji, kwargs))
+        return True
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -41,6 +48,7 @@ def _settings(tmp_path: Path) -> Settings:
         file_id_cache_max_items=500,
         file_id_cache_ttl_days=30,
         media_cache_enabled=True,
+        status_reactions=True,
         delete_original=True,
         default_language="en",
         log_level="INFO",
@@ -121,3 +129,162 @@ def test_extract_first_url_trims_punctuation() -> None:
 def test_self_mention_requires_a_message_token() -> None:
     assert main.BotApplication._self_mention("hello @alice", "alice")
     assert not main.BotApplication._self_mention("https://example.com/@alice/video", "alice")
+
+
+def test_status_reaction_lifecycle_for_retained_link(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "reaction",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "User",
+        False,
+    )
+
+    app._set_status_reaction(job, "👀")
+    app._after_success(job)
+    app._after_failure(job)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "👍", "👎"]
+    assert fake.deletes == []
+
+
+def test_successful_deleted_link_needs_no_success_reaction(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "deleted",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "User",
+        True,
+    )
+
+    app._set_status_reaction(job, "👀")
+    app._after_success(job)
+
+    assert [item[2] for item in fake.reactions] == ["👀"]
+    assert fake.deletes == [(-100, 42)]
+
+
+def test_reaction_failure_never_breaks_processing(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    job = Job("job", -100, None, 42, 7, "https://example.com", "key", "User", True)
+
+    class ReactionsDisabledBot(FakeBot):
+        def set_message_reaction(self, *_args, **_kwargs):
+            raise RuntimeError("reactions disabled")
+
+    app.bot = ReactionsDisabledBot()
+    app._set_status_reaction(job, "👀")
+
+
+def test_disallowed_failure_reaction_clears_stale_eyes(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    job = Job("job", -100, None, 42, 7, "https://example.com", "key", "User", True)
+
+    class RestrictedBot(FakeBot):
+        def set_message_reaction(self, chat_id, message_id, reaction, **kwargs):
+            if reaction and reaction[0].emoji == "👎":
+                raise RuntimeError("reaction not allowed")
+            return super().set_message_reaction(chat_id, message_id, reaction, **kwargs)
+
+    fake = RestrictedBot()
+    app.bot = fake
+    app._set_status_reaction(job, "👀")
+    app._after_failure(job)
+
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+
+
+def test_reactions_can_be_disabled(tmp_path) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), status_reactions=False))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("job", -100, None, 42, 7, "https://example.com", "key", "User", True)
+
+    app._set_status_reaction(job, "👀")
+
+    assert fake.reactions == []
+
+
+def test_accepted_group_link_gets_eyes(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    app._handle_group_message(message)
+
+    assert [item[2] for item in fake.reactions] == ["👀"]
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    app.coordinator.abort(flight)
+
+
+def test_full_queue_replaces_eyes_with_failure(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), max_queue=1))
+    fake = FakeBot()
+    app.bot = fake
+    app.queue.put_nowait(None)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    app._handle_group_message(message)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "👎"]
+
+
+def test_metadata_failure_replaces_eyes_for_every_joined_job(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = None
+    for index in range(2):
+        job = Job(
+            f"failed-{index}",
+            -(index + 1),
+            None,
+            index + 10,
+            index + 20,
+            "https://example.com/video",
+            "https://example.com/video",
+            f"User {index}",
+            True,
+        )
+        app._set_status_reaction(job, "👀")
+        flight = app.coordinator.submit(job) or flight
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(RuntimeError("failed")))
+
+    app._process_flight(flight)
+
+    by_message: dict[int, list[str]] = {}
+    for _, message_id, emoji, _ in fake.reactions:
+        by_message.setdefault(message_id, []).append(emoji)
+    assert by_message == {10: ["👀", "👎"], 11: ["👀", "👎"]}

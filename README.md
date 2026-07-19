@@ -2,12 +2,13 @@
 
 A quiet, self-hosted Telegram bot that replaces video links with the actual video. It is designed for small private groups: paste a supported link, and the bot downloads the video, posts it silently in the same topic, then removes the original message only after success.
 
-The bot intentionally sends no “downloading” or failure messages for automatic requests. If a source is unavailable, the original link stays untouched and the technical reason is written to the rotating log.
+The bot intentionally sends no “downloading” or failure messages for automatic requests. A 👀 reaction means the link is being processed; a retained link changes to 👎 on failure or 👍 after success. If reactions are unavailable in a chat, the bot keeps working silently. Technical reasons are written to the rotating log.
 
 ## Highlights
 
 - Supports YouTube, Instagram, TikTok, VK, X, Facebook and many other sites through [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 - Silent messages and no link previews.
+- Quiet status reactions instead of progress messages.
 - Telegram forum topic support.
 - English and Russian interface; English is the default.
 - Per-user automatic-download opt-out.
@@ -23,9 +24,10 @@ The bot intentionally sends no “downloading” or failure messages for automat
 ## How it works
 
 1. A member posts a video link.
-2. The bot validates the URL and quietly downloads the video.
+2. After accepting the job, the bot reacts with 👀 and quietly downloads the video.
 3. The bot publishes the video silently in the same chat topic.
-4. After a successful upload, it removes the original link if it has permission.
+4. After a successful upload, it removes the original link if it has permission; otherwise it changes the reaction to 👍.
+5. If processing fails, the original link remains with a 👎 reaction.
 
 When the same video is posted again, the bot normally sends the existing Telegram media by `file_id`. Captions and sender attribution are still generated independently for every group.
 
@@ -76,6 +78,7 @@ Only `BOT_TOKEN` is required.
 | `DEFAULT_LANGUAGE` | `en` | Default UI language: `en` or `ru` |
 | `DELETE_ORIGINAL` | `true` | Remove a link after successful delivery |
 | `MEDIA_CACHE_ENABLED` | `true` | Enable disk and Telegram `file_id` caches |
+| `STATUS_REACTIONS` | `true` | Use 👀 while processing and 👎/👍 for retained links |
 | `DISK_CACHE_MAX_FILES` | `5` | Maximum recent media files on disk |
 | `DISK_CACHE_TTL_SECONDS` | `300` | Disk-cache lifetime after last use |
 | `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum persistent Telegram media entries |
