@@ -14,7 +14,13 @@ from typing import Any
 
 import telebot
 
-from app.download_backend import MediaMetadata, download_metadata, extract_metadata, find_downloaded_file
+from app.download_backend import (
+    MediaMetadata,
+    display_source_name,
+    download_metadata,
+    extract_metadata,
+    find_downloaded_file,
+)
 from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job
 from app.logging_setup import configure_logging
@@ -162,7 +168,7 @@ class BotApplication:
             media_key, file_id, source_name = cached
             if not self.coordinator.promote(flight, media_key):
                 return
-            metadata = MediaMetadata(first.url, {"id": media_key}, media_key, source_name)
+            metadata = MediaMetadata(first.url, {"id": media_key}, media_key, display_source_name(source_name))
             while True:
                 batch = self.coordinator.pending(flight)
                 if batch:
@@ -453,6 +459,8 @@ class BotApplication:
                 [
                     telebot.types.BotCommand("start", "Show instructions"),
                     telebot.types.BotCommand("help", "Show instructions"),
+                    telebot.types.BotCommand("en", "Switch to English (admins)"),
+                    telebot.types.BotCommand("ru", "Переключить на русский (админы)"),
                     telebot.types.BotCommand("language", "Change language (admins)"),
                     telebot.types.BotCommand("settings", "Show group settings"),
                     telebot.types.BotCommand("delete_original", "Configure link deletion (admins)"),
@@ -460,6 +468,21 @@ class BotApplication:
             )
         except Exception:
             self.log.exception("cannot set Telegram commands")
+
+    def _handle_language_command(self, message: Any, requested: str | None) -> None:
+        chat_id = int(message.chat.id)
+        current = self.storage.chat_language(chat_id)
+        if requested is None:
+            self._safe_message(chat_id, tr(current, "language_current", language=current))
+            return
+        if requested not in {"en", "ru"}:
+            self._safe_message(chat_id, tr(current, "language_invalid"))
+            return
+        if getattr(message.chat, "type", "") != "private" and not self._is_admin(chat_id, int(message.from_user.id)):
+            self._safe_message(chat_id, tr(current, "language_admin_only"))
+            return
+        self.storage.set_chat_language(chat_id, requested)
+        self._safe_message(chat_id, tr(requested, "language_changed"))
 
     def _register_handlers(self) -> None:
         bot = self.bot
@@ -495,25 +518,12 @@ class BotApplication:
             if private:
                 self.storage.mark_welcomed("private", int(message.from_user.id))
 
-        @bot.message_handler(commands=["language"])
+        @bot.message_handler(commands=["language", "en", "ru"])
         def language(message: Any) -> None:
-            chat_id = int(message.chat.id)
-            current = self.storage.chat_language(chat_id)
             parts = (message.text or "").split()
-            if len(parts) == 1:
-                self._safe_message(chat_id, tr(current, "language_current", language=current))
-                return
-            requested = parts[1].lower()
-            if requested not in {"en", "ru"}:
-                self._safe_message(chat_id, tr(current, "language_invalid"))
-                return
-            if getattr(message.chat, "type", "") != "private" and not self._is_admin(
-                chat_id, int(message.from_user.id)
-            ):
-                self._safe_message(chat_id, tr(current, "language_admin_only"))
-                return
-            self.storage.set_chat_language(chat_id, requested)
-            self._safe_message(chat_id, tr(requested, "language_changed"))
+            command = parts[0].split("@", 1)[0].lstrip("/").lower() if parts else "language"
+            requested = command if command in {"en", "ru"} else (parts[1].lower() if len(parts) > 1 else None)
+            self._handle_language_command(message, requested)
 
         @bot.message_handler(commands=["settings"])
         def group_settings(message: Any) -> None:

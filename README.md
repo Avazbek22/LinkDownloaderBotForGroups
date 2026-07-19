@@ -92,8 +92,8 @@ See [.env-example](.env-example) for yt-dlp site-specific options.
 ## Commands
 
 - `/start` and `/help` — show instructions.
-- `/language` — show the current language.
-- `/language en` or `/language ru` — change the group language; group administrators only.
+- `/en` or `/ru` — change the language; group administrators only.
+- `/language` and `/language en|ru` — compatible long form.
 - `/settings` — show the current group settings; group administrators only.
 - `/delete_original on` or `/delete_original off` — configure successful-link deletion; group administrators only.
 - `@BotName me` or `@BotName я` — toggle automatic downloads for yourself.

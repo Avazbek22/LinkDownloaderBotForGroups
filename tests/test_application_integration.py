@@ -15,6 +15,7 @@ class FakeBot:
         self.sends = []
         self.deletes = []
         self.reactions = []
+        self.messages = []
 
     def send_video(self, *, video, **kwargs):
         self.sends.append((video, kwargs))
@@ -26,6 +27,10 @@ class FakeBot:
     def set_message_reaction(self, chat_id, message_id, reaction, **kwargs):
         emoji = reaction[0].emoji if reaction else None
         self.reactions.append((chat_id, message_id, emoji, kwargs))
+        return True
+
+    def send_message(self, chat_id, text, **kwargs):
+        self.messages.append((chat_id, text, kwargs))
         return True
 
 
@@ -288,3 +293,19 @@ def test_metadata_failure_replaces_eyes_for_every_joined_job(tmp_path, monkeypat
     for _, message_id, emoji, _ in fake.reactions:
         by_message.setdefault(message_id, []).append(emoji)
     assert by_message == {10: ["👀", "👎"], 11: ["👀", "👎"]}
+
+
+def test_short_language_command_changes_group_language(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    monkeypatch.setattr(app, "_is_admin", lambda *_args: True)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7),
+    )
+
+    app._handle_language_command(message, "ru")
+
+    assert app.storage.chat_language(-100) == "ru"
+    assert "русский" in fake.messages[-1][1]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,25 @@ class MediaMetadata:
     info: dict[str, Any]
     media_key: str
     source_name: str
+
+
+_SOURCE_NAMES = {
+    "youtube": "YouTube",
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+    "twitter": "X",
+    "facebook": "Facebook",
+    "vkontakte": "VK",
+    "vk": "VK",
+}
+
+
+def display_source_name(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Video"
+    key = re.sub(r"[^a-z0-9]", "", raw.lower())
+    return _SOURCE_NAMES.get(key, raw)
 
 
 def _duration(info: dict[str, Any]) -> int | None:
@@ -183,7 +203,7 @@ def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata
     media_id = str(info.get("id") or info.get("display_id") or "").strip()
     if not media_id:
         raise RuntimeError("extractor returned no media id")
-    source = str(info.get("extractor_key") or info.get("extractor") or "Video")
+    source = display_source_name(str(info.get("extractor_key") or info.get("extractor") or "Video"))
     return MediaMetadata(url=url, info=info, media_key=f"{extractor}:{media_id}", source_name=source)
 
 

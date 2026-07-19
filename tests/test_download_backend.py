@@ -3,7 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from app import download_backend
-from app.download_backend import MediaMetadata, download_metadata, select_format
+from app.download_backend import MediaMetadata, display_source_name, download_metadata, select_format
+
+
+def test_source_names_use_brand_spelling() -> None:
+    assert display_source_name("Youtube") == "YouTube"
+    assert display_source_name("youtube") == "YouTube"
+    assert display_source_name("TikTok") == "TikTok"
+    assert display_source_name("VKontakte") == "VK"
+    assert display_source_name("CustomExtractor") == "CustomExtractor"
 
 
 def test_selects_best_format_that_fits() -> None:

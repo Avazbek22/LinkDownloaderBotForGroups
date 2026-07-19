@@ -10,7 +10,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "2. Disable Group Privacy in BotFather.\n"
             "3. Grant permission to delete messages.\n\n"
             "Post a video link and I will quietly replace it with the video.\n\n"
-            "Use /language en or /language ru to change the language.\n"
+            "Use /en or /ru to change the language.\n"
             'Source: <a href="{repo_url}">GitHub</a>'
         ),
         "group_help": (
@@ -20,7 +20,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "<b>Personal opt-out</b>\n"
             "Send {bot_mention} me to toggle automatic downloads for yourself.\n"
             "When disabled, use {bot_mention} &lt;link&gt;.\n\n"
-            "Administrators can change the language with /language en or /language ru."
+            "Administrators can change the language with /en or /ru."
         ),
         "admin_hint": (
             "⚠️ <b>Administrator permission recommended</b>\n"
@@ -52,7 +52,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "2. Отключите Group Privacy в BotFather.\n"
             "3. Разрешите удалять сообщения.\n\n"
             "Отправьте ссылку на видео — я тихо заменю её готовым видео.\n\n"
-            "Язык: /language en или /language ru.\n"
+            "Язык: /en или /ru.\n"
             'Исходный код: <a href="{repo_url}">GitHub</a>'
         ),
         "group_help": (
@@ -62,7 +62,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "<b>Персональное отключение</b>\n"
             "Отправьте {bot_mention} я, чтобы отключить или включить автоматическое скачивание для себя.\n"
             "Когда оно отключено, используйте {bot_mention} &lt;ссылка&gt;.\n\n"
-            "Администраторы могут изменить язык: /language en или /language ru."
+            "Администраторы могут изменить язык: /en или /ru."
         ),
         "admin_hint": (
             "⚠️ <b>Рекомендуются права администратора</b>\n"
