@@ -1,291 +1,177 @@
-# LinkDownloaderBotForGroups — Telegram-бот для скачивания видео по ссылкам в группах
+# Link Downloader Bot for Telegram Groups
 
-**LinkDownloaderBotForGroups** — это Telegram-бот для групп/супергрупп: Вы кидаете ссылку на видео (YouTube/Instagram/TikTok/VK/X/Facebook/Telegram и др.), бот скачивает ролик через **yt-dlp**, публикует видео в чат и (опционально) удаляет исходное сообщение со ссылкой.
+A quiet, self-hosted Telegram bot that replaces video links with the actual video. It is designed for small private groups: paste a supported link, and the bot downloads the video, posts it silently in the same topic, then removes the original message only after success.
 
-Ключевые слова (для поиска): **telegram bot downloader**, **yt-dlp telegram bot**, **скачать видео по ссылке в телеграм**, **бот для групп скачивает youtube instagram tiktok vk**.
+The bot intentionally sends no “downloading” or failure messages for automatic requests. If a source is unavailable, the original link stays untouched and the technical reason is written to the rotating log.
 
----
+## Highlights
 
-## Что умеет
+- Supports YouTube, Instagram, TikTok, VK, X, Facebook and many other sites through [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+- Silent messages and no link previews.
+- Telegram forum topic support.
+- English and Russian interface; English is the default.
+- Per-user automatic-download opt-out.
+- Safe public-URL validation against local and private network addresses.
+- Bounded worker queue and concurrent downloads.
+- Single-flight deduplication: simultaneous copies of the same video are downloaded once.
+- Reuses Telegram `file_id`, avoiding repeated downloads and uploads.
+- Five-minute disk cache with automatic cleanup.
+- Atomic JSON storage with backups and migration from the legacy `prefs.json`.
+- Daily rotating logs retained for 60 days.
+- Reproducible Docker deployment and an optional nightly yt-dlp updater with rollback.
 
-* ✅ Скачивает видео по ссылкам и отправляет в чат как **video** (с поддержкой streaming).
-* ✅ Работает в **группах и супергруппах**, включая **темы** (topics) — отвечает в нужном треде.
-* ✅ Поддерживает множество источников (зависит от yt-dlp и доступности контента).
-* ✅ **Без лишних уведомлений** (silent) и без превью ссылок.
-* ✅ **Очередь и воркеры**: несколько скачиваний параллельно, чтобы не блокировать чат.
-* ✅ **Персональный opt-out**: участник может отключить авто-скачивание для себя.
-* ✅ Настраиваемые ограничения: размер файла, папка, cookies, чат логов.
-* ✅ Установка одной командой через `install.sh` (Docker-рекомендуемый режим).
+## How it works
 
----
+1. A member posts a video link.
+2. The bot validates the URL and quietly downloads the video.
+3. The bot publishes the video silently in the same chat topic.
+4. After a successful upload, it removes the original link if it has permission.
 
-## Как это выглядит в группе
+When the same video is posted again, the bot normally sends the existing Telegram media by `file_id`. Captions and sender attribution are still generated independently for every group.
 
-1. Участник отправляет ссылку на видео.
-2. Бот скачивает ролик.
-3. Бот публикует видео в группу.
-4. Бот удаляет исходное сообщение со ссылкой (если у бота есть право **Delete messages**).
+## Telegram setup
 
-Под подписью к видео бот добавляет:
+Create a bot with [@BotFather](https://t.me/BotFather), then:
 
-* кликабельную ссылку на оригинал
-* кто отправил ссылку
+1. Disable **Group Privacy** under **Bot Settings → Group Privacy**. Otherwise the bot cannot see ordinary group messages.
+2. Add the bot to a group.
+3. Grant **Delete messages** if original links should be removed.
 
----
+No other administrator rights are required.
 
-## Важно про права и приватность
+## Quick start with Docker
 
-Чтобы бот работал «по умолчанию» (видел **все** сообщения со ссылками и мог удалять сообщения):
+```bash
+git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git
+cd LinkDownloaderBotForGroups
+cp .env-example .env
+nano .env
+docker compose up -d --build
+docker compose logs -f --tail=200
+```
 
-### 1) Отключите Group Privacy (иначе бот не видит обычные сообщения)
-
-В BotFather:
-
-* **Bot Settings → Group Privacy → Off**
-
-Если приватность включена — бот будет видеть только команды и упоминания, и «авто-скачивание без упоминания» работать не будет.
-
-### 2) Дайте боту права администратора в группе
-
-Минимально нужные права:
-
-* ✅ **Delete messages** (чтобы удалять исходную ссылку)
-
-Остальные права не требуются, но можно включать по желанию.
-
----
-
-## Быстрый старт (Docker, рекомендовано)
-
-### 1) Получите токен
-
-* В Telegram откройте **@BotFather**
-* Создайте бота (`/newbot`)
-* Скопируйте **BOT_TOKEN**
-
-> Совет по безопасности: токен храните только в `.env`, не коммитьте его в Git.
-
-### 2) Установите через install.sh
-
-На сервере (Ubuntu/Debian):
+Or inspect and run the installer on Debian/Ubuntu:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Avazbek22/LinkDownloaderBotForGroups/main/install.sh -o install.sh
+less install.sh
 chmod +x install.sh
 ./install.sh
 ```
 
-Скрипт:
+The installer preserves an existing `.env` and refuses to update a repository with tracked local modifications.
 
-* установит зависимости
-* клонирует репозиторий
-* попросит токен и запишет его в `.env`
-* поднимет контейнер через Docker Compose
+## Configuration
 
----
+Only `BOT_TOKEN` is required.
 
-## Конфигурация
+| Variable | Default | Description |
+|---|---:|---|
+| `BOT_TOKEN` | — | Telegram bot token |
+| `LOGS_CHAT_ID` | empty | Optional chat for future critical operational notifications |
+| `MAX_FILESIZE` | `52428800` | Maximum upload size in bytes |
+| `WORKERS` | `2` | Concurrent download workers |
+| `MAX_QUEUE` | `200` | In-memory queue capacity |
+| `UPLOAD_WORKERS` | `2` | Concurrent local-file uploads to Telegram |
+| `JOB_TIMEOUT_SECONDS` | `900` | Download deadline |
+| `DEFAULT_LANGUAGE` | `en` | Default UI language: `en` or `ru` |
+| `DELETE_ORIGINAL` | `true` | Remove a link after successful delivery |
+| `MEDIA_CACHE_ENABLED` | `true` | Enable disk and Telegram `file_id` caches |
+| `DISK_CACHE_MAX_FILES` | `5` | Maximum recent media files on disk |
+| `DISK_CACHE_TTL_SECONDS` | `300` | Disk-cache lifetime after last use |
+| `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum persistent Telegram media entries |
+| `FILE_ID_CACHE_TTL_DAYS` | `30` | Telegram media-cache lifetime |
+| `COOKIES_FILE` | empty | Optional cookies file; `/app/data/cookies.txt` is convenient in Docker |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+| `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Concurrent fragments per download |
 
-Настройки читаются из `.env` (или переменных окружения). Файл `config.py` **не содержит секретов** — он просто читает env.
+See [.env-example](.env-example) for yt-dlp site-specific options.
 
-### .env (пример)
+## Commands
 
-```env
-BOT_TOKEN=123456789:AA...your_token_here
+- `/start` and `/help` — show instructions.
+- `/language` — show the current language.
+- `/language en` or `/language ru` — change the group language; group administrators only.
+- `/settings` — show the current group settings; group administrators only.
+- `/delete_original on` or `/delete_original off` — configure successful-link deletion; group administrators only.
+- `@BotName me` or `@BotName я` — toggle automatic downloads for yourself.
+- When opted out, use `@BotName <link>` for a manual download.
 
-# Optional:
-# LOGS_CHAT_ID=123456789
-# MAX_FILESIZE=52428800
-# OUTPUT_FOLDER=/tmp/yt-dlp-telegram
-# COOKIES_FILE=/app/cookies.txt
-YTDLP_JS_RUNTIMES=node
-YTDLP_REMOTE_COMPONENTS=ejs:github
-YTDLP_INSTAGRAM_IMPERSONATE=chrome
-YTDLP_INSTAGRAM_RETRIES=8
-YTDLP_INSTAGRAM_FRAGMENT_RETRIES=8
-YTDLP_INSTAGRAM_SOCKET_TIMEOUT=30
+The bot remains silent for ordinary automatic failures by design.
+
+## Persistent data
+
+Runtime state is stored in `data/`:
+
+```text
+data/
+├── settings.json       # per-chat language and settings
+├── users.json          # per-user opt-out choices
+├── state.json          # welcome and migration state
+├── media_cache.json    # Telegram file_id cache
+└── cache/              # short-lived downloaded media
 ```
 
-### Переменные окружения
+Writes use a temporary file, `fsync`, and atomic replacement. A last-known-good `.bak` file is retained. Invalid JSON is quarantined rather than silently overwritten. Existing `data/prefs.json` is imported once and left untouched as a fallback.
 
-* **BOT_TOKEN** *(обязательно)* — токен бота.
-* **LOGS_CHAT_ID** *(опционально)* — чат/канал/диалог для логов запросов (число).
-* **MAX_FILESIZE** *(опционально)* — максимальный размер файла в байтах (по умолчанию 50 MB).
-* **OUTPUT_FOLDER** *(опционально)* — временная папка для загрузок (по умолчанию `/tmp/yt-dlp-telegram`).
-* **COOKIES_FILE** *(опционально)* — путь к cookies-файлу (если нужно для сложных сайтов/авторизации).
-* **YTDLP_JS_RUNTIMES** *(по умолчанию `node`)* — JS runtime для YouTube extractor.
-* **YTDLP_REMOTE_COMPONENTS** *(по умолчанию `ejs:github`)* — удалённые EJS-компоненты для устойчивости YouTube.
-* **YTDLP_INSTAGRAM_IMPERSONATE** *(по умолчанию `chrome`)* — профиль impersonation для Instagram.
-* **YTDLP_INSTAGRAM_RETRIES** *(по умолчанию `8`)* — retries для Instagram.
-* **YTDLP_INSTAGRAM_FRAGMENT_RETRIES** *(по умолчанию `8`)* — fragment retries для Instagram.
-* **YTDLP_INSTAGRAM_SOCKET_TIMEOUT** *(по умолчанию `30`)* — socket timeout для Instagram.
+## Logs
 
----
-
-## Управление ботом в группе
-
-### Авто-скачивание по умолчанию
-
-* Любая ссылка на видео → скачивание → отправка → удаление исходной ссылки.
-
-### Отключить авто-скачивание для себя
-
-В группе напишите:
-
-* `@ИмяБота @ВашНик`
-* или `@ИмяБота me`
-* или `@ИмяБота я`
-
-Повторите — включится обратно.
-
-### Ручной режим (когда Вы отключились)
-
-Если у Вас отключено авто — скачивание только с упоминанием:
-
-* `@ИмяБота <ссылка>`
-
----
-
-## Структура данных
-
-Для сохранения настроек opt-out используется файл:
-
-* `data/prefs.json`
-
-Он монтируется в контейнер (Docker), поэтому переживает рестарты.
-
----
-
-## Обновление на сервере (Docker)
+Application logs are written to stdout and `logs/bot.log`. They rotate daily at UTC midnight, with 60 daily files retained. Query strings are omitted from logged URLs to reduce accidental exposure of tokens.
 
 ```bash
-cd /root/LinkDownloaderBotForGroups
-
-docker compose version >/dev/null 2>&1 && COMPOSE="docker compose" || COMPOSE="docker-compose"
-
-$COMPOSE -p linkdownloaderbotforgroups down
-
-git fetch --all --prune
-# Важно: если Вы ничего локально не правили, будет чисто
-# Если правили — сохраните свои изменения отдельно
-
-git pull --ff-only
-
-$COMPOSE -p linkdownloaderbotforgroups up -d --build
-$COMPOSE -p linkdownloaderbotforgroups logs -f --tail=200
+docker compose logs -f --tail=200
+ls -la logs/
 ```
 
-### Как сменить токен
+## Automatic yt-dlp updates
 
-1. Обновите `.env`:
+Video extractors change frequently. `install.sh` enables a nightly systemd timer when systemd is available. The updater:
+
+1. preserves the current Docker image as a rollback image;
+2. refreshes only the yt-dlp image layer;
+3. runs an import/version smoke test;
+4. recreates the service;
+5. restores the previous image if the new container does not stay running.
+
+Updater output is stored in daily `logs/updater-YYYY-MM-DD.log` files and retained for 60 days.
 
 ```bash
-cd /root/LinkDownloaderBotForGroups
-nano .env
+systemctl status linkdownloaderbotforgroups-yt-dlp-update.timer
+sudo systemctl start linkdownloaderbotforgroups-yt-dlp-update.service
 ```
 
-2. Пересоберите и перезапустите:
+Other dependencies are deliberately updated through reviewed pull requests instead of unattended nightly upgrades.
+
+## Development
+
+Python 3.11 or newer is supported.
 
 ```bash
-docker compose version >/dev/null 2>&1 && COMPOSE="docker compose" || COMPOSE="docker-compose"
-$COMPOSE -p linkdownloaderbotforgroups up -d --build
-$COMPOSE -p linkdownloaderbotforgroups logs -f --tail=200
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m ruff check .
+python -m ruff format --check .
+python -m pytest
 ```
 
----
+The tests do not require a real Telegram token or live video sites.
 
-## Диагностика и логи
+## Security and privacy
 
-### Посмотреть статус
+- Secrets belong in `.env`, which is excluded from Git and Docker build context.
+- URLs containing credentials or resolving to non-public IPv4/IPv6 addresses are rejected.
+- The application runs as an unprivileged user after preparing its two writable directories.
+- The container filesystem is read-only except for `data`, `logs`, and `/tmp`.
+- Full URL query strings are not written to application logs.
+- For an internet-facing deployment, also block private-network egress in the host firewall. Application-level DNS checks reduce SSRF risk but cannot replace network-level egress policy against every redirect or DNS-rebinding scenario.
 
-```bash
-cd /root/LinkDownloaderBotForGroups
+Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
-docker compose version >/dev/null 2>&1 && COMPOSE="docker compose" || COMPOSE="docker-compose"
+## Legal notice
 
-$COMPOSE -p linkdownloaderbotforgroups ps
-$COMPOSE -p linkdownloaderbotforgroups logs --tail=200
-```
+Use the bot only for content you are allowed to download and share. Site terms, copyright law and local regulations remain the operator's responsibility. This project does not bypass DRM.
 
-### Посмотреть ресурсы
+## Contributing
 
-```bash
-docker stats --no-stream linkdownloaderbot
-```
-
-### Проверить, что токен не пустой (без вывода токена)
-
-```bash
-cd /root/LinkDownloaderBotForGroups
-
-# Проверка .env (покажет длину и head/tail)
-token="$(grep -m1 '^BOT_TOKEN=' .env | cut -d= -f2- | tr -d '\r\n')"
-echo "BOT_TOKEN length: ${#token}"
-echo "BOT_TOKEN head/tail: ${token:0:5}...${token: -5}"
-
-# Проверка внутри контейнера (без печати токена)
-docker exec -i linkdownloaderbot sh -lc 'python - <<PY\nimport os\nt=os.getenv("BOT_TOKEN","")\nprint(len(t))\nPY'
-```
-
----
-
-## Частые проблемы
-
-### Бот не реагирует на ссылки в группе
-
-* Проверьте **Group Privacy = Off** в BotFather.
-* Проверьте, что бот добавлен в группу и видит сообщения.
-
-### Бот не удаляет исходные сообщения
-
-* Дайте боту права администратора: **Delete messages**.
-
-### «Не удалось скачать»
-
-* Ссылка может быть недоступна без авторизации или из-за геоблокировки.
-* Попробуйте настроить **COOKIES_FILE**.
-* Посмотрите логи контейнера.
-
-### Файл слишком большой
-
-* Telegram-боты имеют ограничения на размер загрузки.
-* Уменьшите качество/формат или уменьшите `MAX_FILESIZE`.
-
----
-
-## Безопасность
-
-* Никогда не коммитьте `.env` и токены.
-* Если токен утёк — **сразу перевыпустите** его в BotFather.
-
----
-
-## MIT License
-
-Copyright (c) 2026 Avazbek Olimov
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
----
-
-## Автор
-
-**Avazbek Olimov**
-
-Репозиторий: [https://github.com/Avazbek22/LinkDownloaderBotForGroups](https://github.com/Avazbek22/LinkDownloaderBotForGroups)
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. The project is released under the [MIT License](LICENSE).

@@ -7,7 +7,7 @@ def _host(url: str) -> str:
     try:
         host = (urlparse(url).netloc or "").lower()
         return host.replace("www.", "").strip()
-    except Exception:
+    except (TypeError, ValueError):
         return ""
 
 

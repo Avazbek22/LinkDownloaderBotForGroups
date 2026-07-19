@@ -8,9 +8,12 @@ def _env_int(name: str, default: int) -> int:
     if not raw:
         return default
     try:
-        return int(raw)
-    except Exception:
-        return default
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return value
 
 
 def _env_str(name: str, default: str) -> str:

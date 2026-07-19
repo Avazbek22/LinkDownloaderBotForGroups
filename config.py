@@ -1,32 +1,14 @@
-import os
+"""Backward-compatible configuration facade.
 
-# Required: Telegram bot token (from .env or environment variables)
-token = (os.getenv("BOT_TOKEN") or "").strip()
-if not token:
-    raise RuntimeError("BOT_TOKEN is not set. Put it into .env or environment variables.")
+New code should import app.settings. Existing forks importing config continue to
+receive the original attribute names.
+"""
 
-# Optional logs chat id (disabled by default)
-logs_raw = (os.getenv("LOGS_CHAT_ID") or "").strip()
-if logs_raw:
-    try:
-        logs = int(logs_raw)
-    except ValueError as ex:
-        raise RuntimeError("LOGS_CHAT_ID must be an integer.") from ex
-else:
-    logs = None
+from app.settings import load_settings
 
-# Max file size (bytes). Default: 50 MB.
-max_filesize_raw = (os.getenv("MAX_FILESIZE") or "").strip()
-if max_filesize_raw:
-    try:
-        max_filesize = int(max_filesize_raw)
-    except ValueError as ex:
-        raise RuntimeError("MAX_FILESIZE must be an integer (bytes).") from ex
-else:
-    max_filesize = 50 * 1024 * 1024
-
-# Temp folder for downloads (can be overridden)
-output_folder = (os.getenv("OUTPUT_FOLDER") or "/tmp/yt-dlp-telegram").strip() or "/tmp/yt-dlp-telegram"
-
-# Optional: cookies file path (disabled by default)
-cookies_file = (os.getenv("COOKIES_FILE") or "").strip() or None
+_settings = load_settings()
+token = _settings.token
+logs = _settings.logs_chat_id
+max_filesize = _settings.max_filesize
+output_folder = str(_settings.output_dir)
+cookies_file = str(_settings.cookies_file) if _settings.cookies_file else None

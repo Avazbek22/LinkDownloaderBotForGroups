@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a reproducible problem
+body:
+  - type: textarea
+    attributes:
+      label: Description
+      description: What happened and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Provide safe steps without tokens, cookies, private URLs, or chat data.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Version
+  - type: textarea
+    attributes:
+      label: Relevant redacted logs
