@@ -55,8 +55,7 @@ Or inspect and run the installer on Debian/Ubuntu:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Avazbek22/LinkDownloaderBotForGroups/main/install.sh -o install.sh
 less install.sh
-chmod +x install.sh
-./install.sh
+bash install.sh
 ```
 
 The installer preserves an existing `.env` and refuses to update a repository with tracked local modifications.
@@ -141,6 +140,52 @@ sudo systemctl start linkdownloaderbotforgroups-yt-dlp-update.service
 ```
 
 Other dependencies are deliberately updated through reviewed pull requests instead of unattended nightly upgrades.
+
+## Automatic application deployments
+
+Production auto-deployment is optional and disabled by default. It uses two branches so a failing push cannot reach the VPS:
+
+1. changes are merged or pushed to `production`;
+2. GitHub Actions runs the Python and Docker checks;
+3. only after every check succeeds, CI promotes the commit to `production-ready`;
+4. the VPS checks `production-ready` every two minutes and deploys it.
+
+The server stores `BOT_TOKEN` only in its local `.env`; GitHub never receives it. Before replacing the running container, the deployer builds the new image and calls Telegram `getMe`. It retains the previous image, restores it on failure, and does not retry the same failed commit indefinitely. Application and deploy logs remain on the server.
+
+Repository setup:
+
+1. Create `production` from `main`.
+2. Under **Settings → Actions → General → Workflow permissions**, allow GitHub Actions to write repository contents so CI can update `production-ready`.
+3. Protect `production`: require pull requests and the CI checks before merging.
+4. Merge `main` into `production` once to create the first tested `production-ready` ref.
+
+Enable the pull-based deployer on a systemd VPS after the updated `main` has been installed:
+
+```bash
+cd /opt/linkdownloaderbot
+git fetch origin main
+git checkout main
+git pull --ff-only origin main
+INSTALL_DIR=/opt/linkdownloaderbot \
+  BRANCH=main \
+  INSTALL_APP_UPDATER=1 \
+  DEPLOY_BRANCH=production-ready \
+  bash install.sh
+```
+
+No inbound SSH access from GitHub is required. Useful commands:
+
+```bash
+systemctl status linkdownloaderbotforgroups-deploy.timer
+systemctl start linkdownloaderbotforgroups-deploy.service
+tail -f /opt/linkdownloaderbot/logs/deploy-$(date -u +%Y-%m-%d).log
+```
+
+To disable application deployments without stopping the bot:
+
+```bash
+systemctl disable --now linkdownloaderbotforgroups-deploy.timer
+```
 
 ## Development
 
