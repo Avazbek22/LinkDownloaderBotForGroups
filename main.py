@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,7 @@ class BotApplication:
                 self._operator_alert("A download worker failed unexpectedly. Check bot.log.")
                 if flight is not None:
                     self.coordinator.abort(flight)
+                    self._after_failure_many(list(flight.jobs))
             finally:
                 self.queue.task_done()
 
@@ -179,7 +181,7 @@ class BotApplication:
                 validate_public_url(final_url)
         except Exception:
             self.log.exception("metadata failed job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
-            self.coordinator.abort(flight)
+            self._after_failure_many(self.coordinator.abort(flight))
             return
 
         media_key = f"{metadata.media_key}:mp4:{self.settings.max_filesize}"
@@ -274,6 +276,7 @@ class BotApplication:
                     self.log.warning("invalid Telegram file_id media_key=%s", media_key)
                     return jobs[index:]
                 self.log.exception("cached send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+                self._after_failure(job)
         return []
 
     def _send_from_file(
@@ -306,6 +309,7 @@ class BotApplication:
                 self._after_success(job)
             except Exception:
                 self.log.exception("video send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+                self._after_failure(job)
         return file_id
 
     def _send_video(self, job: Job, video: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
@@ -335,8 +339,53 @@ class BotApplication:
         if job.delete_original:
             try:
                 self.bot.delete_message(job.chat_id, job.original_message_id)
+                return
             except Exception:
                 self.log.exception("original delete failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+        if not self._set_status_reaction(job, "👍"):
+            self._clear_status_reaction(job)
+
+    def _after_failure(self, job: Job) -> None:
+        if not self._set_status_reaction(job, "👎"):
+            self._clear_status_reaction(job)
+
+    def _after_failure_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            self._after_failure(job)
+
+    def _set_status_reaction(self, job: Job, emoji: str) -> bool:
+        if not self.settings.status_reactions:
+            return False
+        method = getattr(self.bot, "set_message_reaction", None)
+        if method is None:
+            return False
+        try:
+            method(
+                job.chat_id,
+                job.original_message_id,
+                [telebot.types.ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+            return True
+        except Exception as exc:
+            # Reactions may be disabled or restricted per chat. They are only
+            # a best-effort status hint and must never affect the download.
+            self.log.info(
+                "status reaction unavailable job_id=%s chat_id=%s error=%s",
+                job.job_id,
+                job.chat_id,
+                type(exc).__name__,
+            )
+            return False
+
+    def _clear_status_reaction(self, job: Job) -> None:
+        if not self.settings.status_reactions:
+            return
+        method = getattr(self.bot, "set_message_reaction", None)
+        if method is None:
+            return
+        with suppress(Exception):
+            method(job.chat_id, job.original_message_id, [], is_big=False)
 
     @staticmethod
     def _is_invalid_file_id(exc: Exception) -> bool:
@@ -525,6 +574,7 @@ class BotApplication:
             self._handle_group_message(message)
 
     def _handle_group_message(self, message: Any) -> None:
+        job: Job | None = None
         try:
             if getattr(message.chat, "type", "") not in {"group", "supergroup"}:
                 return
@@ -568,6 +618,7 @@ class BotApplication:
                 sender_name=self._sender_name(message),
                 delete_original=self.storage.delete_original(chat_id),
             )
+            self._set_status_reaction(job, "👀")
             flight = self.coordinator.submit(job)
             if flight is None:
                 self.log.info("job joined URL flight job_id=%s url=%s", job.job_id, safe_url_for_log(url))
@@ -577,11 +628,14 @@ class BotApplication:
                 self.log.info("job queued job_id=%s chat_id=%s url=%s", job.job_id, chat_id, safe_url_for_log(url))
             except queue.Full:
                 self.coordinator.abort(flight)
+                self._after_failure(job)
                 self.log.warning("queue full job_id=%s chat_id=%s", job.job_id, chat_id)
                 self._operator_alert("The download queue is full. Check bot.log.")
         except UnsafeUrlError:
             self.log.warning("unsafe URL rejected chat_id=%s", getattr(message.chat, "id", None), exc_info=True)
         except Exception:
+            if job is not None:
+                self._after_failure(job)
             self.log.exception("group handler failed chat_id=%s", getattr(message.chat, "id", None))
 
     @staticmethod

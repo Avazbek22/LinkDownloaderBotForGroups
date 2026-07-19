@@ -6,6 +6,7 @@ SERVICE_KEY="${SERVICE_KEY:-linkdownloaderbot}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
 IMAGE_NAME="${IMAGE_NAME:-linkdownloaderbotforgroups:local}"
 ROLLBACK_IMAGE="${IMAGE_NAME%:*}:rollback"
+LOCK_FILE="${LOCK_FILE:-/run/lock/linkdownloaderbotforgroups-update.lock}"
 
 log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -82,9 +83,15 @@ docker_runtime_exists() {
 }
 
 main() {
-  mkdir -p "$ROOT_DIR/logs"
+  mkdir -p "$ROOT_DIR/logs" "$(dirname "$LOCK_FILE")"
   find "$ROOT_DIR/logs" -maxdepth 1 -type f -name 'updater-*.log' -mtime +60 -delete
   exec >>"$ROOT_DIR/logs/updater-$(date -u '+%Y-%m-%d').log" 2>&1
+  need_cmd flock || { log "flock is required"; exit 1; }
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "another updater is running; skipping"
+    exit 0
+  fi
   cd "$ROOT_DIR"
   if docker_runtime_exists && update_docker; then
     exit 0

@@ -65,6 +65,7 @@ class Settings:
     file_id_cache_max_items: int
     file_id_cache_ttl_days: int
     media_cache_enabled: bool
+    status_reactions: bool
     delete_original: bool
     default_language: str
     log_level: str
@@ -114,6 +115,7 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         file_id_cache_max_items=_integer("FILE_ID_CACHE_MAX_ITEMS", 500, 1, 100_000),
         file_id_cache_ttl_days=_integer("FILE_ID_CACHE_TTL_DAYS", 30, 1, 3650),
         media_cache_enabled=_boolean("MEDIA_CACHE_ENABLED", True),
+        status_reactions=_boolean("STATUS_REACTIONS", True),
         delete_original=_boolean("DELETE_ORIGINAL", True),
         default_language=default_language,
         log_level=log_level,

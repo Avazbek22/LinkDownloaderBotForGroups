@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for tested LinkDownloaderBotForGroups production commits
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+RandomizedDelaySec=20s
+Persistent=true
+Unit=linkdownloaderbotforgroups-deploy.service
+
+[Install]
+WantedBy=timers.target

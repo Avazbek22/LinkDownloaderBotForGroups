@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly yt-dlp updater for LinkDownloaderBotForGroups
+Description=Deploy tested LinkDownloaderBotForGroups production commits
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
@@ -8,9 +8,10 @@ Requires=docker.service
 Type=oneshot
 WorkingDirectory=__INSTALL_DIR__
 Environment=ROOT_DIR=__INSTALL_DIR__
+Environment=DEPLOY_BRANCH=__DEPLOY_BRANCH__
 Environment=COMPOSE_PROJECT=__COMPOSE_PROJECT__
 Environment=SERVICE_KEY=__SERVICE_KEY__
-ExecStart=/usr/bin/env bash __INSTALL_DIR__/scripts/update-ytdlp.sh
+ExecStart=/usr/bin/env bash __INSTALL_DIR__/scripts/deploy-production.sh
 
 [Install]
 WantedBy=multi-user.target

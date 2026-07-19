@@ -2,12 +2,13 @@
 
 A quiet, self-hosted Telegram bot that replaces video links with the actual video. It is designed for small private groups: paste a supported link, and the bot downloads the video, posts it silently in the same topic, then removes the original message only after success.
 
-The bot intentionally sends no “downloading” or failure messages for automatic requests. If a source is unavailable, the original link stays untouched and the technical reason is written to the rotating log.
+The bot intentionally sends no “downloading” or failure messages for automatic requests. A 👀 reaction means the link is being processed; a retained link changes to 👎 on failure or 👍 after success. If reactions are unavailable in a chat, the bot keeps working silently. Technical reasons are written to the rotating log.
 
 ## Highlights
 
 - Supports YouTube, Instagram, TikTok, VK, X, Facebook and many other sites through [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 - Silent messages and no link previews.
+- Quiet status reactions instead of progress messages.
 - Telegram forum topic support.
 - English and Russian interface; English is the default.
 - Per-user automatic-download opt-out.
@@ -23,9 +24,10 @@ The bot intentionally sends no “downloading” or failure messages for automat
 ## How it works
 
 1. A member posts a video link.
-2. The bot validates the URL and quietly downloads the video.
+2. After accepting the job, the bot reacts with 👀 and quietly downloads the video.
 3. The bot publishes the video silently in the same chat topic.
-4. After a successful upload, it removes the original link if it has permission.
+4. After a successful upload, it removes the original link if it has permission; otherwise it changes the reaction to 👍.
+5. If processing fails, the original link remains with a 👎 reaction.
 
 When the same video is posted again, the bot normally sends the existing Telegram media by `file_id`. Captions and sender attribution are still generated independently for every group.
 
@@ -55,8 +57,7 @@ Or inspect and run the installer on Debian/Ubuntu:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Avazbek22/LinkDownloaderBotForGroups/main/install.sh -o install.sh
 less install.sh
-chmod +x install.sh
-./install.sh
+bash install.sh
 ```
 
 The installer preserves an existing `.env` and refuses to update a repository with tracked local modifications.
@@ -77,6 +78,7 @@ Only `BOT_TOKEN` is required.
 | `DEFAULT_LANGUAGE` | `en` | Default UI language: `en` or `ru` |
 | `DELETE_ORIGINAL` | `true` | Remove a link after successful delivery |
 | `MEDIA_CACHE_ENABLED` | `true` | Enable disk and Telegram `file_id` caches |
+| `STATUS_REACTIONS` | `true` | Use 👀 while processing and 👎/👍 for retained links |
 | `DISK_CACHE_MAX_FILES` | `5` | Maximum recent media files on disk |
 | `DISK_CACHE_TTL_SECONDS` | `300` | Disk-cache lifetime after last use |
 | `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum persistent Telegram media entries |
@@ -141,6 +143,52 @@ sudo systemctl start linkdownloaderbotforgroups-yt-dlp-update.service
 ```
 
 Other dependencies are deliberately updated through reviewed pull requests instead of unattended nightly upgrades.
+
+## Automatic application deployments
+
+Production auto-deployment is optional and disabled by default. It uses two branches so a failing push cannot reach the VPS:
+
+1. changes are merged or pushed to `production`;
+2. GitHub Actions runs the Python and Docker checks;
+3. only after every check succeeds, CI promotes the commit to `production-ready`;
+4. the VPS checks `production-ready` every two minutes and deploys it.
+
+The server stores `BOT_TOKEN` only in its local `.env`; GitHub never receives it. Before replacing the running container, the deployer builds the new image and calls Telegram `getMe`. It retains the previous image, restores it on failure, and does not retry the same failed commit indefinitely. Application and deploy logs remain on the server.
+
+Repository setup:
+
+1. Create `production` from `main`.
+2. Under **Settings → Actions → General → Workflow permissions**, allow GitHub Actions to write repository contents so CI can update `production-ready`.
+3. Protect `production`: require pull requests and the CI checks before merging.
+4. Merge `main` into `production` once to create the first tested `production-ready` ref.
+
+Enable the pull-based deployer on a systemd VPS after the updated `main` has been installed:
+
+```bash
+cd /opt/linkdownloaderbot
+git fetch origin main
+git checkout main
+git pull --ff-only origin main
+INSTALL_DIR=/opt/linkdownloaderbot \
+  BRANCH=main \
+  INSTALL_APP_UPDATER=1 \
+  DEPLOY_BRANCH=production-ready \
+  bash install.sh
+```
+
+No inbound SSH access from GitHub is required. Useful commands:
+
+```bash
+systemctl status linkdownloaderbotforgroups-deploy.timer
+systemctl start linkdownloaderbotforgroups-deploy.service
+tail -f /opt/linkdownloaderbot/logs/deploy-$(date -u +%Y-%m-%d).log
+```
+
+To disable application deployments without stopping the bot:
+
+```bash
+systemctl disable --now linkdownloaderbotforgroups-deploy.timer
+```
 
 ## Development
 

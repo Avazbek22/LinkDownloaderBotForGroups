@@ -6,6 +6,7 @@ BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/LinkDownloaderBotForGroups}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
 SERVICE_KEY="linkdownloaderbot"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-production-ready}"
 
 info() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 ok() { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -22,11 +23,12 @@ compose() {
 
 install_prerequisites() {
   info "Checking prerequisites"
-  if ! need git || ! need docker; then
+  if ! need git || ! need docker || ! need flock; then
     need apt-get || die "Install Git and Docker manually on this operating system"
     as_root apt-get update -y
     need git || as_root apt-get install -y git ca-certificates
     need docker || as_root apt-get install -y docker.io
+    need flock || as_root apt-get install -y util-linux
   fi
   need docker || die "Docker is unavailable"
   if ! docker compose version >/dev/null 2>&1 && ! need docker-compose; then
@@ -100,12 +102,31 @@ install_updater() {
   ok "Nightly updater installed"
 }
 
+install_app_updater() {
+  [[ "${INSTALL_APP_UPDATER:-0}" == "1" ]] || return 0
+  need systemctl || return 0
+  [[ -d /run/systemd/system ]] || return 0
+  info "Installing production auto-deployer"
+  local service="/etc/systemd/system/linkdownloaderbotforgroups-deploy.service"
+  local timer="/etc/systemd/system/linkdownloaderbotforgroups-deploy.timer"
+  sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+      -e "s|__DEPLOY_BRANCH__|$DEPLOY_BRANCH|g" \
+      -e "s|__COMPOSE_PROJECT__|$COMPOSE_PROJECT|g" \
+      -e "s|__SERVICE_KEY__|$SERVICE_KEY|g" \
+      "$INSTALL_DIR/scripts/systemd/linkdownloaderbotforgroups-deploy.service" | as_root tee "$service" >/dev/null
+  as_root cp "$INSTALL_DIR/scripts/systemd/linkdownloaderbotforgroups-deploy.timer" "$timer"
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now linkdownloaderbotforgroups-deploy.timer
+  ok "Production auto-deployer installed for $DEPLOY_BRANCH"
+}
+
 main() {
   install_prerequisites
   prepare_repository
   prepare_environment
   start_bot
   install_updater
+  install_app_updater
   printf '\nLogs: cd %q && docker compose -p %q logs -f --tail=200\n' "$INSTALL_DIR" "$COMPOSE_PROJECT"
 }
 
