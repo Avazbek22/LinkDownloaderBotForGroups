@@ -157,7 +157,9 @@ class BotApplication:
         first = flight.jobs[0]
         started = time.monotonic()
         self.log.info("job metadata job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
-        cache_profile = f"mp4:{self.settings.max_filesize}"
+        # Bump the profile whenever delivery compatibility changes so an old,
+        # already-uploaded Telegram file_id cannot bypass the new validation.
+        cache_profile = f"mp4-h264-v2:{self.settings.max_filesize}"
         cached = (
             self.storage.get_cached_by_url(f"{first.url_key}|{cache_profile}", self.settings.file_id_cache_ttl_days)
             if self.settings.media_cache_enabled
@@ -190,7 +192,7 @@ class BotApplication:
             self._after_failure_many(self.coordinator.abort(flight))
             return
 
-        media_key = f"{metadata.media_key}:mp4:{self.settings.max_filesize}"
+        media_key = f"{metadata.media_key}:mp4-h264-v2:{self.settings.max_filesize}"
         if cached is None and not self.coordinator.promote(flight, media_key):
             self.log.info("job joined media flight job_id=%s media_key=%s", first.job_id, media_key)
             return

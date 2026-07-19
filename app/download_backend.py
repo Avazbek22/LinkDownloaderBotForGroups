@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +14,8 @@ import yt_dlp
 
 from app import env_config
 from app.url_utils import is_instagram_url, is_youtube_url
+
+LOG = logging.getLogger(__name__)
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -24,6 +29,12 @@ class MediaMetadata:
     info: dict[str, Any]
     media_key: str
     source_name: str
+
+
+@dataclass(frozen=True)
+class FormatPlan:
+    format_spec: str
+    merge_output_format: str | None = None
 
 
 _SOURCE_NAMES = {
@@ -61,12 +72,23 @@ def _size(fmt: dict[str, Any], duration: int | None) -> int | None:
     return None
 
 
+def _video_compatibility(fmt: dict[str, Any]) -> int:
+    codec = str(fmt.get("vcodec") or "").lower()
+    if codec.startswith(("avc1", "avc3", "h264")):
+        return 2
+    if not codec:
+        # Some extractors expose a direct MP4 without probing its streams. Such
+        # files are usually the site's broadly compatible progressive variant.
+        return 1
+    return 0
+
+
 def _video_score(fmt: dict[str, Any]) -> tuple[int, int, int, float]:
+    compatible = _video_compatibility(fmt)
     height = min(int(fmt.get("height") or 0), 2160)
-    compatible = int(str(fmt.get("vcodec") or "").startswith("avc1"))
     fps = min(int(fmt.get("fps") or 0), 120)
     bitrate = float(fmt.get("tbr") or 0)
-    return height, compatible, fps, bitrate
+    return compatible, height, fps, bitrate
 
 
 def _audio_score(fmt: dict[str, Any]) -> tuple[int, float]:
@@ -74,8 +96,8 @@ def _audio_score(fmt: dict[str, Any]) -> tuple[int, float]:
     return compatible, float(fmt.get("abr") or fmt.get("tbr") or 0)
 
 
-def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None]:
-    """Select the best MP4 plan that is likely to fit the Telegram limit."""
+def select_format_candidates(info: dict[str, Any], max_bytes: int) -> list[FormatPlan]:
+    """Return best-first MP4 plans that may fit and remain Telegram-compatible."""
     formats = [item for item in info.get("formats", []) if isinstance(item, dict)]
     duration = _duration(info)
     budget = int(max_bytes * 0.96)
@@ -86,13 +108,16 @@ def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None
     for fmt in formats:
         if not fmt.get("format_id"):
             continue
-        video = fmt.get("vcodec") not in {None, "none"}
-        audio = fmt.get("acodec") not in {None, "none"}
+        video_codec = fmt.get("vcodec")
+        audio_codec = fmt.get("acodec")
+        video = video_codec not in {None, "none"}
+        audio = audio_codec not in {None, "none"}
         ext = fmt.get("ext")
-        if ext == "mp4" and video and audio:
+        unknown_direct_mp4 = ext == "mp4" and video_codec is None and audio_codec is None and bool(fmt.get("url"))
+        if ext == "mp4" and ((video and audio) or unknown_direct_mp4) and _video_compatibility(fmt) > 0:
             if (_size(fmt, duration) or budget) <= budget:
                 progressive.append(fmt)
-        elif ext == "mp4" and video and not audio:
+        elif ext == "mp4" and video and not audio and _video_compatibility(fmt) > 0:
             video_only.append(fmt)
         elif ext in {"m4a", "mp4"} and audio and not video:
             audio_only.append(fmt)
@@ -105,28 +130,55 @@ def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None
             if video_size is not None and audio_size is not None and video_size + audio_size > budget:
                 continue
             pairs.append((video, audio))
-    known_progressive = [fmt for fmt in progressive if _size(fmt, duration) is not None]
-    if known_progressive:
-        progressive = known_progressive
-    known_pairs = [
-        pair for pair in pairs if _size(pair[0], duration) is not None and _size(pair[1], duration) is not None
-    ]
-    if known_pairs:
-        pairs = known_pairs
+    ranked: list[tuple[tuple[Any, ...], FormatPlan, str | None]] = []
+    for fmt in progressive:
+        video_score = _video_score(fmt)
+        score = (*video_score[:3], int(_size(fmt, duration) is not None), video_score[3])
+        ranked.append((score, FormatPlan(str(fmt["format_id"])), str(fmt.get("url") or "") or None))
+    for video, audio in pairs:
+        video_score = _video_score(video)
+        known_size = int(_size(video, duration) is not None and _size(audio, duration) is not None)
+        ranked.append(
+            (
+                (*video_score[:3], known_size, video_score[3], *_audio_score(audio)),
+                FormatPlan(f"{video['format_id']}+{audio['format_id']}", "mp4"),
+                None,
+            )
+        )
+    ranked.sort(key=lambda item: item[0], reverse=True)
 
-    best_progressive = max(progressive, key=_video_score) if progressive else None
-    best_pair = max(pairs, key=lambda pair: (_video_score(pair[0]), _audio_score(pair[1]))) if pairs else None
-    if best_progressive is not None and (
-        best_pair is None or _video_score(best_progressive) >= _video_score(best_pair[0])
-    ):
-        return str(best_progressive["format_id"]), None
-    if best_pair is not None:
-        video, audio = best_pair
-        return f"{video['format_id']}+{audio['format_id']}", "mp4"
+    plans: list[FormatPlan] = []
+    seen_specs: set[str] = set()
+    seen_direct_urls: set[str] = set()
+    for _score, plan, direct_url in ranked:
+        # Instagram sometimes lists the same direct MP4 under several opaque
+        # IDs. Downloading the identical URL repeatedly cannot improve quality.
+        if direct_url and direct_url in seen_direct_urls:
+            continue
+        if plan.format_spec in seen_specs:
+            continue
+        plans.append(plan)
+        seen_specs.add(plan.format_spec)
+        if direct_url:
+            seen_direct_urls.add(direct_url)
 
-    # yt-dlp applies the actual max_filesize guard. This fallback is needed when
-    # extractors do not expose enough size metadata to make a local decision.
-    return "b[ext=mp4]/bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b", "mp4"
+    if not plans:
+        plans.append(
+            FormatPlan(
+                "b[ext=mp4][vcodec^=avc1][acodec!=none]/"
+                "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/"
+                "b[ext=mp4][vcodec^=h264][acodec!=none]/"
+                "bv*[ext=mp4][vcodec^=h264]+ba[ext=m4a]",
+                "mp4",
+            )
+        )
+    return plans
+
+
+def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None]:
+    """Return the preferred plan while preserving the original public API."""
+    plan = select_format_candidates(info, max_bytes)[0]
+    return plan.format_spec, plan.merge_output_format
 
 
 def _csv(raw: str) -> list[str]:
@@ -185,6 +237,88 @@ def _base_options(cookie_file: Path | None) -> dict[str, Any]:
     return options
 
 
+def _unselect_info(info: dict[str, Any]) -> dict[str, Any]:
+    """Remove yt-dlp's default choice so a later FormatPlan is actually applied."""
+    clean = dict(info)
+    for key in (
+        "requested_formats",
+        "requested_downloads",
+        "format_id",
+        "format",
+        "url",
+        "manifest_url",
+        "ext",
+        "vcodec",
+        "acodec",
+        "width",
+        "height",
+        "resolution",
+        "filesize",
+        "filesize_approx",
+        "tbr",
+        "vbr",
+        "abr",
+        "protocol",
+        "container",
+    ):
+        clean.pop(key, None)
+    return clean
+
+
+def _remove_attempt_files(output_folder: Path, out_prefix: str) -> None:
+    for path in output_folder.glob(f"{out_prefix}.*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
+    """Reject partial, audio-only, oversized, or Telegram-incompatible results."""
+    size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError("downloaded file is empty")
+    if size > max_bytes:
+        raise RuntimeError("downloaded file exceeds MAX_FILESIZE")
+
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name:stream=codec_type,codec_name,width,height",
+            "-of",
+            "json",
+            os.fspath(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(completed.stdout)
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    video_streams = [
+        stream for stream in (streams or []) if isinstance(stream, dict) and stream.get("codec_type") == "video"
+    ]
+    if not video_streams:
+        raise RuntimeError("downloaded file has no video stream")
+
+    compatible = any(
+        str(stream.get("codec_name") or "").lower() == "h264"
+        and int(stream.get("width") or 0) > 0
+        and int(stream.get("height") or 0) > 0
+        for stream in video_streams
+    )
+    if not compatible:
+        codecs = ",".join(sorted({str(stream.get("codec_name") or "unknown") for stream in video_streams}))
+        raise RuntimeError(f"downloaded video codec is not Telegram-compatible: {codecs}")
+
+    format_info = payload.get("format") if isinstance(payload, dict) else None
+    format_name = str(format_info.get("format_name") or "") if isinstance(format_info, dict) else ""
+    if not {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}.intersection(format_name.split(",")):
+        raise RuntimeError(f"downloaded video container is not MP4-compatible: {format_name or 'unknown'}")
+
+
 def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata:
     options = _base_options(cookie_file)
     options.update(_site_options(url))
@@ -219,44 +353,62 @@ def download_metadata(
 ) -> dict[str, Any]:
     output_folder.mkdir(parents=True, exist_ok=True)
     outtmpl = os.fspath(output_folder / f"{out_prefix}.%(ext)s")
-    format_spec, merge_format = select_format(metadata.info, max_send_bytes)
+    plans = select_format_candidates(metadata.info, max_send_bytes)
 
     def progress_hook(_status: dict[str, Any]) -> None:
         if deadline is not None and time.monotonic() > deadline:
             raise yt_dlp.utils.DownloadError("download deadline exceeded")
 
-    options = _base_options(cookie_file)
-    options.update(
-        outtmpl=outtmpl,
-        concurrent_fragment_downloads=concurrent_fragments,
-        fragment_retries=5,
-        max_filesize=max_send_bytes,
-        format=format_spec,
-        progress_hooks=[progress_hook],
-    )
-    if merge_format:
-        options["merge_output_format"] = merge_format
-    options.update(_site_options(metadata.url))
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.process_ie_result(dict(metadata.info), download=True)
-    except Exception:
-        if not (is_youtube_url(metadata.url) or is_instagram_url(metadata.url)):
-            raise
-        fallback = _base_options(cookie_file)
-        fallback.update(
+    def options_for(plan: FormatPlan, fragments: int, *, instagram_impersonate: bool = True) -> dict[str, Any]:
+        options = _base_options(cookie_file)
+        options.update(
             outtmpl=outtmpl,
-            concurrent_fragment_downloads=1,
+            concurrent_fragment_downloads=fragments,
             fragment_retries=5,
             max_filesize=max_send_bytes,
-            format=format_spec,
+            format=plan.format_spec,
             progress_hooks=[progress_hook],
         )
-        if merge_format:
-            fallback["merge_output_format"] = merge_format
-        fallback.update(_site_options(metadata.url, instagram_impersonate=False))
-        with yt_dlp.YoutubeDL(fallback) as ydl:
-            return ydl.extract_info(metadata.url, download=True)
+        if plan.merge_output_format:
+            options["merge_output_format"] = plan.merge_output_format
+        options.update(_site_options(metadata.url, instagram_impersonate=instagram_impersonate))
+        return options
+
+    last_error: Exception | None = None
+    for index, plan in enumerate(plans, start=1):
+        _remove_attempt_files(output_folder, out_prefix)
+        LOG.info("trying media format candidate=%s total=%s", index, len(plans))
+        try:
+            with yt_dlp.YoutubeDL(options_for(plan, concurrent_fragments)) as ydl:
+                result = ydl.process_ie_result(_unselect_info(metadata.info), download=True)
+        except Exception as primary_error:
+            last_error = primary_error
+            if not (is_youtube_url(metadata.url) or is_instagram_url(metadata.url)):
+                continue
+            _remove_attempt_files(output_folder, out_prefix)
+            try:
+                # A fresh extraction recovers expired CDN URLs without making
+                # it the normal path for Instagram, which is sensitive to extra requests.
+                with yt_dlp.YoutubeDL(options_for(plan, 1, instagram_impersonate=False)) as ydl:
+                    result = ydl.extract_info(metadata.url, download=True)
+            except Exception as fallback_error:
+                last_error = fallback_error
+                continue
+
+        path = find_downloaded_file(result if isinstance(result, dict) else {}, out_prefix, output_folder)
+        try:
+            if path is None:
+                raise RuntimeError("downloaded file not found")
+            _validate_downloaded_video(path, max_send_bytes)
+        except Exception as validation_error:
+            last_error = validation_error
+            LOG.warning("media format candidate rejected candidate=%s reason=%s", index, validation_error)
+            _remove_attempt_files(output_folder, out_prefix)
+            continue
+        return result
+
+    _remove_attempt_files(output_folder, out_prefix)
+    raise RuntimeError("no compatible video format fits the configured size limit") from last_error
 
 
 def find_downloaded_file(info: dict[str, Any], prefix: str, output_folder: Path) -> Path | None:

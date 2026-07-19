@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app import download_backend
-from app.download_backend import MediaMetadata, display_source_name, download_metadata, select_format
+from app.download_backend import (
+    FormatPlan,
+    MediaMetadata,
+    display_source_name,
+    download_metadata,
+    select_format,
+    select_format_candidates,
+)
 
 
 def test_source_names_use_brand_spelling() -> None:
@@ -70,7 +80,7 @@ def test_combines_video_and_audio_sizes() -> None:
     assert select_format(info, 50_000_000) == ("v720+audio", "mp4")
 
 
-def test_known_size_wins_over_higher_unknown_format() -> None:
+def test_higher_unknown_format_is_tried_before_lower_known_format() -> None:
     info = {
         "formats": [
             {
@@ -90,7 +100,92 @@ def test_known_size_wins_over_higher_unknown_format() -> None:
             },
         ]
     }
-    assert select_format(info, 50_000_000) == ("known", None)
+    assert select_format(info, 50_000_000) == ("unknown", None)
+
+
+def test_unknown_direct_instagram_mp4_wins_over_incompatible_dash() -> None:
+    info = {
+        "formats": [
+            {
+                "format_id": "direct",
+                "ext": "mp4",
+                "vcodec": None,
+                "acodec": None,
+                "url": "https://cdn.example/video.mp4",
+            },
+            {
+                "format_id": "vp9-video",
+                "ext": "mp4",
+                "vcodec": "vp09.00.40.08",
+                "acodec": "none",
+                "height": 1920,
+                "tbr": 4600,
+            },
+            {
+                "format_id": "audio",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.5",
+                "tbr": 70,
+            },
+        ]
+    }
+
+    assert select_format(info, 50_000_000) == ("direct", None)
+    assert [plan.format_spec for plan in select_format_candidates(info, 50_000_000)] == ["direct"]
+
+
+def test_unselect_info_removes_stale_default_without_losing_formats() -> None:
+    formats = [{"format_id": "direct"}]
+    clean = download_backend._unselect_info(
+        {
+            "id": "video",
+            "webpage_url": "https://example.com/video",
+            "formats": formats,
+            "format_id": "stale-vp9+audio",
+            "requested_formats": [{"format_id": "stale-vp9"}],
+            "url": "https://cdn.example/stale.mp4",
+            "vcodec": "vp9",
+        }
+    )
+
+    assert clean["formats"] is formats
+    assert clean["webpage_url"] == "https://example.com/video"
+    assert "format_id" not in clean
+    assert "requested_formats" not in clean
+    assert "url" not in clean
+
+
+def test_video_validation_requires_h264_stream(monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"not-a-real-video")
+
+    def probe(codec: str, codec_type: str = "video") -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=(
+                '{"streams":[{"codec_type":"'
+                + codec_type
+                + '","codec_name":"'
+                + codec
+                + '","width":720,"height":1280}],'
+                '"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}'
+            )
+        )
+
+    monkeypatch.setattr(download_backend.subprocess, "run", lambda *_args, **_kwargs: probe("h264"))
+    download_backend._validate_downloaded_video(path, 1_000_000)
+
+    monkeypatch.setattr(download_backend.subprocess, "run", lambda *_args, **_kwargs: probe("vp9"))
+    with pytest.raises(RuntimeError, match="not Telegram-compatible"):
+        download_backend._validate_downloaded_video(path, 1_000_000)
+
+    monkeypatch.setattr(
+        download_backend.subprocess,
+        "run",
+        lambda *_args, **_kwargs: probe("aac", codec_type="audio"),
+    )
+    with pytest.raises(RuntimeError, match="no video stream"):
+        download_backend._validate_downloaded_video(path, 1_000_000)
 
 
 def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, tmp_path: Path) -> None:
@@ -111,6 +206,7 @@ def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, 
             raise RuntimeError("expired media URL")
 
         def extract_info(self, *_args, **_kwargs):
+            (tmp_path / "retry.mp4").write_bytes(b"video")
             return {"id": "video", "extractor": "youtube"}
 
     monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
@@ -119,6 +215,7 @@ def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, 
         "_site_options",
         lambda *_args, **_kwargs: {"js_runtimes": {"node": {}}},
     )
+    monkeypatch.setattr(download_backend, "_validate_downloaded_video", lambda *_args, **_kwargs: None)
     metadata = MediaMetadata(
         url="https://www.youtube.com/watch?v=video",
         info={
@@ -155,3 +252,55 @@ def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, 
     assert options_seen[1]["format"] == "video+audio"
     assert options_seen[1]["merge_output_format"] == "mp4"
     assert options_seen[1]["js_runtimes"] == {"node": {}}
+
+
+def test_rejects_audio_only_attempt_and_uses_next_candidate(monkeypatch, tmp_path: Path) -> None:
+    formats_seen: list[str] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+            formats_seen.append(options["format"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            suffix = "m4a" if self.options["format"] == "bad" else "mp4"
+            (tmp_path / f"candidate.{suffix}").write_bytes(b"media")
+            return {"id": "video"}
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(
+        download_backend,
+        "select_format_candidates",
+        lambda *_args, **_kwargs: [FormatPlan("bad"), FormatPlan("good")],
+    )
+
+    def validate(path: Path, _max_bytes: int) -> None:
+        if path.suffix == ".m4a":
+            raise RuntimeError("downloaded file has no video stream")
+
+    monkeypatch.setattr(download_backend, "_validate_downloaded_video", validate)
+    metadata = MediaMetadata(
+        url="https://example.com/video",
+        info={"id": "video", "formats": []},
+        media_key="example:video",
+        source_name="Example",
+    )
+
+    result = download_metadata(
+        metadata,
+        "candidate",
+        tmp_path,
+        max_send_bytes=10_000_000,
+        concurrent_fragments=2,
+    )
+
+    assert result["id"] == "video"
+    assert formats_seen == ["bad", "good"]
+    assert not (tmp_path / "candidate.m4a").exists()
+    assert (tmp_path / "candidate.mp4").exists()

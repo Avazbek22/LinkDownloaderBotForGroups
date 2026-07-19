@@ -143,6 +143,8 @@ flowchart LR
 
 The bot uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports a large number of video websites.
 
+For Telegram delivery, it prefers the highest-quality H.264 MP4 candidate that fits the configured size limit. The completed file is checked with ffprobe before upload, so an audio-only or incompatible partial download is never cached as a video.
+
 Common examples:
 
 - YouTube
