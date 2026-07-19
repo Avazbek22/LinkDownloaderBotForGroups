@@ -9,3 +9,7 @@ venv/
 
 # Runtime / cache
 data/
+logs/
+.pytest_cache/
+.ruff_cache/
+.idea/

@@ -1,342 +1,258 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import yt_dlp
 
-import config
 from app import env_config
 from app.url_utils import is_instagram_url, is_youtube_url
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
-except Exception:  # pragma: no cover - old yt-dlp runtime
+except ImportError:  # pragma: no cover - compatibility with older yt-dlp
     ImpersonateTarget = None
 
 
-def duration_sec(meta: Dict[str, Any]) -> Optional[int]:
-    dur = meta.get("duration")
-    if isinstance(dur, (int, float)) and dur > 0:
-        return int(dur)
+@dataclass(frozen=True)
+class MediaMetadata:
+    url: str
+    info: dict[str, Any]
+    media_key: str
+    source_name: str
+
+
+def _duration(info: dict[str, Any]) -> int | None:
+    value = info.get("duration")
+    return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def _size(fmt: dict[str, Any], duration: int | None) -> int | None:
+    for key in ("filesize", "filesize_approx"):
+        value = fmt.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    bitrate = fmt.get("tbr")
+    if duration and isinstance(bitrate, (int, float)) and bitrate > 0:
+        return int(duration * bitrate * 1000 / 8)
     return None
 
 
-def format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
-    fs = fmt.get("filesize")
-    if isinstance(fs, int) and fs > 0:
-        return fs, True
-
-    fsa = fmt.get("filesize_approx")
-    if isinstance(fsa, int) and fsa > 0:
-        return fsa, True
-
-    tbr = fmt.get("tbr")
-    if dur and isinstance(tbr, (int, float)) and tbr > 0:
-        est = int(dur * (float(tbr) * 1000.0 / 8.0))
-        if est > 0:
-            return est, False
-
-    return None, False
+def _video_score(fmt: dict[str, Any]) -> tuple[int, int, int, float]:
+    height = min(int(fmt.get("height") or 0), 2160)
+    compatible = int(str(fmt.get("vcodec") or "").startswith("avc1"))
+    fps = min(int(fmt.get("fps") or 0), 120)
+    bitrate = float(fmt.get("tbr") or 0)
+    return height, compatible, fps, bitrate
 
 
-def vcodec_pref_rank(vcodec: Any) -> int:
-    s = str(vcodec or "")
-    return 2 if s.startswith("avc1") else 1
+def _audio_score(fmt: dict[str, Any]) -> tuple[int, float]:
+    compatible = int(str(fmt.get("acodec") or "").startswith("mp4a"))
+    return compatible, float(fmt.get("abr") or fmt.get("tbr") or 0)
 
 
-def acodec_pref_rank(acodec: Any) -> int:
-    s = str(acodec or "")
-    return 2 if s.startswith("mp4a") else 1
+def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None]:
+    """Select the best MP4 plan that is likely to fit the Telegram limit."""
+    formats = [item for item in info.get("formats", []) if isinstance(item, dict)]
+    duration = _duration(info)
+    budget = int(max_bytes * 0.96)
 
-
-def best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    best = None
-    best_key = None
-
-    for f in meta.get("formats", []) or []:
-        if f.get("ext") != "mp4":
+    progressive: list[dict[str, Any]] = []
+    video_only: list[dict[str, Any]] = []
+    audio_only: list[dict[str, Any]] = []
+    for fmt in formats:
+        if not fmt.get("format_id"):
             continue
-        if f.get("vcodec") == "none" or f.get("acodec") == "none":
-            continue
+        video = fmt.get("vcodec") not in {None, "none"}
+        audio = fmt.get("acodec") not in {None, "none"}
+        ext = fmt.get("ext")
+        if ext == "mp4" and video and audio:
+            if (_size(fmt, duration) or budget) <= budget:
+                progressive.append(fmt)
+        elif ext == "mp4" and video and not audio:
+            video_only.append(fmt)
+        elif ext in {"m4a", "mp4"} and audio and not video:
+            audio_only.append(fmt)
 
-        fid = f.get("format_id")
-        if not fid:
-            continue
-
-        height = f.get("height") or 0
-        fps = f.get("fps") or 0
-        tbr = f.get("tbr") or 0
-
-        v_rank = vcodec_pref_rank(f.get("vcodec"))
-        a_rank = acodec_pref_rank(f.get("acodec"))
-
-        key = (int(v_rank), int(a_rank), int(height), int(fps), float(tbr))
-
-        if best is None or key > best_key:
-            best = {
-                "kind": "progressive",
-                "format_spec": str(fid),
-                "merge_output_format": None,
-            }
-            best_key = key
-
-    return best
-
-
-def best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    dur = duration_sec(meta)
-
-    best_v = None
-    best_v_key = None
-    best_a = None
-    best_a_key = None
-
-    for f in meta.get("formats", []) or []:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-
-        if ext == "mp4" and vcodec != "none" and acodec == "none":
-            fid = f.get("format_id")
-            if not fid:
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for video in video_only:
+        video_size = _size(video, duration)
+        for audio in audio_only:
+            audio_size = _size(audio, duration)
+            if video_size is not None and audio_size is not None and video_size + audio_size > budget:
                 continue
+            pairs.append((video, audio))
+    known_progressive = [fmt for fmt in progressive if _size(fmt, duration) is not None]
+    if known_progressive:
+        progressive = known_progressive
+    known_pairs = [
+        pair for pair in pairs if _size(pair[0], duration) is not None and _size(pair[1], duration) is not None
+    ]
+    if known_pairs:
+        pairs = known_pairs
 
-            height = f.get("height") or 0
-            fps = f.get("fps") or 0
-            tbr = f.get("tbr") or 0
+    best_progressive = max(progressive, key=_video_score) if progressive else None
+    best_pair = max(pairs, key=lambda pair: (_video_score(pair[0]), _audio_score(pair[1]))) if pairs else None
+    if best_progressive is not None and (
+        best_pair is None or _video_score(best_progressive) >= _video_score(best_pair[0])
+    ):
+        return str(best_progressive["format_id"]), None
+    if best_pair is not None:
+        video, audio = best_pair
+        return f"{video['format_id']}+{audio['format_id']}", "mp4"
 
-            v_rank = vcodec_pref_rank(vcodec)
-            key = (int(v_rank), int(height), int(fps), float(tbr))
-
-            if best_v is None or key > best_v_key:
-                size, conf = format_size_bytes(f, dur)
-                best_v = {"f": f, "size": size, "conf": conf}
-                best_v_key = key
-
-        if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
-            fid = f.get("format_id")
-            if not fid:
-                continue
-
-            abr = f.get("abr") or f.get("tbr") or 0
-            a_rank = acodec_pref_rank(acodec)
-            key = (int(a_rank), float(abr))
-
-            if best_a is None or key > best_a_key:
-                size, conf = format_size_bytes(f, dur)
-                best_a = {"f": f, "size": size, "conf": conf}
-                best_a_key = key
-
-    if not best_v or not best_a:
-        return None
-
-    vf = best_v["f"]
-    af = best_a["f"]
-    return {
-        "kind": "separate",
-        "format_spec": f"{vf.get('format_id')}+{af.get('format_id')}",
-        "merge_output_format": "mp4",
-    }
+    # yt-dlp applies the actual max_filesize guard. This fallback is needed when
+    # extractors do not expose enough size metadata to make a local decision.
+    return "b[ext=mp4]/bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b", "mp4"
 
 
-def build_video_plan_like_main1(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    p = best_progressive_mp4(meta)
-    if p:
-        return p
-    p = best_separate_mp4_m4a(meta)
-    if p:
-        return p
-    return None
+def _csv(raw: str) -> list[str]:
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
-def _parse_csv_list(raw: str) -> List[str]:
-    return [x.strip() for x in (raw or "").split(",") if x.strip()]
-
-
-def _build_http_headers() -> Dict[str, str]:
+def _headers() -> dict[str, str]:
     return {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     }
 
 
-def _parse_impersonate_target(raw: str) -> Optional[Any]:
-    name = (raw or "").strip()
-    if not name or ImpersonateTarget is None:
+def _impersonate(raw: str) -> Any | None:
+    if not raw or ImpersonateTarget is None:
         return None
     try:
-        return ImpersonateTarget.from_str(name)
-    except Exception:
+        return ImpersonateTarget.from_str(raw.strip())
+    except (ValueError, TypeError):
         return None
 
 
-def _youtube_api_opts() -> Dict[str, Any]:
-    runtimes = _parse_csv_list(env_config.YTDLP_JS_RUNTIMES)
-    remote_components = _parse_csv_list(env_config.YTDLP_REMOTE_COMPONENTS)
-    opts: Dict[str, Any] = {}
-    if runtimes:
-        opts["js_runtimes"] = {name: {} for name in runtimes}
-    if remote_components:
-        opts["remote_components"] = remote_components
-    return opts
-
-
-def _instagram_api_opts(force_impersonate: bool) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {}
-    if force_impersonate:
-        target = _parse_impersonate_target(env_config.YTDLP_INSTAGRAM_IMPERSONATE)
+def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    if is_youtube_url(url):
+        runtimes = _csv(env_config.YTDLP_JS_RUNTIMES)
+        components = _csv(env_config.YTDLP_REMOTE_COMPONENTS)
+        if runtimes:
+            options["js_runtimes"] = {runtime: {} for runtime in runtimes}
+        if components:
+            options["remote_components"] = components
+    if is_instagram_url(url):
+        options.update(
+            retries=env_config.YTDLP_INSTAGRAM_RETRIES,
+            fragment_retries=env_config.YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
+            socket_timeout=env_config.YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
+        )
+        target = _impersonate(env_config.YTDLP_INSTAGRAM_IMPERSONATE) if instagram_impersonate else None
         if target is not None:
-            opts["impersonate"] = target
-    return opts
+            options["impersonate"] = target
+    return options
 
 
-def _base_meta_opts(cookiefile_value: Optional[str], http_headers: Dict[str, str]) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {
+def _base_options(cookie_file: Path | None) -> dict[str, Any]:
+    options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
         "socket_timeout": 20,
         "retries": 5,
-        "http_headers": http_headers,
+        "http_headers": _headers(),
     }
-    if cookiefile_value:
-        opts["cookiefile"] = cookiefile_value
-    return opts
+    if cookie_file and cookie_file.is_file():
+        options["cookiefile"] = os.fspath(cookie_file)
+    return options
 
 
-def _base_download_opts(
-    outtmpl: str,
-    max_send_bytes: int,
-    concurrent_fragments: int,
-    http_headers: Dict[str, str],
-) -> Dict[str, Any]:
-    return {
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": concurrent_fragments,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
-        "max_filesize": max_send_bytes,
-        "http_headers": http_headers,
-    }
+def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata:
+    options = _base_options(cookie_file)
+    options.update(_site_options(url))
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        if not is_instagram_url(url):
+            raise
+        fallback = _base_options(cookie_file)
+        with yt_dlp.YoutubeDL(fallback) as ydl:
+            info = ydl.extract_info(url, download=False)
+    if not isinstance(info, dict):
+        raise RuntimeError("extractor returned no metadata")
+    extractor = str(info.get("extractor_key") or info.get("extractor") or "generic").lower()
+    media_id = str(info.get("id") or info.get("display_id") or "").strip()
+    if not media_id:
+        raise RuntimeError("extractor returned no media id")
+    source = str(info.get("extractor_key") or info.get("extractor") or "Video")
+    return MediaMetadata(url=url, info=info, media_key=f"{extractor}:{media_id}", source_name=source)
 
 
-def _extract_meta(url: str, opts: Dict[str, Any]) -> Dict[str, Any]:
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def _download(url: str, opts: Dict[str, Any]) -> Dict[str, Any]:
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=True)
-
-
-def download_with_ytdlp(
-    url: str,
+def download_metadata(
+    metadata: MediaMetadata,
     out_prefix: str,
-    output_folder: str,
+    output_folder: Path,
     *,
     max_send_bytes: int,
     concurrent_fragments: int,
-) -> Dict[str, Any]:
-    os.makedirs(output_folder, exist_ok=True)
-    outtmpl = os.path.join(output_folder, f"{out_prefix}.%(ext)s")
+    cookie_file: Path | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    output_folder.mkdir(parents=True, exist_ok=True)
+    outtmpl = os.fspath(output_folder / f"{out_prefix}.%(ext)s")
+    format_spec, merge_format = select_format(metadata.info, max_send_bytes)
 
-    cookies_file = getattr(config, "cookies_file", None)
-    cookiefile_value = None
-    if isinstance(cookies_file, str) and cookies_file.strip() and os.path.exists(cookies_file.strip()):
-        cookiefile_value = cookies_file.strip()
+    def progress_hook(_status: dict[str, Any]) -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise yt_dlp.utils.DownloadError("download deadline exceeded")
 
-    http_headers = _build_http_headers()
-
-    is_yt = is_youtube_url(url)
-    is_ig = is_instagram_url(url)
-
-    meta_opts = _base_meta_opts(cookiefile_value, http_headers)
-    if is_yt:
-        meta_opts.update(_youtube_api_opts())
-    if is_ig:
-        meta_opts.update(
-            {
-                "retries": env_config.YTDLP_INSTAGRAM_RETRIES,
-                "fragment_retries": env_config.YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
-                "socket_timeout": env_config.YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
-            }
-        )
-        meta_opts.update(_instagram_api_opts(force_impersonate=True))
-
-    try:
-        meta = _extract_meta(url, meta_opts)
-    except Exception:
-        if not is_ig:
-            raise
-        # Fail-soft: Instagram fallback without forced impersonation and with base retries/timeouts.
-        fallback_meta_opts = _base_meta_opts(cookiefile_value, http_headers)
-        meta = _extract_meta(url, fallback_meta_opts)
-
-    plan = build_video_plan_like_main1(meta)
-    if plan:
-        format_value = str(plan.get("format_spec"))
-        merge_value = plan.get("merge_output_format")
-    else:
-        format_value = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-        merge_value = "mp4"
-
-    primary_opts = _base_download_opts(
+    options = _base_options(cookie_file)
+    options.update(
         outtmpl=outtmpl,
-        max_send_bytes=max_send_bytes,
-        concurrent_fragments=concurrent_fragments,
-        http_headers=http_headers,
+        concurrent_fragment_downloads=concurrent_fragments,
+        fragment_retries=5,
+        max_filesize=max_send_bytes,
+        format=format_spec,
+        progress_hooks=[progress_hook],
     )
-    primary_opts["format"] = format_value
-    if merge_value:
-        primary_opts["merge_output_format"] = str(merge_value)
-    if cookiefile_value:
-        primary_opts["cookiefile"] = cookiefile_value
-    if is_yt:
-        primary_opts.update(_youtube_api_opts())
-    if is_ig:
-        primary_opts.update(
-            {
-                "retries": env_config.YTDLP_INSTAGRAM_RETRIES,
-                "fragment_retries": env_config.YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
-                "socket_timeout": env_config.YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
-            }
-        )
-        primary_opts.update(_instagram_api_opts(force_impersonate=True))
-
+    if merge_format:
+        options["merge_output_format"] = merge_format
+    options.update(_site_options(metadata.url))
     try:
-        return _download(url, primary_opts)
-    except Exception as primary_err:
-        if is_ig:
-            # Fail-soft: retry Instagram without forced impersonation and with default retries/timeouts.
-            ig_fallback_opts = _base_download_opts(
-                outtmpl=outtmpl,
-                max_send_bytes=max_send_bytes,
-                concurrent_fragments=concurrent_fragments,
-                http_headers=http_headers,
-            )
-            ig_fallback_opts["format"] = format_value
-            if merge_value:
-                ig_fallback_opts["merge_output_format"] = str(merge_value)
-            if cookiefile_value:
-                ig_fallback_opts["cookiefile"] = cookiefile_value
-            return _download(url, ig_fallback_opts)
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.process_ie_result(dict(metadata.info), download=True)
+    except Exception:
+        if not (is_youtube_url(metadata.url) or is_instagram_url(metadata.url)):
+            raise
+        fallback = _base_options(cookie_file)
+        fallback.update(
+            outtmpl=outtmpl,
+            concurrent_fragment_downloads=1,
+            fragment_retries=5,
+            max_filesize=max_send_bytes,
+            format=format_spec,
+            progress_hooks=[progress_hook],
+        )
+        if merge_format:
+            fallback["merge_output_format"] = merge_format
+        fallback.update(_site_options(metadata.url, instagram_impersonate=False))
+        with yt_dlp.YoutubeDL(fallback) as ydl:
+            return ydl.extract_info(metadata.url, download=True)
 
-        if is_yt:
-            # Extractor churn fallback for YouTube.
-            yt_fallback_opts = _base_download_opts(
-                outtmpl=outtmpl,
-                max_send_bytes=max_send_bytes,
-                concurrent_fragments=1,
-                http_headers=http_headers,
-            )
-            yt_fallback_opts.update(_youtube_api_opts())
-            yt_fallback_opts["format"] = "18/best[ext=mp4]/best"
-            return _download(url, yt_fallback_opts)
 
-        raise primary_err
+def find_downloaded_file(info: dict[str, Any], prefix: str, output_folder: Path) -> Path | None:
+    exact = output_folder / f"{prefix}.mp4"
+    if exact.is_file():
+        return exact
+    candidates: list[Path] = []
+    for path in output_folder.glob(f"{prefix}.*"):
+        lower = path.name.lower()
+        if not path.is_file() or lower.endswith((".part", ".ytdl", ".tmp", ".temp")):
+            continue
+        name_after_prefix = lower[len(prefix) :]
+        if name_after_prefix.startswith(".f") and name_after_prefix[2:].split(".", 1)[0].isdigit():
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: (path.suffix.lower() == ".mp4", path.stat().st_mtime), reverse=True)
+    return candidates[0]

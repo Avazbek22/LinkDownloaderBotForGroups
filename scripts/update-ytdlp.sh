@@ -4,96 +4,96 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SERVICE_KEY="${SERVICE_KEY:-linkdownloaderbot}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
+IMAGE_NAME="${IMAGE_NAME:-linkdownloaderbotforgroups:local}"
+ROLLBACK_IMAGE="${IMAGE_NAME%:*}:rollback"
 
-log() {
-  printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
-}
-
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 detect_compose() {
-  if need_cmd docker && docker compose version >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1; then
     echo "docker compose"
-    return 0
-  fi
-  if need_cmd docker-compose; then
+  elif need_cmd docker-compose; then
     echo "docker-compose"
-    return 0
-  fi
-  return 1
-}
-
-log_runtime() {
-  local py="$1"
-  local node_line="node:missing"
-  if need_cmd node; then
-    node_line="node:$(node --version 2>/dev/null || echo unknown)"
-  fi
-  local targets_line
-  targets_line="$("$py" -m yt_dlp --list-impersonate-targets 2>/dev/null | tr '\n' ' ' || true)"
-  if [[ -n "$targets_line" ]]; then
-    log "$node_line | impersonate-targets: $targets_line"
   else
-    log "$node_line | impersonate-targets: unavailable"
+    return 1
   fi
 }
 
-update_venv_mode() {
-  local venv_python="$ROOT_DIR/.venv/bin/python"
-  local venv_pip="$ROOT_DIR/.venv/bin/pip"
-  [[ -x "$venv_python" && -x "$venv_pip" ]] || return 1
-
+update_venv() {
+  local python="$ROOT_DIR/.venv/bin/python"
+  local pip="$ROOT_DIR/.venv/bin/pip"
+  [[ -x "$python" && -x "$pip" ]] || return 1
   local before after
-  before="$("$venv_python" -m yt_dlp --version 2>/dev/null || true)"
-  "$venv_pip" install --upgrade 'yt-dlp[default,curl-cffi]' >/dev/null
-  after="$("$venv_python" -m yt_dlp --version 2>/dev/null || true)"
-  log_runtime "$venv_python"
-
-  if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
-    log "yt-dlp changed in venv: $before -> $after"
-    if need_cmd systemctl && systemctl list-unit-files | grep -q '^linkdownloaderbotforgroups.service'; then
-      systemctl restart linkdownloaderbotforgroups.service || true
-      log "restarted linkdownloaderbotforgroups.service"
-    fi
-  else
-    log "yt-dlp unchanged in venv: ${after:-unknown}"
+  before="$($python -m yt_dlp --version 2>/dev/null || true)"
+  "$pip" install --upgrade 'yt-dlp[default,curl-cffi]'
+  after="$($python -m yt_dlp --version)"
+  log "venv yt-dlp: ${before:-unknown} -> $after"
+  if [[ "$before" != "$after" ]] && systemctl list-unit-files 2>/dev/null | grep -q '^linkdownloaderbotforgroups.service'; then
+    systemctl restart linkdownloaderbotforgroups.service
   fi
-  return 0
 }
 
-update_docker_mode() {
-  local compose_cmd
-  compose_cmd="$(detect_compose)" || return 1
-
-  local before after
-  before="$($compose_cmd -p "$COMPOSE_PROJECT" exec -T "$SERVICE_KEY" python -m yt_dlp --version 2>/dev/null || true)"
-  $compose_cmd -p "$COMPOSE_PROJECT" build "$SERVICE_KEY" >/dev/null
-  after="$($compose_cmd -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version 2>/dev/null || true)"
-
-  if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
-    $compose_cmd -p "$COMPOSE_PROJECT" up -d --no-deps "$SERVICE_KEY" >/dev/null
-    log "yt-dlp changed in docker: $before -> $after (service restarted)"
-  else
-    log "yt-dlp unchanged in docker: ${after:-unknown}"
+update_docker() {
+  local compose before_id before_version after_version
+  compose="$(detect_compose)"
+  cd "$ROOT_DIR"
+  before_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  before_version="$($compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version 2>/dev/null || true)"
+  if [[ -n "$before_id" ]]; then
+    docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"
   fi
 
-  local node_line="node:unknown"
-  node_line="$($compose_cmd -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" sh -lc 'node --version 2>/dev/null || echo missing' 2>/dev/null || true)"
-  local targets_line
-  targets_line="$($compose_cmd -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --list-impersonate-targets 2>/dev/null | tr '\n' ' ' || true)"
-  log "container-node:${node_line:-missing} | impersonate-targets: ${targets_line:-unavailable}"
-  return 0
+  $compose -p "$COMPOSE_PROJECT" build --pull \
+    --build-arg "YTDLP_CACHEBUST=$(date -u '+%Y%m%dT%H%M%SZ')" "$SERVICE_KEY"
+  $compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" \
+    python -c 'import main, telebot, yt_dlp; from app.settings import load_settings; s=load_settings(); telebot.TeleBot(s.token).get_me(); print(yt_dlp.version.__version__)' >/dev/null
+  after_version="$($compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version)"
+
+  if ! $compose -p "$COMPOSE_PROJECT" up -d --no-deps "$SERVICE_KEY"; then
+    rollback_docker "$compose"
+    return 1
+  fi
+  sleep 10
+  local container_id running
+  container_id="$($compose -p "$COMPOSE_PROJECT" ps -q "$SERVICE_KEY")"
+  running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)"
+  if [[ -z "$container_id" || "$running" != "true" ]]; then
+    log "new container failed; rolling back"
+    rollback_docker "$compose"
+    return 1
+  fi
+  log "docker yt-dlp: ${before_version:-unknown} -> $after_version"
+}
+
+rollback_docker() {
+  local compose="$1"
+  if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+    docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME"
+    $compose -p "$COMPOSE_PROJECT" up -d --no-deps --force-recreate "$SERVICE_KEY"
+  fi
+}
+
+docker_runtime_exists() {
+  local compose
+  compose="$(detect_compose)" || return 1
+  cd "$ROOT_DIR"
+  $compose -p "$COMPOSE_PROJECT" ps -a --services 2>/dev/null | grep -q "^${SERVICE_KEY}$"
 }
 
 main() {
+  mkdir -p "$ROOT_DIR/logs"
+  find "$ROOT_DIR/logs" -maxdepth 1 -type f -name 'updater-*.log' -mtime +60 -delete
+  exec >>"$ROOT_DIR/logs/updater-$(date -u '+%Y-%m-%d').log" 2>&1
   cd "$ROOT_DIR"
-  if update_venv_mode; then
+  if docker_runtime_exists && update_docker; then
     exit 0
   fi
-  if update_docker_mode; then
+  if update_venv; then
     exit 0
   fi
-  log "No supported runtime found (.venv or docker compose). Nothing to update."
+  log "no supported runtime found"
+  exit 1
 }
 
 main "$@"

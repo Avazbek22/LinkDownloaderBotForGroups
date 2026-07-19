@@ -1,833 +1,621 @@
 from __future__ import annotations
 
 import html
-import json
-import os
-import re
-import uuid
+import logging
 import queue
+import re
+import signal
 import threading
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-from urllib.parse import urlparse
+import time
+import uuid
+from pathlib import Path
+from typing import Any
 
 import telebot
 
-import config
-from app.download_backend import download_with_ytdlp
+from app.download_backend import MediaMetadata, download_metadata, extract_metadata, find_downloaded_file
+from app.i18n import tr
+from app.jobs import Flight, FlightCoordinator, Job
+from app.logging_setup import configure_logging
+from app.media_cache import DiskMediaCache
+from app.settings import Settings, load_settings
+from app.storage import Storage
+from app.url_security import UnsafeUrlError, normalized_url_key, safe_url_for_log, validate_public_url
 
-
-# =========================
-# Settings (simple and stable)
-# =========================
-
-WORKERS = 2                 # how many downloads in parallel
-MAX_QUEUE = 200             # queue limit to avoid RAM issues on busy groups
-MAX_SEND_BYTES = int(getattr(config, "max_filesize", 50_000_000))
-YTDLP_CONCURRENT_FRAGMENTS = 4
-
-# Persistent JSON "DB" (mounted via docker-compose to survive restarts)
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-PREFS_PATH = os.path.join(DATA_DIR, "prefs.json")
-
-# About (for help messages)
-AUTHOR_NAME = "Avazbek Olimov"
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
+URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 
-# =========================
-# Telegram init
-# =========================
-
-bot = telebot.TeleBot(config.token, threaded=True)
-bot_lock = threading.RLock()
-
-jobs_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=MAX_QUEUE)
-
-
-def _bot_call(fn, *args, **kwargs):
-    with bot_lock:
-        return fn(*args, **kwargs)
-
-
-# =========================
-# Helpers
-# =========================
-
-def _extract_first_url(text: str) -> Optional[str]:
-    if not text:
+def extract_first_url(text: str) -> str | None:
+    match = URL_RE.search(text or "")
+    if not match:
         return None
-    m = re.search(r"(https?://\S+)", text.strip())
-    if not m:
-        return None
-    url = m.group(1).strip()
-    url = url.rstrip(").,]}>\"'")
-    return url
+    return match.group(0).rstrip(").,;:!?]}>\"'")
 
 
-def _try_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> bool:
-    # Requirement: no notifications, no preview
-    try:
-        kwargs: Dict[str, Any] = {
-            "disable_web_page_preview": True,
-            "disable_notification": True,
-        }
-        if isinstance(message_thread_id, int):
-            kwargs["message_thread_id"] = message_thread_id
-
-        _bot_call(bot.send_message, chat_id, text, **kwargs)
-        return True
-    except Exception:
-        return False
-
-
-def _try_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> bool:
-    # Requirement: no notifications, no preview + HTML allowed
-    try:
-        kwargs: Dict[str, Any] = {
-            "disable_web_page_preview": True,
-            "disable_notification": True,
-            "parse_mode": "HTML",
-        }
-        if isinstance(message_thread_id, int):
-            kwargs["message_thread_id"] = message_thread_id
-
-        _bot_call(bot.send_message, chat_id, html_text, **kwargs)
-        return True
-    except Exception:
-        return False
-
-
-def _safe_send_message(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> None:
-    _try_send_message(chat_id, text, message_thread_id=message_thread_id)
-
-
-def _safe_send_message_html(chat_id: int, html_text: str, message_thread_id: Optional[int] = None) -> None:
-    _try_send_message_html(chat_id, html_text, message_thread_id=message_thread_id)
-
-
-def _safe_delete_message(chat_id: int, message_id: int) -> bool:
-    try:
-        _bot_call(bot.delete_message, chat_id, message_id)
-        return True
-    except Exception:
-        return False
-
-
-def _log_request(message, url: str) -> None:
-    logs_chat = getattr(config, "logs", None)
-    if not logs_chat:
-        return
-
-    try:
-        user = message.from_user
-        username = f"@{user.username}" if getattr(user, "username", None) else "(no username)"
-        chat_title = getattr(message.chat, "title", "") or "Group"
-        text = (
-            f"Download request from {username} ({user.id})\n"
-            f"Chat: {chat_title} ({message.chat.id})\n"
-            f"URL: {url}"
+class BotApplication:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.log = logging.getLogger("link_downloader_bot.app")
+        self.storage = Storage(settings.data_dir, settings.default_language, settings.delete_original)
+        self.storage.prune_media_cache(settings.file_id_cache_ttl_days, settings.file_id_cache_max_items)
+        self.disk_cache = DiskMediaCache(
+            settings.output_dir,
+            max_files=settings.disk_cache_max_files,
+            ttl_seconds=settings.disk_cache_ttl,
         )
-        _bot_call(bot.send_message, logs_chat, text, disable_web_page_preview=True)
-    except Exception:
-        pass
-
-
-def _is_intermediate_ytdlp_file(prefix: str, filename: str) -> bool:
-    """
-    yt-dlp промежуточные файлы при separate выглядят как:
-    PREFIX.f137.mp4, PREFIX.f140.m4a, PREFIX.f248.webm и т.п.
-    """
-    if not filename.startswith(prefix + "."):
-        return False
-    # .part / .ytdl / temp сразу считаем мусором/промежуточным
-    low = filename.lower()
-    if low.endswith(".part") or low.endswith(".ytdl") or low.endswith(".tmp") or low.endswith(".temp"):
-        return True
-    # PREFIX.f<digits>.ext
-    return re.match(rf"^{re.escape(prefix)}\.f\d+\.", filename) is not None
-
-
-def _find_downloaded_file(info: Dict[str, Any], prefix: str, output_folder: str) -> Optional[str]:
-    """
-    КРИТИЧНО: сначала ищем финальный файл PREFIX.mp4.
-    Именно он является результатом merge и содержит аудио.
-    """
-    # 0) Best: final merged/progressive file by outtmpl base
-    final_mp4 = os.path.join(output_folder, f"{prefix}.mp4")
-    if os.path.exists(final_mp4):
-        return final_mp4
-
-    # 1) Sometimes yt-dlp gives final path in these keys
-    try:
-        for key in ("filepath", "_filename"):
-            fp = info.get(key)
-            if fp and os.path.exists(fp):
-                return fp
-    except Exception:
-        pass
-
-    # 2) If info has requested_downloads, НЕ берём первый попавшийся mp4 (это часто video-only).
-    # Берём лучше "не промежуточный" и предпочитаем тот, что без ".f123."
-    try:
-        reqs = info.get("requested_downloads") or []
-        candidates = []
-        for r in reqs:
-            fp = r.get("filepath")
-            if not fp or not os.path.exists(fp):
-                continue
-            fn = os.path.basename(fp)
-            candidates.append(fp)
-
-        # Prefer non-intermediate
-        non_intermediate = [fp for fp in candidates if not _is_intermediate_ytdlp_file(prefix, os.path.basename(fp))]
-        if non_intermediate:
-            # Prefer mp4 among them
-            mp4 = [fp for fp in non_intermediate if fp.lower().endswith(".mp4")]
-            return mp4[0] if mp4 else non_intermediate[0]
-    except Exception:
-        pass
-
-    # 3) Fallback: scan folder, prefer exact PREFIX.<ext> (without .f123), then mp4, newest
-    try:
-        files = []
-        for fn in os.listdir(output_folder):
-            if not fn.startswith(prefix):
-                continue
-            low = fn.lower()
-            if low.endswith(".part") or low.endswith(".ytdl") or low.endswith(".tmp") or low.endswith(".temp"):
-                continue
-            fp = os.path.join(output_folder, fn)
-            if not os.path.exists(fp):
-                continue
-            files.append(fp)
-
-        if not files:
-            return None
-
-        # Prefer "base" file: PREFIX.<ext> (no extra dots except ext)
-        base_like = []
-        for fp in files:
-            fn = os.path.basename(fp)
-            if fn.startswith(prefix + ".") and fn.count(".") == 1:
-                base_like.append(fp)
-
-        if base_like:
-            mp4 = [fp for fp in base_like if fp.lower().endswith(".mp4")]
-            if mp4:
-                return mp4[0]
-            return base_like[0]
-
-        # Else prefer mp4 that is not intermediate
-        non_intermediate_mp4 = [
-            fp for fp in files
-            if fp.lower().endswith(".mp4") and not _is_intermediate_ytdlp_file(prefix, os.path.basename(fp))
-        ]
-        if non_intermediate_mp4:
-            # newest
-            non_intermediate_mp4.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return non_intermediate_mp4[0]
-
-        # last resort: newest file
-        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return files[0]
-    except Exception:
-        return None
-
-
-def _cleanup_files(prefix: str, output_folder: str) -> None:
-    try:
-        for fn in os.listdir(output_folder):
-            if fn.startswith(prefix):
-                fp = os.path.join(output_folder, fn)
-                try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-def _download_with_ytdlp(url: str, out_prefix: str, output_folder: str) -> Dict[str, Any]:
-    return download_with_ytdlp(
-        url=url,
-        out_prefix=out_prefix,
-        output_folder=output_folder,
-        max_send_bytes=MAX_SEND_BYTES,
-        concurrent_fragments=YTDLP_CONCURRENT_FRAGMENTS,
-    )
-
-
-def _send_video_no_reply(
-    chat_id: int,
-    message_thread_id: Optional[int],
-    file_path: str,
-    caption_html: str,
-) -> None:
-    size = os.path.getsize(file_path)
-    if size > MAX_SEND_BYTES:
-        raise RuntimeError("File too large for Telegram bot upload limit")
-
-    kwargs: Dict[str, Any] = {
-        "supports_streaming": True,
-        "disable_notification": True,
-        "caption": caption_html,
-        "parse_mode": "HTML",
-    }
-    if isinstance(message_thread_id, int):
-        kwargs["message_thread_id"] = message_thread_id
-
-    with open(file_path, "rb") as f:
-        _bot_call(bot.send_video, chat_id, f, **kwargs)
-
-
-# =========================
-# Source detection
-# =========================
-
-def _detect_source(url: str) -> str:
-    try:
-        host = (urlparse(url).netloc or "").lower()
-        host = host.replace("www.", "").strip()
-
-        mapping = [
-            (("youtube.com", "youtu.be", "m.youtube.com"), "YouTube"),
-            (("instagram.com", "instagr.am"), "Instagram"),
-            (("tiktok.com",), "TikTok"),
-            (("vk.com", "vkvideo.ru"), "VK"),
-            (("twitter.com", "x.com"), "X"),
-            (("facebook.com", "fb.watch"), "Facebook"),
-            (("t.me",), "Telegram"),
-        ]
-
-        for domains, name in mapping:
-            if any(host == d or host.endswith("." + d) for d in domains):
-                return name
-
-        if host:
-            return host
-        return "Unknown"
-    except Exception:
-        return "Unknown"
-
-
-def _format_sender_name(message) -> str:
-    user = message.from_user
-    first = (getattr(user, "first_name", "") or "").strip()
-    last = (getattr(user, "last_name", "") or "").strip()
-
-    full = f"{first} {last}".strip()
-    if full:
-        return full
-
-    username = getattr(user, "username", None)
-    if username:
-        return f"@{username}"
-
-    return str(getattr(user, "id", ""))
-
-
-def _html_escape_text(s: str) -> str:
-    return html.escape(s or "", quote=False)
-
-
-def _html_escape_attr(s: str) -> str:
-    return html.escape(s or "", quote=True)
-
-
-# =========================
-# Persistent prefs (JSON)
-# =========================
-
-_prefs_lock = threading.RLock()
-_prefs_cache: Dict[str, Any] = {}
-
-
-def _ensure_prefs_loaded() -> None:
-    global _prefs_cache
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    with _prefs_lock:
-        if _prefs_cache:
-            return
-
-        if not os.path.exists(PREFS_PATH):
-            _prefs_cache = {
-                "version": 2,
-                "opt_out": {},
-                "welcomed_groups": {},
-                "welcomed_private": {},
-            }
-            _save_prefs_locked()
-            return
-
-        try:
-            with open(PREFS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("prefs not dict")
-
-            if "opt_out" not in data or not isinstance(data.get("opt_out"), dict):
-                data["opt_out"] = {}
-
-            if "welcomed_groups" not in data or not isinstance(data.get("welcomed_groups"), dict):
-                data["welcomed_groups"] = {}
-
-            if "welcomed_private" not in data or not isinstance(data.get("welcomed_private"), dict):
-                data["welcomed_private"] = {}
-
-            if "version" not in data:
-                data["version"] = 2
-
-            _prefs_cache = data
-        except Exception:
-            _prefs_cache = {
-                "version": 2,
-                "opt_out": {},
-                "welcomed_groups": {},
-                "welcomed_private": {},
-            }
-            _save_prefs_locked()
-
-
-def _save_prefs_locked() -> None:
-    tmp = PREFS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_prefs_cache, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PREFS_PATH)
-
-
-def _is_opted_out(chat_id: int, user_id: int) -> bool:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        opt_out = _prefs_cache.get("opt_out", {})
-        chat_key = str(chat_id)
-        users = opt_out.get(chat_key, {})
-        return bool(users.get(str(user_id), False))
-
-
-def _toggle_opt_out(chat_id: int, user_id: int) -> bool:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        opt_out = _prefs_cache.setdefault("opt_out", {})
-        chat_key = str(chat_id)
-        users = opt_out.setdefault(chat_key, {})
-
-        user_key = str(user_id)
-        new_value = not bool(users.get(user_key, False))
-        users[user_key] = new_value
-
-        if not new_value:
-            users.pop(user_key, None)
-        if isinstance(users, dict) and not users:
-            opt_out.pop(chat_key, None)
-
-        _save_prefs_locked()
-        return new_value
-
-
-def _was_group_welcomed(chat_id: int) -> bool:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        return bool(_prefs_cache.get("welcomed_groups", {}).get(str(chat_id), False))
-
-
-def _mark_group_welcomed(chat_id: int) -> None:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        _prefs_cache.setdefault("welcomed_groups", {})[str(chat_id)] = True
-        _save_prefs_locked()
-
-
-def _was_private_welcomed(user_id: int) -> bool:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        return bool(_prefs_cache.get("welcomed_private", {}).get(str(user_id), False))
-
-
-def _mark_private_welcomed(user_id: int) -> None:
-    _ensure_prefs_loaded()
-    with _prefs_lock:
-        _prefs_cache.setdefault("welcomed_private", {})[str(user_id)] = True
-        _save_prefs_locked()
-
-
-# =========================
-# Mention detection
-# =========================
-
-def _get_bot_username_lower() -> str:
-    try:
-        me = _bot_call(bot.get_me)
-        username = (getattr(me, "username", "") or "").strip()
-        return username.lower()
-    except Exception:
-        return ""
-
-
-def _get_bot_id() -> int:
-    try:
-        me = _bot_call(bot.get_me)
-        return int(getattr(me, "id", 0) or 0)
-    except Exception:
-        return 0
-
-
-BOT_USERNAME_LOWER = _get_bot_username_lower()
-BOT_ID = _get_bot_id()
-
-
-def _contains_bot_mention(text: str) -> bool:
-    if not isinstance(text, str) or not text.strip():
-        return False
-    if not BOT_USERNAME_LOWER:
-        return False
-    return f"@{BOT_USERNAME_LOWER}" in text.lower()
-
-
-def _contains_sender_self_mention_or_me(text: str, sender_username: Optional[str]) -> bool:
-    if not isinstance(text, str) or not text.strip():
-        return False
-
-    t = text.lower()
-
-    if re.search(r"(^|\s)me(\s|$)", t):
-        return True
-
-    if re.search(r"(^|\s)я(\s|$)", t):
-        return True
-
-    if sender_username:
-        return re.search(rf"@{re.escape(sender_username.lower())}\b", t) is not None
-
-    return False
-
-
-# =========================
-# Help / About text
-# =========================
-
-def _help_text_html(is_group: bool) -> str:
-    bot_mention = f"@{BOT_USERNAME_LOWER}" if BOT_USERNAME_LOWER else "@<bot>"
-
-    if is_group:
-        usage = (
-            "<b>Как пользоваться</b>\n"
-            "• Просто отправляйте ссылку на видео в группу — бот скачает видео, отправит его и затем удалит исходную ссылку.\n"
-            "• Подпись под видео: кликабельная «Ссылка на видео …» + «От Имя Фамилия».\n\n"
-            "<b>Как отключить авто-скачивание для себя</b>\n"
-            f"• Напишите в группе: {bot_mention} @ВашНик\n"
-            "  (можно также написать «me» или «я» вместо ника)\n"
-            "• Повторите команду — включится обратно.\n\n"
-            "<b>Режим вручную (когда Вы отключились)</b>\n"
-            f"• Чтобы скачать: {bot_mention} &lt;ссылка&gt;\n"
-        )
-    else:
-        usage = (
-            "<b>Я бот для групп</b>\n"
-            "Я скачиваю видео по ссылкам (YouTube/Instagram/TikTok/VK/X/Facebook/Telegram и др.) и публикую видео в группе.\n\n"
-            "<b>Что нужно сделать</b>\n"
-            "1) Добавьте меня в группу.\n"
-            "2) Дайте права администратора и разрешение удалять сообщения.\n\n"
-            "<b>Как работает по умолчанию</b>\n"
-            "• Любая ссылка на видео в группе → скачивание → отправка видео → удаление исходной ссылки.\n\n"
-            "<b>Как отключить авто-скачивание для себя</b>\n"
-            f"• В группе напишите: {bot_mention} @ВашНик\n"
-            "  (или «me» / «я»)\n"
-            "• Повторите — включится обратно.\n\n"
-            "<b>Когда авто отключено</b>\n"
-            f"• Скачивание только так: {bot_mention} &lt;ссылка&gt;\n"
-        )
-
-    author = _html_escape_text(AUTHOR_NAME)
-    repo_attr = _html_escape_attr(REPO_URL)
-
-    return (
-        f"{usage}\n"
-        f"Автор: {author}\n"
-        f'<a href="{repo_attr}">Ссылка на репозиторий</a>'
-    )
-
-
-def _bot_admin_hint_html(chat_id: int) -> str:
-    try:
-        if not BOT_ID:
-            return ""
-        cm = _bot_call(bot.get_chat_member, chat_id, BOT_ID)
-        status = (getattr(cm, "status", "") or "").lower()
-        is_admin = status in ("administrator", "creator")
-        if is_admin:
-            return ""
-        return (
-            "⚠️ <b>Важно</b>\n"
-            "Чтобы бот мог <b>удалять исходные ссылки</b>, назначьте его администратором и включите право «Удалять сообщения».\n\n"
-        )
-    except Exception:
-        return ""
-
-
-def _try_set_commands() -> None:
-    try:
-        commands = [
-            telebot.types.BotCommand("start", "Инструкция"),
-            telebot.types.BotCommand("help", "Инструкция"),
-        ]
-        _bot_call(bot.set_my_commands, commands)
-    except Exception:
-        pass
-
-
-_try_set_commands()
-
-
-# =========================
-# Jobs
-# =========================
-
-@dataclass(frozen=True)
-class Job:
-    chat_id: int
-    message_thread_id: Optional[int]
-    original_message_id: int
-    url: str
-    prefix: str
-    source_name: str
-    sender_full_name: str
-    notify_on_fail: bool
-    delete_original_on_success: bool
-
-
-def _process_job(job_dict: Dict[str, Any]) -> None:
-    job = Job(**job_dict)
-
-    output_folder = getattr(config, "output_folder", "/tmp/yt-dlp-telegram") or "/tmp/yt-dlp-telegram"
-
-    try:
-        info = _download_with_ytdlp(job.url, job.prefix, output_folder)
-        file_path = _find_downloaded_file(info, job.prefix, output_folder)
-
-        if not file_path or not os.path.exists(file_path):
-            raise RuntimeError("Downloaded file not found")
-
-        url_attr = _html_escape_attr(job.url)
-        source_text = _html_escape_text(job.source_name)
-        sender_text = _html_escape_text(job.sender_full_name)
-
-        caption_html = f'<a href="{url_attr}">Ссылка на видео {source_text}</a>\nОт {sender_text}'
-
-        _send_video_no_reply(
-            chat_id=job.chat_id,
-            message_thread_id=job.message_thread_id,
-            file_path=file_path,
-            caption_html=caption_html,
-        )
-
-        if job.delete_original_on_success:
-            _safe_delete_message(job.chat_id, job.original_message_id)
-
-    except Exception:
-        if job.notify_on_fail:
-            _safe_send_message(job.chat_id, "Не удалось скачать", message_thread_id=job.message_thread_id)
-    finally:
-        _cleanup_files(job.prefix, output_folder)
-
-
-def _worker_loop() -> None:
-    while True:
-        job = jobs_q.get()
-        try:
-            _process_job(job)
-        finally:
-            jobs_q.task_done()
-
-
-for _ in range(WORKERS):
-    t = threading.Thread(target=_worker_loop, daemon=True)
-    t.start()
-
-
-# =========================
-# Service: bot added to group (one-time per group)
-# =========================
-
-@bot.message_handler(content_types=["new_chat_members"])
-def handle_new_chat_members(message):
-    try:
-        if message.chat.type not in ("group", "supergroup"):
-            return
-
-        new_members = getattr(message, "new_chat_members", None) or []
-        if not new_members:
-            return
-
-        is_me = False
-        for u in new_members:
+        self.coordinator = FlightCoordinator()
+        self.queue: queue.Queue[Flight | None] = queue.Queue(maxsize=settings.max_queue)
+        self.stop_event = threading.Event()
+        self.upload_slots = threading.BoundedSemaphore(settings.upload_workers)
+        self.bot = telebot.TeleBot(settings.token, threaded=True)
+        self.bot_id = 0
+        self.bot_username = ""
+        self.workers: list[threading.Thread] = []
+        self.maintenance_thread: threading.Thread | None = None
+        self._register_handlers()
+
+    @property
+    def mention(self) -> str:
+        return f"@{self.bot_username}" if self.bot_username else "@bot"
+
+    def initialize_identity(self) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, 6):
             try:
-                uid = int(getattr(u, "id", 0) or 0)
+                me = self.bot.get_me()
+                self.bot_id = int(me.id)
+                self.bot_username = str(me.username or "").lower()
+                return
+            except Exception as exc:  # Telegram errors vary by transport/version
+                last_error = exc
+                self.log.warning("get_me failed attempt=%s", attempt, exc_info=True)
+                if attempt < 5:
+                    time.sleep(min(attempt * 2, 8))
+        raise RuntimeError("cannot initialize Telegram bot identity") from last_error
+
+    def start(self) -> None:
+        self.disk_cache.maintain()
+        if self.settings.cookies_file and not self.settings.cookies_file.is_file():
+            self.log.warning("cookies file does not exist path=%s", self.settings.cookies_file)
+        self.initialize_identity()
+        self._set_commands()
+        for index in range(self.settings.workers):
+            thread = threading.Thread(target=self._worker, name=f"download-worker-{index + 1}", daemon=True)
+            thread.start()
+            self.workers.append(thread)
+        self.maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            name="cache-maintenance",
+            daemon=True,
+        )
+        self.maintenance_thread.start()
+        self.log.info(
+            "bot started username=%s workers=%s uploads=%s",
+            self.bot_username,
+            self.settings.workers,
+            self.settings.upload_workers,
+        )
+        self.bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=None)
+
+    def stop(self) -> None:
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        self.bot.stop_polling()
+        for _ in self.workers:
+            try:
+                self.queue.put_nowait(None)
+            except queue.Full:
+                break
+        for thread in self.workers:
+            thread.join(timeout=10)
+        if self.maintenance_thread is not None:
+            self.maintenance_thread.join(timeout=2)
+        self.disk_cache.maintain()
+        self.log.info("bot stopped")
+
+    def _worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                flight = self.queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                if flight is None:
+                    return
+                self._process_flight(flight)
             except Exception:
-                uid = 0
-            uname = (getattr(u, "username", "") or "").lower()
-            if (BOT_ID and uid == BOT_ID) or (BOT_USERNAME_LOWER and uname == BOT_USERNAME_LOWER):
-                is_me = True
+                self.log.exception("uncaught worker error")
+                self._operator_alert("A download worker failed unexpectedly. Check bot.log.")
+                if flight is not None:
+                    self.coordinator.abort(flight)
+            finally:
+                self.queue.task_done()
+
+    def _maintenance_loop(self) -> None:
+        interval = min(60, self.settings.disk_cache_ttl)
+        while not self.stop_event.wait(interval):
+            try:
+                self.disk_cache.maintain()
+                self.storage.prune_media_cache(
+                    self.settings.file_id_cache_ttl_days,
+                    self.settings.file_id_cache_max_items,
+                )
+            except Exception:
+                self.log.exception("cache maintenance failed")
+
+    def _process_flight(self, flight: Flight) -> None:
+        first = flight.jobs[0]
+        started = time.monotonic()
+        self.log.info("job metadata job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
+        cache_profile = f"mp4:{self.settings.max_filesize}"
+        cached = (
+            self.storage.get_cached_by_url(f"{first.url_key}|{cache_profile}", self.settings.file_id_cache_ttl_days)
+            if self.settings.media_cache_enabled
+            else None
+        )
+        retry_jobs: list[Job] = []
+        if cached is not None:
+            media_key, file_id, source_name = cached
+            if not self.coordinator.promote(flight, media_key):
+                return
+            metadata = MediaMetadata(first.url, {"id": media_key}, media_key, source_name)
+            while True:
+                batch = self.coordinator.pending(flight)
+                if batch:
+                    retry_jobs = self._send_by_file_id(batch, file_id, metadata, media_key)
+                    if retry_jobs:
+                        break
+                if self.coordinator.finish_if_idle(flight):
+                    self.log.info("Telegram cache hit job_id=%s media_key=%s", first.job_id, media_key)
+                    return
+
+        try:
+            validate_public_url(first.url)
+            metadata = extract_metadata(first.url, self.settings.cookies_file)
+            final_url = metadata.info.get("webpage_url")
+            if isinstance(final_url, str):
+                validate_public_url(final_url)
+        except Exception:
+            self.log.exception("metadata failed job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
+            self.coordinator.abort(flight)
+            return
+
+        media_key = f"{metadata.media_key}:mp4:{self.settings.max_filesize}"
+        if cached is None and not self.coordinator.promote(flight, media_key):
+            self.log.info("job joined media flight job_id=%s media_key=%s", first.job_id, media_key)
+            return
+
+        file_id = None
+        if self.settings.media_cache_enabled:
+            file_id = self.storage.get_file_id(media_key, self.settings.file_id_cache_ttl_days)
+        file_path = self.disk_cache.get(media_key) if self.settings.media_cache_enabled else None
+
+        while True:
+            batch = retry_jobs or self.coordinator.pending(flight)
+            retry_jobs = []
+            if batch:
+                if file_id:
+                    retry = self._send_by_file_id(batch, file_id, metadata, media_key)
+                    if retry:
+                        file_id = None
+                        if file_path is None:
+                            file_path = self._obtain_file(metadata, media_key)
+                        file_id = self._send_from_file(
+                            retry,
+                            file_path,
+                            metadata,
+                            media_key,
+                            {f"{key}|{cache_profile}" for key in flight.url_keys},
+                        )
+                else:
+                    if file_path is None:
+                        file_path = self._obtain_file(metadata, media_key)
+                    file_id = self._send_from_file(
+                        batch,
+                        file_path,
+                        metadata,
+                        media_key,
+                        {f"{key}|{cache_profile}" for key in flight.url_keys},
+                    )
+            if self.coordinator.finish_if_idle(flight):
                 break
 
-        if not is_me:
-            return
+        self.disk_cache.maintain()
+        self.log.info(
+            "job complete job_id=%s media_key=%s elapsed=%.2f",
+            first.job_id,
+            media_key,
+            time.monotonic() - started,
+        )
 
-        chat_id = int(message.chat.id)
-        message_thread_id = getattr(message, "message_thread_id", None)
+    def _obtain_file(self, metadata: MediaMetadata, media_key: str) -> Path:
+        cached = self.disk_cache.get(media_key)
+        if cached is not None:
+            self.log.info("disk cache hit media_key=%s", media_key)
+            return cached
+        prefix = self.disk_cache.prefix(media_key)
+        info = download_metadata(
+            metadata,
+            prefix,
+            self.settings.output_dir,
+            max_send_bytes=self.settings.max_filesize,
+            concurrent_fragments=self.settings.concurrent_fragments,
+            cookie_file=self.settings.cookies_file,
+            deadline=time.monotonic() + self.settings.job_timeout,
+        )
+        path = find_downloaded_file(info, prefix, self.settings.output_dir)
+        if path is None or not path.is_file():
+            self.disk_cache.remove_prefix_except(prefix)
+            raise RuntimeError("downloaded file not found")
+        if path.stat().st_size > self.settings.max_filesize:
+            self.disk_cache.remove_prefix_except(prefix)
+            raise RuntimeError("downloaded file exceeds MAX_FILESIZE")
+        self.disk_cache.remove_prefix_except(prefix, keep=path)
+        self.disk_cache.maintain()
+        self.log.info("download complete media_key=%s bytes=%s", media_key, path.stat().st_size)
+        return path
 
-        if _was_group_welcomed(chat_id):
-            return
+    def _send_by_file_id(
+        self,
+        jobs: list[Job],
+        file_id: str,
+        metadata: MediaMetadata,
+        media_key: str,
+    ) -> list[Job]:
+        for index, job in enumerate(jobs):
+            try:
+                self._send_video(job, file_id, metadata, upload=False)
+                self._after_success(job)
+            except Exception as exc:
+                if self._is_invalid_file_id(exc):
+                    self.storage.remove_file_id(media_key)
+                    self.log.warning("invalid Telegram file_id media_key=%s", media_key)
+                    return jobs[index:]
+                self.log.exception("cached send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+        return []
 
-        html_text = _bot_admin_hint_html(chat_id) + _help_text_html(is_group=True)
+    def _send_from_file(
+        self,
+        jobs: list[Job],
+        path: Path,
+        metadata: MediaMetadata,
+        media_key: str,
+        url_keys: set[str],
+    ) -> str | None:
+        file_id: str | None = None
+        for job in jobs:
+            try:
+                if file_id:
+                    self._send_video(job, file_id, metadata, upload=False)
+                else:
+                    response = self._send_video(job, path, metadata, upload=True)
+                    video = getattr(response, "video", None)
+                    candidate = getattr(video, "file_id", None)
+                    if isinstance(candidate, str) and candidate:
+                        file_id = candidate
+                        if self.settings.media_cache_enabled:
+                            self.storage.put_file_id(
+                                media_key,
+                                file_id,
+                                self.settings.file_id_cache_max_items,
+                                source_name=metadata.source_name,
+                                url_keys=url_keys,
+                            )
+                self._after_success(job)
+            except Exception:
+                self.log.exception("video send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+        return file_id
 
-        if _try_send_message_html(chat_id, html_text, message_thread_id=message_thread_id):
-            _mark_group_welcomed(chat_id)
-
-    except Exception:
-        pass
-
-
-# =========================
-# Private: /start, /help, any text (one-time welcome per user)
-# =========================
-
-@bot.message_handler(commands=["start", "help"])
-def handle_start_help(message):
-    try:
-        chat_type = getattr(message.chat, "type", "")
-        chat_id = int(getattr(message.chat, "id", 0) or 0)
-        message_thread_id = getattr(message, "message_thread_id", None)
-
-        if chat_type == "private":
-            user_id = int(getattr(message.from_user, "id", 0) or 0)
-
-            if (message.text or "").strip().lower().startswith("/help"):
-                _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
-                _mark_private_welcomed(user_id)
-                return
-
-            if not _was_private_welcomed(user_id):
-                _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
-                _mark_private_welcomed(user_id)
-            else:
-                _safe_send_message(chat_id, "Инструкция уже отправлялась. Нажмите /help чтобы показать её снова.",
-                                   message_thread_id=message_thread_id)
-            return
-
-        if chat_type in ("group", "supergroup"):
-            _safe_send_message_html(chat_id, _help_text_html(is_group=True), message_thread_id=message_thread_id)
-            return
-    except Exception:
-        pass
-
-
-@bot.message_handler(func=lambda m: getattr(m.chat, "type", "") == "private", content_types=["text"])
-def handle_private_any_text(message):
-    try:
-        chat_id = int(message.chat.id)
-        user_id = int(getattr(message.from_user, "id", 0) or 0)
-        message_thread_id = getattr(message, "message_thread_id", None)
-
-        if not _was_private_welcomed(user_id):
-            _safe_send_message_html(chat_id, _help_text_html(is_group=False), message_thread_id=message_thread_id)
-            _mark_private_welcomed(user_id)
-            return
-
-        _safe_send_message(chat_id, "Нажмите /help чтобы увидеть инструкцию.", message_thread_id=message_thread_id)
-    except Exception:
-        pass
-
-
-# =========================
-# Main handler
-# =========================
-
-@bot.message_handler(func=lambda m: True, content_types=["text", "photo", "video", "document", "audio", "voice"])
-def handle_group_messages(message):
-    try:
-        if message.chat.type not in ("group", "supergroup"):
-            return
-
-        if getattr(message.from_user, "is_bot", False):
-            return
-
-        text = message.text if message.text else (message.caption if message.caption else "")
-        if not isinstance(text, str) or not text.strip():
-            return
-
-        if text.strip().startswith("/"):
-            return
-
-        chat_id = int(message.chat.id)
-        user_id = int(message.from_user.id)
-        message_thread_id = getattr(message, "message_thread_id", None)
-        bot_mentioned = _contains_bot_mention(text)
-
-        sender_username = getattr(message.from_user, "username", None)
-        if bot_mentioned and _contains_sender_self_mention_or_me(text, sender_username):
-            new_opt_out = _toggle_opt_out(chat_id, user_id)
-
-            if sender_username:
-                who = f"@{sender_username}"
-            else:
-                who = _format_sender_name(message)
-
-            if new_opt_out:
-                msg = (
-                    f"{who}, теперь для Вас авто-скачивание отключено.\n"
-                    f"Чтобы скачать видео, упоминайте бота и вставляйте ссылку: @"
-                    f"{BOT_USERNAME_LOWER} <ссылка>"
-                )
-            else:
-                msg = (
-                    f"{who}, теперь для Вас включена автоотправка видео без упоминания бота.\n"
-                    f"Можно просто отправлять ссылки."
-                )
-
-            _safe_send_message(chat_id, msg, message_thread_id=message_thread_id)
-            return
-
-        url = _extract_first_url(text)
-        if not url:
-            return
-
-        url_info = urlparse(url)
-        if not url_info.scheme or not url_info.netloc:
-            return
-
-        _log_request(message, url)
-
-        opted_out = _is_opted_out(chat_id, user_id)
-
-        if opted_out and not bot_mentioned:
-            return
-
-        notify_on_fail = bool(opted_out and bot_mentioned)
-
-        job = {
-            "chat_id": chat_id,
-            "message_thread_id": message_thread_id if isinstance(message_thread_id, int) else None,
-            "original_message_id": int(message.message_id),
-            "url": url,
-            "prefix": uuid.uuid4().hex[:18],
-            "source_name": _detect_source(url),
-            "sender_full_name": _format_sender_name(message),
-            "notify_on_fail": notify_on_fail,
-            "delete_original_on_success": True,
+    def _send_video(self, job: Job, video: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
+        language = self.storage.chat_language(job.chat_id)
+        caption = tr(
+            language,
+            "caption",
+            url=html.escape(job.url, quote=True),
+            source=html.escape(metadata.source_name, quote=False),
+            sender=html.escape(job.sender_name, quote=False),
+        )
+        kwargs: dict[str, Any] = {
+            "chat_id": job.chat_id,
+            "caption": caption,
+            "parse_mode": "HTML",
+            "supports_streaming": True,
+            "disable_notification": True,
         }
+        if job.message_thread_id is not None:
+            kwargs["message_thread_id"] = job.message_thread_id
+        if upload:
+            with self.upload_slots, Path(video).open("rb") as handle:
+                return self.bot.send_video(video=handle, **kwargs)
+        return self.bot.send_video(video=video, **kwargs)
 
+    def _after_success(self, job: Job) -> None:
+        if job.delete_original:
+            try:
+                self.bot.delete_message(job.chat_id, job.original_message_id)
+            except Exception:
+                self.log.exception("original delete failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+
+    @staticmethod
+    def _is_invalid_file_id(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "file_id" in text or "file identifier" in text or "file reference" in text
+
+    def _safe_message(self, chat_id: int, text: str, thread_id: int | None = None, *, html_mode: bool = False) -> bool:
         try:
-            jobs_q.put_nowait(job)
-        except queue.Full:
-            if notify_on_fail:
-                _safe_send_message(chat_id, "Не удалось скачать", message_thread_id=message_thread_id)
+            kwargs: dict[str, Any] = {
+                "disable_notification": True,
+                "disable_web_page_preview": True,
+            }
+            if html_mode:
+                kwargs["parse_mode"] = "HTML"
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            self.bot.send_message(chat_id, text, **kwargs)
+            return True
+        except Exception:
+            self.log.exception("message send failed chat_id=%s", chat_id)
+            return False
 
-    except Exception:
-        pass
+    def _operator_alert(self, text: str) -> None:
+        if self.settings.logs_chat_id is None:
+            return
+        try:
+            self.bot.send_message(
+                self.settings.logs_chat_id,
+                text,
+                disable_notification=True,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            self.log.exception("operator alert failed")
+
+    def _is_admin(self, chat_id: int, user_id: int) -> bool:
+        try:
+            member = self.bot.get_chat_member(chat_id, user_id)
+            return str(getattr(member, "status", "")).lower() in {"administrator", "creator"}
+        except Exception:
+            self.log.exception("admin check failed chat_id=%s user_id=%s", chat_id, user_id)
+            return False
+
+    def _admin_hint(self, chat_id: int, language: str) -> str:
+        try:
+            member = self.bot.get_chat_member(chat_id, self.bot_id)
+            if str(getattr(member, "status", "")).lower() in {"administrator", "creator"} and bool(
+                getattr(member, "can_delete_messages", True)
+            ):
+                return ""
+        except Exception:
+            self.log.exception("bot permission check failed chat_id=%s", chat_id)
+            return ""
+        return tr(language, "admin_hint")
+
+    def _help(self, chat_id: int, private: bool) -> str:
+        language = self.storage.chat_language(chat_id)
+        if private:
+            return tr(language, "private_help", repo_url=html.escape(REPO_URL, quote=True))
+        return tr(language, "group_help", bot_mention=html.escape(self.mention, quote=False))
+
+    def _set_commands(self) -> None:
+        try:
+            self.bot.set_my_commands(
+                [
+                    telebot.types.BotCommand("start", "Show instructions"),
+                    telebot.types.BotCommand("help", "Show instructions"),
+                    telebot.types.BotCommand("language", "Change language (admins)"),
+                    telebot.types.BotCommand("settings", "Show group settings"),
+                    telebot.types.BotCommand("delete_original", "Configure link deletion (admins)"),
+                ]
+            )
+        except Exception:
+            self.log.exception("cannot set Telegram commands")
+
+    def _register_handlers(self) -> None:
+        bot = self.bot
+
+        @bot.message_handler(content_types=["new_chat_members"])
+        def new_members(message: Any) -> None:
+            if getattr(message.chat, "type", "") not in {"group", "supergroup"}:
+                return
+            members = getattr(message, "new_chat_members", None) or []
+            if not any(int(getattr(member, "id", 0) or 0) == self.bot_id for member in members):
+                return
+            chat_id = int(message.chat.id)
+            if self.storage.was_welcomed("group", chat_id):
+                return
+            language = self.storage.chat_language(chat_id)
+            text = self._admin_hint(chat_id, language) + self._help(chat_id, private=False)
+            if self._safe_message(chat_id, text, getattr(message, "message_thread_id", None), html_mode=True):
+                self.storage.mark_welcomed("group", chat_id)
+
+        @bot.message_handler(commands=["start", "help"])
+        def start_help(message: Any) -> None:
+            chat_type = getattr(message.chat, "type", "")
+            chat_id = int(message.chat.id)
+            private = chat_type == "private"
+            if not private and chat_type not in {"group", "supergroup"}:
+                return
+            self._safe_message(
+                chat_id,
+                self._help(chat_id, private=private),
+                getattr(message, "message_thread_id", None),
+                html_mode=True,
+            )
+            if private:
+                self.storage.mark_welcomed("private", int(message.from_user.id))
+
+        @bot.message_handler(commands=["language"])
+        def language(message: Any) -> None:
+            chat_id = int(message.chat.id)
+            current = self.storage.chat_language(chat_id)
+            parts = (message.text or "").split()
+            if len(parts) == 1:
+                self._safe_message(chat_id, tr(current, "language_current", language=current))
+                return
+            requested = parts[1].lower()
+            if requested not in {"en", "ru"}:
+                self._safe_message(chat_id, tr(current, "language_invalid"))
+                return
+            if getattr(message.chat, "type", "") != "private" and not self._is_admin(
+                chat_id, int(message.from_user.id)
+            ):
+                self._safe_message(chat_id, tr(current, "language_admin_only"))
+                return
+            self.storage.set_chat_language(chat_id, requested)
+            self._safe_message(chat_id, tr(requested, "language_changed"))
+
+        @bot.message_handler(commands=["settings"])
+        def group_settings(message: Any) -> None:
+            chat_id = int(message.chat.id)
+            language_code = self.storage.chat_language(chat_id)
+            if getattr(message.chat, "type", "") not in {"group", "supergroup"}:
+                return
+            if not self._is_admin(chat_id, int(message.from_user.id)):
+                self._safe_message(chat_id, tr(language_code, "admin_only"))
+                return
+            enabled = self.storage.delete_original(chat_id)
+            state = tr(language_code, "state_on" if enabled else "state_off")
+            self._safe_message(
+                chat_id,
+                tr(
+                    language_code,
+                    "settings_summary",
+                    language=language_code,
+                    delete_original=state,
+                ),
+                getattr(message, "message_thread_id", None),
+                html_mode=True,
+            )
+
+        @bot.message_handler(commands=["delete_original"])
+        def delete_original(message: Any) -> None:
+            chat_id = int(message.chat.id)
+            language_code = self.storage.chat_language(chat_id)
+            if getattr(message.chat, "type", "") not in {"group", "supergroup"}:
+                return
+            if not self._is_admin(chat_id, int(message.from_user.id)):
+                self._safe_message(chat_id, tr(language_code, "admin_only"))
+                return
+            parts = (message.text or "").split()
+            if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+                self._safe_message(chat_id, tr(language_code, "delete_usage"))
+                return
+            enabled = parts[1].lower() == "on"
+            self.storage.set_delete_original(chat_id, enabled)
+            state = tr(language_code, "state_on" if enabled else "state_off")
+            self._safe_message(chat_id, tr(language_code, "delete_changed", state=state))
+
+        @bot.message_handler(func=lambda item: getattr(item.chat, "type", "") == "private", content_types=["text"])
+        def private_text(message: Any) -> None:
+            chat_id = int(message.chat.id)
+            user_id = int(message.from_user.id)
+            if not self.storage.was_welcomed("private", user_id):
+                if self._safe_message(chat_id, self._help(chat_id, private=True), html_mode=True):
+                    self.storage.mark_welcomed("private", user_id)
+                return
+            self._safe_message(chat_id, tr(self.storage.chat_language(chat_id), "private_hint"))
+
+        @bot.message_handler(
+            func=lambda _message: True,
+            content_types=["text", "photo", "video", "document", "audio", "voice"],
+        )
+        def group_message(message: Any) -> None:
+            self._handle_group_message(message)
+
+    def _handle_group_message(self, message: Any) -> None:
+        try:
+            if getattr(message.chat, "type", "") not in {"group", "supergroup"}:
+                return
+            if getattr(message.from_user, "is_bot", False):
+                return
+            text = message.text or message.caption or ""
+            if not text.strip() or text.lstrip().startswith("/"):
+                return
+            chat_id = int(message.chat.id)
+            user_id = int(message.from_user.id)
+            mentioned = bool(self.bot_username and re.search(rf"(^|\s)@{re.escape(self.bot_username)}\b", text.lower()))
+            username = getattr(message.from_user, "username", None)
+            if mentioned and self._self_mention(text, username):
+                opted_out = self.storage.toggle_opt_out(chat_id, user_id)
+                who = f"@{username}" if username else self._sender_name(message)
+                key = "opted_out" if opted_out else "opted_in"
+                self._safe_message(
+                    chat_id,
+                    tr(self.storage.chat_language(chat_id), key, who=who, bot_mention=self.mention),
+                    getattr(message, "message_thread_id", None),
+                )
+                return
+            url = extract_first_url(text)
+            if url is None:
+                return
+            if self.storage.is_opted_out(chat_id, user_id) and not mentioned:
+                return
+            validate_public_url(url)
+            job = Job(
+                job_id=uuid.uuid4().hex[:16],
+                chat_id=chat_id,
+                message_thread_id=(
+                    int(message.message_thread_id)
+                    if isinstance(getattr(message, "message_thread_id", None), int)
+                    else None
+                ),
+                original_message_id=int(message.message_id),
+                user_id=user_id,
+                url=url,
+                url_key=normalized_url_key(url),
+                sender_name=self._sender_name(message),
+                delete_original=self.storage.delete_original(chat_id),
+            )
+            flight = self.coordinator.submit(job)
+            if flight is None:
+                self.log.info("job joined URL flight job_id=%s url=%s", job.job_id, safe_url_for_log(url))
+                return
+            try:
+                self.queue.put_nowait(flight)
+                self.log.info("job queued job_id=%s chat_id=%s url=%s", job.job_id, chat_id, safe_url_for_log(url))
+            except queue.Full:
+                self.coordinator.abort(flight)
+                self.log.warning("queue full job_id=%s chat_id=%s", job.job_id, chat_id)
+                self._operator_alert("The download queue is full. Check bot.log.")
+        except UnsafeUrlError:
+            self.log.warning("unsafe URL rejected chat_id=%s", getattr(message.chat, "id", None), exc_info=True)
+        except Exception:
+            self.log.exception("group handler failed chat_id=%s", getattr(message.chat, "id", None))
+
+    @staticmethod
+    def _self_mention(text: str, username: str | None) -> bool:
+        lowered = text.lower()
+        if re.search(r"(^|\s)(me|я)(\s|$)", lowered):
+            return True
+        return bool(username and re.search(rf"(^|\s)@{re.escape(username.lower())}\b", lowered))
+
+    @staticmethod
+    def _sender_name(message: Any) -> str:
+        first = str(getattr(message.from_user, "first_name", "") or "").strip()
+        last = str(getattr(message.from_user, "last_name", "") or "").strip()
+        full = f"{first} {last}".strip()
+        username = getattr(message.from_user, "username", None)
+        return full or (f"@{username}" if username else str(message.from_user.id))
 
 
-bot.infinity_polling(timeout=30, long_polling_timeout=30)
+def main() -> None:
+    settings = load_settings()
+    configure_logging(settings.logs_dir, settings.log_level)
+    application = BotApplication(settings)
+
+    def shutdown(_signum: int, _frame: Any) -> None:
+        application.stop()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+    try:
+        application.start()
+    finally:
+        application.stop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,3 +1,2 @@
+pyTelegramBotAPI==4.36.0
 yt-dlp[default,curl-cffi]
-pyTelegramBotAPI
-requests-toolbelt>=1.0.0
