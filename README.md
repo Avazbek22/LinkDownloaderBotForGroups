@@ -19,7 +19,7 @@ The bot intentionally sends no “downloading” or failure messages for automat
 - Five-minute disk cache with automatic cleanup.
 - Atomic JSON storage with backups and migration from the legacy `prefs.json`.
 - Daily rotating logs retained for 60 days.
-- Reproducible Docker deployment and an optional nightly yt-dlp updater with rollback.
+- Reproducible Docker deployment with automatic application and yt-dlp updates, both with rollback.
 
 ## How it works
 
@@ -41,7 +41,27 @@ Create a bot with [@BotFather](https://t.me/BotFather), then:
 
 No other administrator rights are required.
 
-## Quick start with Docker
+## Installation
+
+On a clean Debian or Ubuntu VPS, clone the repository you want to follow and run its installer:
+
+```bash
+sudo git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git /opt/linkdownloaderbot
+sudo bash /opt/linkdownloaderbot/install.sh
+```
+
+The installer asks only for the Telegram bot token. It installs missing prerequisites, creates the local configuration, starts the bot, and enables safe automatic updates. Running it again updates the installation without replacing `.env`, `data/`, or `logs/`.
+
+To run your own fork, use its clone URL instead:
+
+```bash
+sudo git clone https://github.com/YOUR_NAME/LinkDownloaderBotForGroups.git /opt/linkdownloaderbot
+sudo bash /opt/linkdownloaderbot/install.sh
+```
+
+The installer detects the repository's `origin`, so a fork follows its own `main` branch and never the original owner's repository. The bot token remains only in `/opt/linkdownloaderbot/.env`; it is not sent to GitHub. The installer refuses automatic updates when tracked server files contain local changes.
+
+For a manual Docker setup without the installer:
 
 ```bash
 git clone https://github.com/Avazbek22/LinkDownloaderBotForGroups.git
@@ -51,16 +71,6 @@ nano .env
 docker compose up -d --build
 docker compose logs -f --tail=200
 ```
-
-Or inspect and run the installer on Debian/Ubuntu:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Avazbek22/LinkDownloaderBotForGroups/main/install.sh -o install.sh
-less install.sh
-bash install.sh
-```
-
-The installer preserves an existing `.env` and refuses to update a repository with tracked local modifications.
 
 ## Configuration
 
@@ -93,7 +103,6 @@ See [.env-example](.env-example) for yt-dlp site-specific options.
 
 - `/start` and `/help` — show instructions.
 - `/en` or `/ru` — change the language; group administrators only.
-- `/language` and `/language en|ru` — compatible long form.
 - `/settings` — show the current group settings; group administrators only.
 - `/delete_original on` or `/delete_original off` — configure successful-link deletion; group administrators only.
 - `@BotName me` or `@BotName я` — toggle automatic downloads for yourself.
@@ -144,39 +153,22 @@ sudo systemctl start linkdownloaderbotforgroups-yt-dlp-update.service
 
 Other dependencies are deliberately updated through reviewed pull requests instead of unattended nightly upgrades.
 
-## Automatic application deployments
+## Automatic application updates
 
-Production auto-deployment is optional and disabled by default. It uses two branches so a failing push cannot reach the VPS:
+On a systemd VPS, the installer enables a timer that checks the installation's own `origin/main` every two minutes. This works identically for the original repository and forks—there are no deployment branches, GitHub secrets, webhooks, or inbound SSH access to configure.
 
-1. changes are merged or pushed to `production`;
-2. GitHub Actions runs the Python and Docker checks;
-3. only after every check succeeds, CI promotes the commit to `production-ready`;
-4. the VPS checks `production-ready` every two minutes and deploys it.
+When a new commit appears, the deployer:
 
-The server stores `BOT_TOKEN` only in its local `.env`; GitHub never receives it. Before replacing the running container, the deployer builds the new image and calls Telegram `getMe`. It retains the previous image, restores it on failure, and does not retry the same failed commit indefinitely. Application and deploy logs remain on the server.
+1. accepts only a fast-forward update and refuses tracked local modifications;
+2. preserves the current image for rollback;
+3. builds the new image before replacing the running bot;
+4. verifies the application and Telegram token with `getMe`;
+5. starts the new container and checks that it remains stable;
+6. restores the previous commit and image if any step fails.
 
-Repository setup:
+The failed commit is not retried until a newer commit appears. Runtime configuration and persistent data remain on the VPS. For safer maintenance, protect `main` and require the included CI checks before merging pull requests.
 
-1. Create `production` from `main`.
-2. Under **Settings → Actions → General → Workflow permissions**, allow GitHub Actions to write repository contents so CI can update `production-ready`.
-3. Protect `production`: require pull requests and the CI checks before merging.
-4. Merge `main` into `production` once to create the first tested `production-ready` ref.
-
-Enable the pull-based deployer on a systemd VPS after the updated `main` has been installed:
-
-```bash
-cd /opt/linkdownloaderbot
-git fetch origin main
-git checkout main
-git pull --ff-only origin main
-INSTALL_DIR=/opt/linkdownloaderbot \
-  BRANCH=main \
-  INSTALL_APP_UPDATER=1 \
-  DEPLOY_BRANCH=production-ready \
-  bash install.sh
-```
-
-No inbound SSH access from GitHub is required. Useful commands:
+Useful commands:
 
 ```bash
 systemctl status linkdownloaderbotforgroups-deploy.timer
@@ -184,7 +176,7 @@ systemctl start linkdownloaderbotforgroups-deploy.service
 tail -f /opt/linkdownloaderbot/logs/deploy-$(date -u +%Y-%m-%d).log
 ```
 
-To disable application deployments without stopping the bot:
+To stop automatic application updates without stopping the bot:
 
 ```bash
 systemctl disable --now linkdownloaderbotforgroups-deploy.timer

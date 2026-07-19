@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, production]
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -41,16 +41,3 @@ jobs:
           context: .
           push: false
           tags: linkdownloaderbotforgroups:test
-
-  promote-production:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/production'
-    needs: [test, docker]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Promote the tested commit
-        run: git push --force origin "$GITHUB_SHA:refs/heads/production-ready"

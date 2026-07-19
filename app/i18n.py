@@ -33,10 +33,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "Mention {bot_mention} together with a link to download it."
         ),
         "opted_in": "{who}, automatic downloads are enabled again. You can simply post links.",
-        "language_current": "Current language: {language}. Available: en, ru.",
         "language_changed": "Language changed to English.",
         "language_admin_only": "Only group administrators can change the language.",
-        "language_invalid": "Supported languages: en, ru.",
         "admin_only": "Only group administrators can change this setting.",
         "settings_summary": "<b>Group settings</b>\nLanguage: {language}\nDelete original link: {delete_original}",
         "delete_usage": "Use /delete_original on or /delete_original off.",
@@ -75,10 +73,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "Для загрузки упомяните {bot_mention} вместе со ссылкой."
         ),
         "opted_in": "{who}, автоматическое скачивание снова включено. Можно просто отправлять ссылки.",
-        "language_current": "Текущий язык: {language}. Доступны: en, ru.",
         "language_changed": "Язык изменён на русский.",
         "language_admin_only": "Изменять язык могут только администраторы группы.",
-        "language_invalid": "Поддерживаемые языки: en, ru.",
         "admin_only": "Изменять эту настройку могут только администраторы группы.",
         "settings_summary": "<b>Настройки группы</b>\nЯзык: {language}\nУдаление исходной ссылки: {delete_original}",
         "delete_usage": "Используйте /delete_original on или /delete_original off.",

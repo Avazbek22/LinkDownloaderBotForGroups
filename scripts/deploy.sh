@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-production-ready}"
+DEPLOY_BRANCH="main"
 SERVICE_KEY="${SERVICE_KEY:-linkdownloaderbot}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
 IMAGE_NAME="${IMAGE_NAME:-linkdownloaderbotforgroups:local}"

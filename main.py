@@ -461,7 +461,6 @@ class BotApplication:
                     telebot.types.BotCommand("help", "Show instructions"),
                     telebot.types.BotCommand("en", "Switch to English (admins)"),
                     telebot.types.BotCommand("ru", "Переключить на русский (админы)"),
-                    telebot.types.BotCommand("language", "Change language (admins)"),
                     telebot.types.BotCommand("settings", "Show group settings"),
                     telebot.types.BotCommand("delete_original", "Configure link deletion (admins)"),
                 ]
@@ -469,15 +468,9 @@ class BotApplication:
         except Exception:
             self.log.exception("cannot set Telegram commands")
 
-    def _handle_language_command(self, message: Any, requested: str | None) -> None:
+    def _handle_language_command(self, message: Any, requested: str) -> None:
         chat_id = int(message.chat.id)
         current = self.storage.chat_language(chat_id)
-        if requested is None:
-            self._safe_message(chat_id, tr(current, "language_current", language=current))
-            return
-        if requested not in {"en", "ru"}:
-            self._safe_message(chat_id, tr(current, "language_invalid"))
-            return
         if getattr(message.chat, "type", "") != "private" and not self._is_admin(chat_id, int(message.from_user.id)):
             self._safe_message(chat_id, tr(current, "language_admin_only"))
             return
@@ -518,11 +511,10 @@ class BotApplication:
             if private:
                 self.storage.mark_welcomed("private", int(message.from_user.id))
 
-        @bot.message_handler(commands=["language", "en", "ru"])
+        @bot.message_handler(commands=["en", "ru"])
         def language(message: Any) -> None:
-            parts = (message.text or "").split()
-            command = parts[0].split("@", 1)[0].lstrip("/").lower() if parts else "language"
-            requested = command if command in {"en", "ru"} else (parts[1].lower() if len(parts) > 1 else None)
+            command = (message.text or "").split(maxsplit=1)[0]
+            requested = command.split("@", 1)[0].lstrip("/").lower()
             self._handle_language_command(message, requested)
 
         @bot.message_handler(commands=["settings"])

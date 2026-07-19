@@ -1,5 +1,5 @@
 [Unit]
-Description=Check for tested LinkDownloaderBotForGroups production commits
+Description=Check origin/main for LinkDownloaderBotForGroups updates
 
 [Timer]
 OnBootSec=2m

@@ -309,3 +309,20 @@ def test_short_language_command_changes_group_language(tmp_path, monkeypatch) ->
 
     assert app.storage.chat_language(-100) == "ru"
     assert "русский" in fake.messages[-1][1]
+
+
+def test_telegram_commands_offer_only_short_language_switches(tmp_path) -> None:
+    class CommandBot:
+        def set_my_commands(self, commands) -> None:
+            self.commands = commands
+
+    app = main.BotApplication(_settings(tmp_path))
+    fake = CommandBot()
+    app.bot = fake
+
+    app._set_commands()
+
+    names = [command.command for command in fake.commands]
+    assert "en" in names
+    assert "ru" in names
+    assert "language" not in names

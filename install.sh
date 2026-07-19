@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPOSITORY="${REPOSITORY:-https://github.com/Avazbek22/LinkDownloaderBotForGroups}"
-BRANCH="${BRANCH:-main}"
-INSTALL_DIR="${INSTALL_DIR:-$PWD/LinkDownloaderBotForGroups}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPOSITORY="https://github.com/Avazbek22/LinkDownloaderBotForGroups"
+BRANCH="main"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-linkdownloaderbotforgroups}"
 SERVICE_KEY="linkdownloaderbot"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-production-ready}"
+
+if [[ -d "$SCRIPT_DIR/.git" ]]; then
+  INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
+  REPOSITORY="${REPOSITORY:-$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)}"
+else
+  INSTALL_DIR="${INSTALL_DIR:-$PWD/LinkDownloaderBotForGroups}"
+  REPOSITORY="${REPOSITORY:-$DEFAULT_REPOSITORY}"
+fi
+
+[[ -n "$REPOSITORY" ]] || REPOSITORY="$DEFAULT_REPOSITORY"
 
 info() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 ok() { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -103,21 +112,19 @@ install_updater() {
 }
 
 install_app_updater() {
-  [[ "${INSTALL_APP_UPDATER:-0}" == "1" ]] || return 0
   need systemctl || return 0
   [[ -d /run/systemd/system ]] || return 0
-  info "Installing production auto-deployer"
+  info "Installing automatic application updates"
   local service="/etc/systemd/system/linkdownloaderbotforgroups-deploy.service"
   local timer="/etc/systemd/system/linkdownloaderbotforgroups-deploy.timer"
   sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
-      -e "s|__DEPLOY_BRANCH__|$DEPLOY_BRANCH|g" \
       -e "s|__COMPOSE_PROJECT__|$COMPOSE_PROJECT|g" \
       -e "s|__SERVICE_KEY__|$SERVICE_KEY|g" \
       "$INSTALL_DIR/scripts/systemd/linkdownloaderbotforgroups-deploy.service" | as_root tee "$service" >/dev/null
   as_root cp "$INSTALL_DIR/scripts/systemd/linkdownloaderbotforgroups-deploy.timer" "$timer"
   as_root systemctl daemon-reload
   as_root systemctl enable --now linkdownloaderbotforgroups-deploy.timer
-  ok "Production auto-deployer installed for $DEPLOY_BRANCH"
+  ok "Automatic updates installed for origin/main"
 }
 
 main() {

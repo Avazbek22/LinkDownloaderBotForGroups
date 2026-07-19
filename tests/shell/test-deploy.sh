@@ -16,7 +16,7 @@ printf 'git %s\n' "$*" >>"$FAKE_COMMAND_LOG"
 case "$*" in
   *"status --porcelain"*) exit 0 ;;
   *"rev-parse HEAD"*) cat "$FAKE_STATE_DIR/head" ;;
-  *"rev-parse refs/remotes/origin/production-ready"*) cat "$FAKE_STATE_DIR/target" ;;
+  *"rev-parse refs/remotes/origin/main"*) cat "$FAKE_STATE_DIR/target" ;;
   *"branch --show-current"*) echo main ;;
   *"merge-base --is-ancestor"*) exit 0 ;;
   *"checkout -q -B"*) printf '%s\n' "${!#}" >"$FAKE_STATE_DIR/head" ;;
@@ -72,7 +72,7 @@ run_deployer() {
     FAKE_STATE_DIR="$case_root" \
     FAKE_COMMAND_LOG="$case_root/commands.log" \
     "$@" \
-    bash "$REPOSITORY_ROOT/scripts/deploy-production.sh"
+    bash "$REPOSITORY_ROOT/scripts/deploy.sh"
 }
 
 success_root="$TEST_ROOT/success"

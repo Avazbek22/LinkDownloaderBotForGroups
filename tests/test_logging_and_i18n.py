@@ -20,4 +20,4 @@ def test_log_redacts_url_queries(tmp_path) -> None:
 
 
 def test_translation_falls_back_to_english() -> None:
-    assert "Current language" in tr("unknown", "language_current", language="en")
+    assert "Only group administrators" in tr("unknown", "language_admin_only")

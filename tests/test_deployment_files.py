@@ -3,22 +3,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_production_is_promoted_only_after_ci_jobs() -> None:
+def test_ci_checks_main_without_promoting_special_branches() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
-    assert "branches: [main, production]" in workflow
-    assert "needs: [test, docker]" in workflow
-    assert "github.ref == 'refs/heads/production'" in workflow
-    assert "refs/heads/production-ready" in workflow
-    assert "contents: write" in workflow
+    assert "branches: [main]" in workflow
+    assert "production" not in workflow
+    assert "contents: write" not in workflow
 
 
-def test_application_updater_is_opt_in() -> None:
+def test_installer_enables_main_updater_and_detects_a_fork() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
 
-    assert "INSTALL_APP_UPDATER:-0" in installer
+    assert "remote get-url origin" in installer
+    assert 'BRANCH="main"' in installer
     assert "linkdownloaderbotforgroups-deploy.timer" in installer
-    assert 'DEPLOY_BRANCH="${DEPLOY_BRANCH:-production-ready}"' in installer
+    assert "INSTALL_APP_UPDATER" not in installer
+
+    deployer = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    assert 'DEPLOY_BRANCH="main"' in deployer
+    assert "production-ready" not in deployer
 
 
 def test_systemd_invokes_scripts_through_bash() -> None:
@@ -27,6 +30,7 @@ def test_systemd_invokes_scripts_through_bash() -> None:
     ytdlp_service = (systemd_dir / "linkdownloaderbotforgroups-yt-dlp-update.service").read_text(encoding="utf-8")
 
     assert "ExecStart=/usr/bin/env bash" in deploy_service
+    assert "scripts/deploy.sh" in deploy_service
     assert "ExecStart=/usr/bin/env bash" in ytdlp_service
 
 
