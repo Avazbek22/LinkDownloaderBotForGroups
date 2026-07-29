@@ -8,7 +8,7 @@ import pytest
 from app import download_backend
 from app.download_backend import (
     FormatPlan,
-    InstagramAudienceRestrictedError,
+    InstagramContentRestrictedError,
     MediaMetadata,
     display_source_name,
     download_metadata,
@@ -18,16 +18,21 @@ from app.download_backend import (
 )
 
 
-def test_instagram_audience_restriction_detection_is_specific() -> None:
-    restricted = RuntimeError(
+def test_instagram_content_restriction_detection_is_specific() -> None:
+    audience_restricted = RuntimeError(
         "ERROR: [Instagram] post: This content isn't available to everyone: It can't be seen by certain audiences."
     )
+    empty_response = RuntimeError(
+        "ERROR: [Instagram] post: Instagram sent an empty media response. "
+        "Check if this post is accessible in your browser without being logged-in."
+    )
 
-    assert download_backend._is_instagram_audience_restriction(restricted)
-    assert not download_backend._is_instagram_audience_restriction(
+    assert download_backend._is_instagram_content_restriction(audience_restricted)
+    assert download_backend._is_instagram_content_restriction(empty_response)
+    assert not download_backend._is_instagram_content_restriction(
         RuntimeError("ERROR: [Instagram] post: Requested content is not available, login required")
     )
-    assert not download_backend._is_instagram_audience_restriction(
+    assert not download_backend._is_instagram_content_restriction(
         RuntimeError("ERROR: [Example] content is not available to everyone")
     )
 
@@ -36,8 +41,8 @@ def test_instagram_probe_preserves_restriction_across_fallback(monkeypatch) -> N
     errors = iter(
         [
             RuntimeError(
-                "ERROR: [Instagram] post: This content isn't available to everyone: "
-                "It can't be seen by certain audiences."
+                "ERROR: [Instagram] post: Instagram sent an empty media response. "
+                "Check if this post is accessible in your browser without being logged-in."
             ),
             RuntimeError("generic fallback error"),
         ]
@@ -58,7 +63,7 @@ def test_instagram_probe_preserves_restriction_across_fallback(monkeypatch) -> N
 
     monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
 
-    with pytest.raises(InstagramAudienceRestrictedError):
+    with pytest.raises(InstagramContentRestrictedError):
         download_backend.extract_metadata("https://www.instagram.com/reel/restricted/")
 
 

@@ -64,7 +64,7 @@ Instead, it uses reactions:
 | Reaction | Meaning |
 |---|---|
 | 👀 | The link is being processed |
-| 🙈 | Instagram restricted the content to certain audiences |
+| 🙈 | Instagram hid or restricted the content from the bot |
 | 👎 | The download failed |
 | 👍 | The video was posted, but the original link was kept |
 

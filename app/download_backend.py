@@ -37,8 +37,8 @@ class FormatPlan:
     merge_output_format: str | None = None
 
 
-class InstagramAudienceRestrictedError(RuntimeError):
-    """Instagram explicitly limited the content to a subset of its audience."""
+class InstagramContentRestrictedError(RuntimeError):
+    """Instagram did not expose the requested content to this client."""
 
 
 _SOURCE_NAMES = {
@@ -245,14 +245,18 @@ def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, 
     return options
 
 
-def _is_instagram_audience_restriction(error: BaseException) -> bool:
-    """Recognize the stable parts of Instagram's audience-restriction response."""
+def _is_instagram_content_restriction(error: BaseException) -> bool:
+    """Recognize Instagram responses that explicitly hide requested content."""
     current: BaseException | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         message = str(current).casefold().replace("\N{RIGHT SINGLE QUOTATION MARK}", "'")
-        if "[instagram]" in message and ("available to everyone" in message or "seen by certain audiences" in message):
+        if "[instagram]" in message and (
+            "available to everyone" in message
+            or "seen by certain audiences" in message
+            or "instagram sent an empty media response" in message
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -369,15 +373,15 @@ def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata
             with yt_dlp.YoutubeDL(fallback) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as fallback_error:
-            # Preserve an explicit audience restriction even if Instagram gives
+            # Preserve an explicit content restriction even if Instagram gives
             # the fallback request a less useful generic error.
             restricted_error = next(
-                (error for error in (primary_error, fallback_error) if _is_instagram_audience_restriction(error)),
+                (error for error in (primary_error, fallback_error) if _is_instagram_content_restriction(error)),
                 None,
             )
             if restricted_error is not None:
-                raise InstagramAudienceRestrictedError(
-                    "Instagram restricted this content to certain audiences"
+                raise InstagramContentRestrictedError(
+                    "Instagram did not expose this content to the bot"
                 ) from restricted_error
             raise
     if not isinstance(info, dict):

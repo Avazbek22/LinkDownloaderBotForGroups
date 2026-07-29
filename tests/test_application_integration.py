@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
-from app.download_backend import InstagramAudienceRestrictedError, MediaMetadata
+from app.download_backend import InstagramContentRestrictedError, MediaMetadata
 from app.jobs import Job
 from app.settings import Settings
 
@@ -299,7 +299,7 @@ def test_metadata_failure_clears_eyes_for_every_joined_job(tmp_path, monkeypatch
     assert by_message == {10: ["👀", None], 11: ["👀", None]}
 
 
-def test_instagram_audience_restriction_replaces_eyes_with_monkey(tmp_path, monkeypatch) -> None:
+def test_instagram_content_restriction_replaces_eyes_with_monkey(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()
     app.bot = fake
@@ -321,7 +321,7 @@ def test_instagram_audience_restriction_replaces_eyes_with_monkey(tmp_path, monk
     monkeypatch.setattr(
         main,
         "extract_metadata",
-        lambda *_args: (_ for _ in ()).throw(InstagramAudienceRestrictedError("restricted")),
+        lambda *_args: (_ for _ in ()).throw(InstagramContentRestrictedError("restricted")),
     )
 
     app._process_flight(flight)
