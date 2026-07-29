@@ -64,6 +64,7 @@ Instead, it uses reactions:
 | Reaction | Meaning |
 |---|---|
 | 👀 | The link is being processed |
+| 🙈 | Instagram restricted the content to certain audiences |
 | 👎 | The download failed |
 | 👍 | The video was posted, but the original link was kept |
 
@@ -286,7 +287,7 @@ The most useful options are:
 | `MAX_QUEUE` | `200` | Number of waiting requests |
 | `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
 | `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
-| `STATUS_REACTIONS` | `true` | Show 👀, 👎, and 👍 reactions |
+| `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 👎, and 👍 reactions |
 | `COOKIES_FILE` | empty | Optional cookies file for restricted websites |
 | `LOG_LEVEL` | `INFO` | Logging detail level |
 

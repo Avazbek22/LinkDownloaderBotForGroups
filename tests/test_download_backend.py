@@ -8,6 +8,7 @@ import pytest
 from app import download_backend
 from app.download_backend import (
     FormatPlan,
+    InstagramAudienceRestrictedError,
     MediaMetadata,
     display_source_name,
     download_metadata,
@@ -15,6 +16,51 @@ from app.download_backend import (
     select_format,
     select_format_candidates,
 )
+
+
+def test_instagram_audience_restriction_detection_is_specific() -> None:
+    restricted = RuntimeError(
+        "ERROR: [Instagram] post: This content isn't available to everyone: "
+        "It can't be seen by certain audiences."
+    )
+
+    assert download_backend._is_instagram_audience_restriction(restricted)
+    assert not download_backend._is_instagram_audience_restriction(
+        RuntimeError("ERROR: [Instagram] post: Requested content is not available, login required")
+    )
+    assert not download_backend._is_instagram_audience_restriction(
+        RuntimeError("ERROR: [Example] content is not available to everyone")
+    )
+
+
+def test_instagram_probe_preserves_restriction_across_fallback(monkeypatch) -> None:
+    errors = iter(
+        [
+            RuntimeError(
+                "ERROR: [Instagram] post: This content isn't available to everyone: "
+                "It can't be seen by certain audiences."
+            ),
+            RuntimeError("generic fallback error"),
+        ]
+    )
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            raise next(errors)
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(InstagramAudienceRestrictedError):
+        download_backend.extract_metadata("https://www.instagram.com/reel/restricted/")
 
 
 def test_source_names_use_brand_spelling() -> None:

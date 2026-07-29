@@ -37,6 +37,10 @@ class FormatPlan:
     merge_output_format: str | None = None
 
 
+class InstagramAudienceRestrictedError(RuntimeError):
+    """Instagram explicitly limited the content to a subset of its audience."""
+
+
 _SOURCE_NAMES = {
     "youtube": "YouTube",
     "instagram": "Instagram",
@@ -241,6 +245,21 @@ def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, 
     return options
 
 
+def _is_instagram_audience_restriction(error: BaseException) -> bool:
+    """Recognize the stable parts of Instagram's audience-restriction response."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).casefold().replace("\N{RIGHT SINGLE QUOTATION MARK}", "'")
+        if "[instagram]" in message and (
+            "available to everyone" in message or "seen by certain audiences" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _base_options(cookie_file: Path | None) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
@@ -344,12 +363,29 @@ def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as primary_error:
         if not is_instagram_url(url):
             raise
         fallback = _base_options(cookie_file)
-        with yt_dlp.YoutubeDL(fallback) as ydl:
-            info = ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(fallback) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as fallback_error:
+            # Preserve an explicit audience restriction even if Instagram gives
+            # the fallback request a less useful generic error.
+            restricted_error = next(
+                (
+                    error
+                    for error in (primary_error, fallback_error)
+                    if _is_instagram_audience_restriction(error)
+                ),
+                None,
+            )
+            if restricted_error is not None:
+                raise InstagramAudienceRestrictedError(
+                    "Instagram restricted this content to certain audiences"
+                ) from restricted_error
+            raise
     if not isinstance(info, dict):
         raise RuntimeError("extractor returned no metadata")
     extractor = str(info.get("extractor_key") or info.get("extractor") or "generic").lower()

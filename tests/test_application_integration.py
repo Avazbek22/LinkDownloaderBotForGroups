@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
-from app.download_backend import MediaMetadata
+from app.download_backend import InstagramAudienceRestrictedError, MediaMetadata
 from app.jobs import Job
 from app.settings import Settings
 
@@ -297,6 +297,38 @@ def test_metadata_failure_clears_eyes_for_every_joined_job(tmp_path, monkeypatch
     for _, message_id, emoji, _ in fake.reactions:
         by_message.setdefault(message_id, []).append(emoji)
     assert by_message == {10: ["👀", None], 11: ["👀", None]}
+
+
+def test_instagram_audience_restriction_replaces_eyes_with_monkey(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "restricted",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.instagram.com/reel/restricted/",
+        "https://www.instagram.com/reel/restricted",
+        "User",
+        True,
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(
+        main,
+        "extract_metadata",
+        lambda *_args: (_ for _ in ()).throw(InstagramAudienceRestrictedError("restricted")),
+    )
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "🙈"]
+    assert fake.sends == []
+    assert fake.deletes == []
 
 
 def test_non_video_metadata_clears_eyes_without_downvote(tmp_path, monkeypatch) -> None:

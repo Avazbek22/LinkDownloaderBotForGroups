@@ -15,6 +15,7 @@ from typing import Any
 import telebot
 
 from app.download_backend import (
+    InstagramAudienceRestrictedError,
     MediaMetadata,
     display_source_name,
     download_metadata,
@@ -192,6 +193,14 @@ class BotApplication:
             final_url = metadata.info.get("webpage_url")
             if isinstance(final_url, str):
                 validate_public_url(final_url)
+        except InstagramAudienceRestrictedError:
+            self.log.info(
+                "link restricted by Instagram audience controls job_id=%s url=%s",
+                first.job_id,
+                safe_url_for_log(first.url),
+            )
+            self._after_audience_restriction_many(self.coordinator.abort(flight))
+            return
         except Exception as exc:
             self.log.info(
                 "link ignored after media probe job_id=%s url=%s error=%s",
@@ -379,6 +388,14 @@ class BotApplication:
     def _after_failure_many(self, jobs: list[Job]) -> None:
         for job in jobs:
             self._after_failure(job)
+
+    def _after_audience_restriction(self, job: Job) -> None:
+        if not self._set_status_reaction(job, "🙈"):
+            self._clear_status_reaction(job)
+
+    def _after_audience_restriction_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            self._after_audience_restriction(job)
 
     def _clear_status_many(self, jobs: list[Job]) -> None:
         for job in jobs:
