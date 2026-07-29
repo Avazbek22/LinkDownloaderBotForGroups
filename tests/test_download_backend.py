@@ -20,8 +20,7 @@ from app.download_backend import (
 
 def test_instagram_audience_restriction_detection_is_specific() -> None:
     restricted = RuntimeError(
-        "ERROR: [Instagram] post: This content isn't available to everyone: "
-        "It can't be seen by certain audiences."
+        "ERROR: [Instagram] post: This content isn't available to everyone: It can't be seen by certain audiences."
     )
 
     assert download_backend._is_instagram_audience_restriction(restricted)

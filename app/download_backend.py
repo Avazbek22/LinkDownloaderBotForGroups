@@ -252,9 +252,7 @@ def _is_instagram_audience_restriction(error: BaseException) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         message = str(current).casefold().replace("\N{RIGHT SINGLE QUOTATION MARK}", "'")
-        if "[instagram]" in message and (
-            "available to everyone" in message or "seen by certain audiences" in message
-        ):
+        if "[instagram]" in message and ("available to everyone" in message or "seen by certain audiences" in message):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -374,11 +372,7 @@ def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata
             # Preserve an explicit audience restriction even if Instagram gives
             # the fallback request a less useful generic error.
             restricted_error = next(
-                (
-                    error
-                    for error in (primary_error, fallback_error)
-                    if _is_instagram_audience_restriction(error)
-                ),
+                (error for error in (primary_error, fallback_error) if _is_instagram_audience_restriction(error)),
                 None,
             )
             if restricted_error is not None:
