@@ -34,7 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test deployment rollback
-        run: bash tests/shell/test-deploy.sh
+        run: |
+          for script in install.sh scripts/*.sh tests/shell/*.sh; do
+            bash -n "$script"
+          done
+          bash tests/shell/test-deploy.sh
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:

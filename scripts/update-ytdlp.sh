@@ -27,11 +27,25 @@ update_venv() {
   [[ -x "$python" && -x "$pip" ]] || return 1
   local before after
   before="$($python -m yt_dlp --version 2>/dev/null || true)"
-  "$pip" install --upgrade 'yt-dlp[default,curl-cffi]'
-  after="$($python -m yt_dlp --version)"
+  if ! "$pip" install --upgrade 'yt-dlp[default,curl-cffi]'; then
+    log "venv yt-dlp installation failed"
+    return 1
+  fi
+  if ! after="$($python -m yt_dlp --version)"; then
+    log "updated venv failed its version check; restoring ${before:-unknown}"
+    [[ -n "$before" ]] && "$pip" install --upgrade "yt-dlp[default,curl-cffi]==$before" || true
+    return 1
+  fi
   log "venv yt-dlp: ${before:-unknown} -> $after"
   if [[ "$before" != "$after" ]] && systemctl list-unit-files 2>/dev/null | grep -q '^linkdownloaderbotforgroups.service'; then
-    systemctl restart linkdownloaderbotforgroups.service
+    if ! systemctl restart linkdownloaderbotforgroups.service; then
+      log "bot restart failed; restoring venv yt-dlp ${before:-unknown}"
+      if [[ -n "$before" ]]; then
+        "$pip" install --upgrade "yt-dlp[default,curl-cffi]==$before" || true
+        systemctl restart linkdownloaderbotforgroups.service || true
+      fi
+      return 1
+    fi
   fi
 }
 
@@ -40,19 +54,35 @@ update_docker() {
   compose="$(detect_compose)"
   cd "$ROOT_DIR"
   before_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  if [[ -z "$before_id" ]]; then
+    log "current Docker image is unavailable: $IMAGE_NAME"
+    return 1
+  fi
   before_version="$($compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version 2>/dev/null || true)"
-  if [[ -n "$before_id" ]]; then
-    docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"
+  if ! docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"; then
+    log "cannot preserve the current Docker image"
+    return 1
   fi
 
-  $compose -p "$COMPOSE_PROJECT" build --pull \
-    --build-arg "YTDLP_CACHEBUST=$(date -u '+%Y%m%dT%H%M%SZ')" "$SERVICE_KEY"
-  $compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" \
-    python -c 'import main, telebot, yt_dlp; from app.settings import load_settings; s=load_settings(); telebot.TeleBot(s.token).get_me(); print(yt_dlp.version.__version__)' >/dev/null
-  after_version="$($compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version)"
+  if ! $compose -p "$COMPOSE_PROJECT" build --pull \
+      --build-arg "YTDLP_CACHEBUST=$(date -u '+%Y%m%dT%H%M%SZ')" "$SERVICE_KEY"; then
+    log "Docker yt-dlp image build failed"
+    return 1
+  fi
+  if ! $compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" \
+      python -c 'import main, telebot, yt_dlp; from app.settings import load_settings; s=load_settings(); telebot.TeleBot(s.token).get_me(); print(yt_dlp.version.__version__)' >/dev/null; then
+    log "updated Docker image failed its smoke check; restoring the previous image"
+    rollback_docker "$compose" 0 || true
+    return 1
+  fi
+  if ! after_version="$($compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version)"; then
+    log "cannot read yt-dlp version from the updated Docker image"
+    rollback_docker "$compose" 0 || true
+    return 1
+  fi
 
   if ! $compose -p "$COMPOSE_PROJECT" up -d --no-deps "$SERVICE_KEY"; then
-    rollback_docker "$compose"
+    rollback_docker "$compose" 1 || true
     return 1
   fi
   sleep 10
@@ -61,7 +91,7 @@ update_docker() {
   running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)"
   if [[ -z "$container_id" || "$running" != "true" ]]; then
     log "new container failed; rolling back"
-    rollback_docker "$compose"
+    rollback_docker "$compose" 1 || true
     return 1
   fi
   log "docker yt-dlp: ${before_version:-unknown} -> $after_version"
@@ -69,8 +99,16 @@ update_docker() {
 
 rollback_docker() {
   local compose="$1"
-  if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
-    docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME"
+  local recreate="${2:-1}"
+  if ! docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+    log "rollback image is unavailable"
+    return 1
+  fi
+  if ! docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME"; then
+    log "cannot restore the rollback image"
+    return 1
+  fi
+  if [[ "$recreate" == "1" ]]; then
     $compose -p "$COMPOSE_PROJECT" up -d --no-deps --force-recreate "$SERVICE_KEY"
   fi
 }
@@ -93,8 +131,12 @@ main() {
     exit 0
   fi
   cd "$ROOT_DIR"
-  if docker_runtime_exists && update_docker; then
-    exit 0
+  if docker_runtime_exists; then
+    if update_docker; then
+      exit 0
+    fi
+    log "Docker yt-dlp update failed"
+    exit 1
   fi
   if update_venv; then
     exit 0

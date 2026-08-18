@@ -60,7 +60,7 @@ class DiskMediaCache:
 
     def _remove_stale_intermediates(self, now: float) -> None:
         for path in self.directory.iterdir():
-            if not path.is_file() or self._usable(path):
+            if not path.is_file() or not self._owned(path) or self._usable(path):
                 continue
             try:
                 if now - path.stat().st_mtime > self.ttl_seconds:
@@ -68,10 +68,18 @@ class DiskMediaCache:
             except OSError:
                 LOG.exception("cannot inspect temporary file path=%s", path)
 
-    @staticmethod
-    def _usable(path: Path) -> bool:
+    def _usable(self, path: Path) -> bool:
         lower = path.name.lower()
-        return path.is_file() and not lower.endswith((".part", ".ytdl", ".tmp", ".temp", ".meta")) and ".f" not in lower
+        return (
+            path.is_file()
+            and self._owned(path)
+            and not lower.endswith((".part", ".ytdl", ".tmp", ".temp", ".meta"))
+            and ".f" not in lower
+        )
+
+    @staticmethod
+    def _owned(path: Path) -> bool:
+        return path.name.lower().startswith("media-")
 
     @staticmethod
     def _unlink(path: Path) -> None:

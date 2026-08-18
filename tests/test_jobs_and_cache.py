@@ -51,3 +51,17 @@ def test_disk_cache_ttl_and_lru(tmp_path) -> None:
     os.utime(old, (time.time() - 60, time.time() - 60))
     assert cache.get("b") is None
     assert not old.exists()
+
+
+def test_disk_cache_never_removes_unowned_files(tmp_path) -> None:
+    cache = DiskMediaCache(tmp_path, max_files=1, ttl_seconds=30)
+    unrelated = tmp_path / "cookies.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+    os.utime(unrelated, (time.time() - 300, time.time() - 300))
+    owned = tmp_path / f"{cache.prefix('video')}.mp4"
+    owned.write_bytes(b"video")
+
+    cache.maintain()
+
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert owned.exists()

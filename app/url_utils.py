@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 
 def _host(url: str) -> str:
     try:
-        host = (urlparse(url).netloc or "").lower()
-        return host.replace("www.", "").strip()
+        host = (urlparse(url).hostname or "").rstrip(".").lower()
+        return host.removeprefix("www.")
     except (TypeError, ValueError):
         return ""
 

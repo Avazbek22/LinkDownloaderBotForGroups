@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from typing import Any
 import yt_dlp
 
 from app import env_config
+from app.url_security import safe_error_for_log
 from app.url_utils import is_instagram_url, is_youtube_url
 
 LOG = logging.getLogger(__name__)
@@ -39,6 +41,10 @@ class FormatPlan:
 
 class InstagramContentRestrictedError(RuntimeError):
     """Instagram did not expose the requested content to this client."""
+
+
+class DownloadDeadlineExceeded(RuntimeError):
+    """The configured end-to-end download deadline has elapsed."""
 
 
 _SOURCE_NAMES = {
@@ -76,6 +82,20 @@ def _size(fmt: dict[str, Any], duration: int | None) -> int | None:
     return None
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
 def _video_compatibility(fmt: dict[str, Any]) -> int:
     codec = str(fmt.get("vcodec") or "").lower()
     if codec.startswith(("avc1", "avc3", "h264")):
@@ -89,20 +109,21 @@ def _video_compatibility(fmt: dict[str, Any]) -> int:
 
 def _video_score(fmt: dict[str, Any]) -> tuple[int, int, int, float]:
     compatible = _video_compatibility(fmt)
-    height = min(int(fmt.get("height") or 0), 2160)
-    fps = min(int(fmt.get("fps") or 0), 120)
-    bitrate = float(fmt.get("tbr") or 0)
+    height = min(_safe_int(fmt.get("height")), 2160)
+    fps = min(_safe_int(fmt.get("fps")), 120)
+    bitrate = _safe_float(fmt.get("tbr"))
     return compatible, height, fps, bitrate
 
 
 def _audio_score(fmt: dict[str, Any]) -> tuple[int, float]:
     compatible = int(str(fmt.get("acodec") or "").startswith("mp4a"))
-    return compatible, float(fmt.get("abr") or fmt.get("tbr") or 0)
+    return compatible, _safe_float(fmt.get("abr") or fmt.get("tbr"))
 
 
 def select_format_candidates(info: dict[str, Any], max_bytes: int) -> list[FormatPlan]:
     """Return best-first MP4 plans that may fit and remain Telegram-compatible."""
-    formats = [item for item in info.get("formats", []) if isinstance(item, dict)]
+    raw_formats = info.get("formats")
+    formats = [item for item in raw_formats if isinstance(item, dict)] if isinstance(raw_formats, list) else []
     duration = _duration(info)
     budget = int(max_bytes * 0.96)
 
@@ -129,8 +150,12 @@ def select_format_candidates(info: dict[str, Any], max_bytes: int) -> list[Forma
     pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for video in video_only:
         video_size = _size(video, duration)
+        if video_size is not None and video_size > budget:
+            continue
         for audio in audio_only:
             audio_size = _size(audio, duration)
+            if audio_size is not None and audio_size > budget:
+                continue
             if video_size is not None and audio_size is not None and video_size + audio_size > budget:
                 continue
             pairs.append((video, audio))
@@ -181,13 +206,18 @@ def select_format_candidates(info: dict[str, Any], max_bytes: int) -> list[Forma
 
 def select_format(info: dict[str, Any], max_bytes: int) -> tuple[str, str | None]:
     """Return the preferred plan while preserving the original public API."""
-    plan = select_format_candidates(info, max_bytes)[0]
+    plans = select_format_candidates(info, max_bytes)
+    if not plans:
+        raise RuntimeError("no compatible video format fits the configured size limit")
+    plan = plans[0]
     return plan.format_spec, plan.merge_output_format
 
 
 def has_downloadable_video(info: dict[str, Any]) -> bool:
     """Return whether extractor metadata positively identifies a video stream."""
-    candidates = [info, *(item for item in info.get("formats", []) if isinstance(item, dict))]
+    raw_formats = info.get("formats")
+    formats = [item for item in raw_formats if isinstance(item, dict)] if isinstance(raw_formats, list) else []
+    candidates = [info, *formats]
     for candidate in candidates:
         video_codec = candidate.get("vcodec")
         if video_codec not in {None, "none"}:
@@ -201,7 +231,9 @@ def has_downloadable_video(info: dict[str, Any]) -> bool:
             # Some direct progressive MP4 entries (notably Instagram) omit
             # codec metadata. The final ffprobe validation remains authoritative.
             return True
-    return any(has_downloadable_video(entry) for entry in info.get("entries", []) if isinstance(entry, dict))
+    raw_entries = info.get("entries")
+    entries = [entry for entry in raw_entries if isinstance(entry, dict)] if isinstance(raw_entries, list) else []
+    return any(has_downloadable_video(entry) for entry in entries)
 
 
 def _csv(raw: str) -> list[str]:
@@ -261,19 +293,26 @@ def _youtube_player_clients() -> list[str | None]:
 
     clients = _csv(clients_raw)
     if not clients:
-        clients = ["web", "android", "ios"]
+        clients = ["default", "android", "ios"]
 
     ordered: list[str | None] = []
     for client in clients:
         normalized = client.strip().lower()
         if not normalized:
             continue
-        value = None if normalized in {"web", "default"} else normalized
+        # "web" was historically treated as yt-dlp's own default selection.
+        # Keep that alias so existing .env files do not silently change behavior.
+        value = None if normalized in {"default", "web"} else normalized
         if value in ordered:
             continue
         ordered.append(value)
 
     return ordered or [None, "android", "ios"]
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise DownloadDeadlineExceeded("download deadline exceeded")
 
 
 def _is_instagram_content_restriction(error: BaseException) -> bool:
@@ -390,31 +429,66 @@ def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
         raise RuntimeError(f"downloaded video container is not MP4-compatible: {format_name or 'unknown'}")
 
 
-def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata:
-    options = _base_options(cookie_file)
-    options.update(_site_options(url))
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as primary_error:
-        if not is_instagram_url(url):
-            raise
-        fallback = _base_options(cookie_file)
+def extract_metadata(
+    url: str,
+    cookie_file: Path | None = None,
+    deadline: float | None = None,
+) -> MediaMetadata:
+    _check_deadline(deadline)
+    info: Any
+    if is_youtube_url(url):
+        last_error: Exception | None = None
+        info = None
+        for player_client in _youtube_player_clients():
+            _check_deadline(deadline)
+            options = _base_options(cookie_file)
+            options.update(_site_options(url, youtube_player_client=player_client))
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    candidate = ydl.extract_info(url, download=False)
+                if not isinstance(candidate, dict):
+                    raise RuntimeError("extractor returned no metadata")
+                info = candidate
+                break
+            except Exception as error:
+                last_error = error
+                LOG.info(
+                    "YouTube metadata client failed client=%s error=%s detail=%s",
+                    player_client or "default",
+                    type(error).__name__,
+                    safe_error_for_log(error),
+                )
+                _check_deadline(deadline)
+        if info is None:
+            raise RuntimeError("all YouTube metadata clients failed") from last_error
+    else:
+        options = _base_options(cookie_file)
+        options.update(_site_options(url))
         try:
-            with yt_dlp.YoutubeDL(fallback) as ydl:
+            with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except Exception as fallback_error:
-            # Preserve an explicit content restriction even if Instagram gives
-            # the fallback request a less useful generic error.
-            restricted_error = next(
-                (error for error in (primary_error, fallback_error) if _is_instagram_content_restriction(error)),
-                None,
-            )
-            if restricted_error is not None:
-                raise InstagramContentRestrictedError(
-                    "Instagram did not expose this content to the bot"
-                ) from restricted_error
-            raise
+        except Exception as primary_error:
+            _check_deadline(deadline)
+            if not is_instagram_url(url):
+                raise
+            fallback = _base_options(cookie_file)
+            try:
+                with yt_dlp.YoutubeDL(fallback) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as fallback_error:
+                _check_deadline(deadline)
+                # Preserve an explicit content restriction even if Instagram gives
+                # the fallback request a less useful generic error.
+                restricted_error = next(
+                    (error for error in (primary_error, fallback_error) if _is_instagram_content_restriction(error)),
+                    None,
+                )
+                if restricted_error is not None:
+                    raise InstagramContentRestrictedError(
+                        "Instagram did not expose this content to the bot"
+                    ) from restricted_error
+                raise
+    _check_deadline(deadline)
     if not isinstance(info, dict):
         raise RuntimeError("extractor returned no metadata")
     extractor = str(info.get("extractor_key") or info.get("extractor") or "generic").lower()
@@ -422,7 +496,12 @@ def extract_metadata(url: str, cookie_file: Path | None = None) -> MediaMetadata
     if not media_id:
         raise RuntimeError("extractor returned no media id")
     source = display_source_name(str(info.get("extractor_key") or info.get("extractor") or "Video"))
-    return MediaMetadata(url=url, info=info, media_key=f"{extractor}:{media_id}", source_name=source)
+    media_key = f"{extractor}:{media_id}"
+    if extractor == "generic":
+        identity_url = str(info.get("webpage_url") or url)
+        identity_hash = hashlib.sha256(identity_url.encode("utf-8")).hexdigest()[:24]
+        media_key = f"generic:{media_id}:{identity_hash}"
+    return MediaMetadata(url=url, info=info, media_key=media_key, source_name=source)
 
 
 def download_metadata(
@@ -437,11 +516,29 @@ def download_metadata(
 ) -> dict[str, Any]:
     output_folder.mkdir(parents=True, exist_ok=True)
     outtmpl = os.fspath(output_folder / f"{out_prefix}.%(ext)s")
-    plans = select_format_candidates(metadata.info, max_send_bytes)
+    is_youtube = is_youtube_url(metadata.url)
+    is_instagram = is_instagram_url(metadata.url)
 
     def progress_hook(_status: dict[str, Any]) -> None:
-        if deadline is not None and time.monotonic() > deadline:
-            raise yt_dlp.utils.DownloadError("download deadline exceeded")
+        try:
+            _check_deadline(deadline)
+        except DownloadDeadlineExceeded:
+            raise yt_dlp.utils.DownloadError("download deadline exceeded") from None
+
+    def extraction_options(
+        *,
+        instagram_impersonate: bool = True,
+        youtube_player_client: str | None = None,
+    ) -> dict[str, Any]:
+        options = _base_options(cookie_file)
+        options.update(
+            _site_options(
+                metadata.url,
+                instagram_impersonate=instagram_impersonate,
+                youtube_player_client=youtube_player_client,
+            )
+        )
+        return options
 
     def options_for(
         plan: FormatPlan,
@@ -471,61 +568,122 @@ def download_metadata(
         return options
 
     last_error: Exception | None = None
-    for index, plan in enumerate(plans, start=1):
-        _remove_attempt_files(output_folder, out_prefix)
-        LOG.info("trying media format candidate=%s total=%s", index, len(plans))
-        is_youtube = is_youtube_url(metadata.url)
-        is_instagram = is_instagram_url(metadata.url)
-        for player_client in _youtube_player_clients() if is_youtube else [None]:
-            result: dict[str, Any] | None = None
+
+    def try_info(
+        info: dict[str, Any],
+        *,
+        phase: str,
+        fragments: int,
+        instagram_impersonate: bool = True,
+        youtube_player_client: str | None = None,
+    ) -> dict[str, Any] | None:
+        nonlocal last_error
+        plans = select_format_candidates(info, max_send_bytes)
+        for index, plan in enumerate(plans, start=1):
+            _check_deadline(deadline)
+            _remove_attempt_files(output_folder, out_prefix)
+            LOG.info(
+                "trying media format phase=%s client=%s candidate=%s total=%s",
+                phase,
+                youtube_player_client or "default",
+                index,
+                len(plans),
+            )
             try:
                 with yt_dlp.YoutubeDL(
-                    options_for(plan, concurrent_fragments, youtube_player_client=player_client)
+                    options_for(
+                        plan,
+                        fragments,
+                        youtube_player_client=youtube_player_client,
+                        instagram_impersonate=instagram_impersonate,
+                    )
                 ) as ydl:
-                    result = ydl.process_ie_result(_unselect_info(metadata.info), download=True)
-                    break
-            except Exception as primary_error:
-                last_error = primary_error
-                if not (is_youtube or is_instagram):
-                    result = None
-                    break
+                    result = ydl.process_ie_result(_unselect_info(info), download=True)
+                if not isinstance(result, dict):
+                    raise RuntimeError("extractor returned no download result")
+                path = find_downloaded_file(result, out_prefix, output_folder)
+                if path is None:
+                    raise RuntimeError("downloaded file not found")
+                _validate_downloaded_video(path, max_send_bytes)
+                _check_deadline(deadline)
+                return result
+            except Exception as error:
+                last_error = error
                 _remove_attempt_files(output_folder, out_prefix)
-                try:
-                    # A fresh extraction recovers expired CDN URLs without making
-                    # it the normal path for Instagram, which is sensitive to extra requests.
-                    with yt_dlp.YoutubeDL(
-                        options_for(
-                            plan,
-                            1,
-                            youtube_player_client=player_client,
-                            instagram_impersonate=False,
-                        )
-                    ) as ydl:
-                        result = ydl.extract_info(metadata.url, download=True)
-                        break
-                except Exception as fallback_error:
-                    last_error = fallback_error
-                    continue
+                LOG.info(
+                    "media format failed phase=%s client=%s candidate=%s error=%s detail=%s",
+                    phase,
+                    youtube_player_client or "default",
+                    index,
+                    type(error).__name__,
+                    safe_error_for_log(error),
+                )
+                _check_deadline(deadline)
+        return None
 
-            if result is not None:
-                break
-
-        if result is None:
-            continue
-
-        path = find_downloaded_file(result if isinstance(result, dict) else {}, out_prefix, output_folder)
-        try:
-            if path is None:
-                raise RuntimeError("downloaded file not found")
-            _validate_downloaded_video(path, max_send_bytes)
-        except Exception as validation_error:
-            last_error = validation_error
-            LOG.warning("media format candidate rejected candidate=%s reason=%s", index, validation_error)
-            _remove_attempt_files(output_folder, out_prefix)
-            continue
+    _check_deadline(deadline)
+    result = try_info(
+        metadata.info,
+        phase="initial",
+        fragments=concurrent_fragments,
+    )
+    if result is not None:
         return result
 
+    if is_youtube:
+        # The player client only affects extraction. Reusing metadata URLs with
+        # different extractor_args merely retries the same CDN URLs, so each
+        # fallback client gets one fresh extraction and its own format plans.
+        for player_client in _youtube_player_clients():
+            _check_deadline(deadline)
+            _remove_attempt_files(output_folder, out_prefix)
+            try:
+                with yt_dlp.YoutubeDL(extraction_options(youtube_player_client=player_client)) as ydl:
+                    fresh_info = ydl.extract_info(metadata.url, download=False)
+                if not isinstance(fresh_info, dict):
+                    raise RuntimeError("extractor returned no metadata")
+            except Exception as error:
+                last_error = error
+                LOG.info(
+                    "YouTube fallback extraction failed client=%s error=%s detail=%s",
+                    player_client or "default",
+                    type(error).__name__,
+                    safe_error_for_log(error),
+                )
+                _check_deadline(deadline)
+                continue
+            result = try_info(
+                fresh_info,
+                phase="fresh",
+                fragments=1,
+                youtube_player_client=player_client,
+            )
+            if result is not None:
+                return result
+    elif is_instagram:
+        # Instagram is sensitive to duplicate requests, so retain only one
+        # fallback extraction without browser impersonation.
+        _check_deadline(deadline)
+        _remove_attempt_files(output_folder, out_prefix)
+        try:
+            with yt_dlp.YoutubeDL(extraction_options(instagram_impersonate=False)) as ydl:
+                fresh_info = ydl.extract_info(metadata.url, download=False)
+            if not isinstance(fresh_info, dict):
+                raise RuntimeError("extractor returned no metadata")
+            result = try_info(
+                fresh_info,
+                phase="fresh",
+                fragments=1,
+                instagram_impersonate=False,
+            )
+            if result is not None:
+                return result
+        except Exception as error:
+            last_error = error
+            _check_deadline(deadline)
+
     _remove_attempt_files(output_folder, out_prefix)
+    _check_deadline(deadline)
     raise RuntimeError("no compatible video format fits the configured size limit") from last_error
 
 

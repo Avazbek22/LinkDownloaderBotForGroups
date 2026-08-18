@@ -29,7 +29,13 @@ from app.logging_setup import configure_logging
 from app.media_cache import DiskMediaCache
 from app.settings import Settings, load_settings
 from app.storage import Storage
-from app.url_security import UnsafeUrlError, normalized_url_key, safe_url_for_log, validate_public_url
+from app.url_security import (
+    UnsafeUrlError,
+    normalized_url_key,
+    safe_error_for_log,
+    safe_url_for_log,
+    validate_public_url,
+)
 
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -117,8 +123,10 @@ class BotApplication:
                 self.queue.put_nowait(None)
             except queue.Full:
                 break
+        shutdown_deadline = time.monotonic() + 25
         for thread in self.workers:
-            thread.join(timeout=10)
+            remaining = max(0.0, shutdown_deadline - time.monotonic())
+            thread.join(timeout=min(10.0, remaining))
         if self.maintenance_thread is not None:
             self.maintenance_thread.join(timeout=2)
         self.disk_cache.maintain()
@@ -162,6 +170,7 @@ class BotApplication:
     def _process_flight(self, flight: Flight) -> None:
         first = flight.jobs[0]
         started = time.monotonic()
+        deadline = started + self.settings.job_timeout
         self.log.info("job metadata job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
         # Bump the profile whenever delivery compatibility changes so an old,
         # already-uploaded Telegram file_id cannot bypass the new validation.
@@ -189,7 +198,7 @@ class BotApplication:
 
         try:
             validate_public_url(first.url)
-            metadata = extract_metadata(first.url, self.settings.cookies_file)
+            metadata = extract_metadata(first.url, self.settings.cookies_file, deadline)
             final_url = metadata.info.get("webpage_url")
             if isinstance(final_url, str):
                 validate_public_url(final_url)
@@ -203,10 +212,11 @@ class BotApplication:
             return
         except Exception as exc:
             self.log.info(
-                "link ignored after media probe job_id=%s url=%s error=%s",
+                "link ignored after media probe job_id=%s url=%s error=%s detail=%s",
                 first.job_id,
                 safe_url_for_log(first.url),
                 type(exc).__name__,
+                safe_error_for_log(exc),
             )
             self._clear_status_many(self.coordinator.abort(flight))
             return
@@ -239,7 +249,7 @@ class BotApplication:
                     if retry:
                         file_id = None
                         if file_path is None:
-                            file_path = self._obtain_file(metadata, media_key)
+                            file_path = self._obtain_file(metadata, media_key, deadline)
                         file_id = self._send_from_file(
                             retry,
                             file_path,
@@ -249,7 +259,7 @@ class BotApplication:
                         )
                 else:
                     if file_path is None:
-                        file_path = self._obtain_file(metadata, media_key)
+                        file_path = self._obtain_file(metadata, media_key, deadline)
                     file_id = self._send_from_file(
                         batch,
                         file_path,
@@ -268,7 +278,7 @@ class BotApplication:
             time.monotonic() - started,
         )
 
-    def _obtain_file(self, metadata: MediaMetadata, media_key: str) -> Path:
+    def _obtain_file(self, metadata: MediaMetadata, media_key: str, deadline: float) -> Path:
         cached = self.disk_cache.get(media_key)
         if cached is not None:
             self.log.info("disk cache hit media_key=%s", media_key)
@@ -281,7 +291,7 @@ class BotApplication:
             max_send_bytes=self.settings.max_filesize,
             concurrent_fragments=self.settings.concurrent_fragments,
             cookie_file=self.settings.cookies_file,
-            deadline=time.monotonic() + self.settings.job_timeout,
+            deadline=deadline,
         )
         path = find_downloaded_file(info, prefix, self.settings.output_dir)
         if path is None or not path.is_file():
@@ -671,8 +681,7 @@ class BotApplication:
                 self.queue.put_nowait(flight)
                 self.log.info("job queued job_id=%s chat_id=%s url=%s", job.job_id, chat_id, safe_url_for_log(url))
             except queue.Full:
-                self.coordinator.abort(flight)
-                self._clear_status_reaction(job)
+                self._clear_status_many(self.coordinator.abort(flight))
                 self.log.warning("queue full job_id=%s chat_id=%s", job.job_id, chat_id)
                 self._operator_alert("The download queue is full. Check bot.log.")
         except UnsafeUrlError:

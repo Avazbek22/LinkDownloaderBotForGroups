@@ -21,12 +21,29 @@ def _env_str(name: str, default: str) -> str:
     return raw or default
 
 
-YTDLP_JS_RUNTIMES = _env_str("YTDLP_JS_RUNTIMES", "node")
-YTDLP_REMOTE_COMPONENTS = _env_str("YTDLP_REMOTE_COMPONENTS", "ejs:github")
+def reload_from_environment() -> None:
+    """Refresh yt-dlp settings after the local .env file has been loaded."""
+    global YTDLP_JS_RUNTIMES
+    global YTDLP_REMOTE_COMPONENTS
+    global YTDLP_INSTAGRAM_IMPERSONATE
+    global YTDLP_INSTAGRAM_RETRIES
+    global YTDLP_INSTAGRAM_FRAGMENT_RETRIES
+    global YTDLP_INSTAGRAM_SOCKET_TIMEOUT
+    global YTDLP_YOUTUBE_PLAYER_CLIENT
+    global YTDLP_YOUTUBE_PLAYER_CLIENTS
 
-YTDLP_INSTAGRAM_IMPERSONATE = _env_str("YTDLP_INSTAGRAM_IMPERSONATE", "chrome")
-YTDLP_INSTAGRAM_RETRIES = _env_int("YTDLP_INSTAGRAM_RETRIES", 8)
-YTDLP_INSTAGRAM_FRAGMENT_RETRIES = _env_int("YTDLP_INSTAGRAM_FRAGMENT_RETRIES", 8)
-YTDLP_INSTAGRAM_SOCKET_TIMEOUT = _env_int("YTDLP_INSTAGRAM_SOCKET_TIMEOUT", 30)
-YTDLP_YOUTUBE_PLAYER_CLIENT = _env_str("YTDLP_YOUTUBE_PLAYER_CLIENT", "")
-YTDLP_YOUTUBE_PLAYER_CLIENTS = _env_str("YTDLP_YOUTUBE_PLAYER_CLIENTS", "web,android,ios")
+    YTDLP_JS_RUNTIMES = _env_str("YTDLP_JS_RUNTIMES", "node")
+    YTDLP_REMOTE_COMPONENTS = _env_str("YTDLP_REMOTE_COMPONENTS", "ejs:github")
+
+    YTDLP_INSTAGRAM_IMPERSONATE = _env_str("YTDLP_INSTAGRAM_IMPERSONATE", "chrome")
+    YTDLP_INSTAGRAM_RETRIES = _env_int("YTDLP_INSTAGRAM_RETRIES", 8)
+    YTDLP_INSTAGRAM_FRAGMENT_RETRIES = _env_int("YTDLP_INSTAGRAM_FRAGMENT_RETRIES", 8)
+    YTDLP_INSTAGRAM_SOCKET_TIMEOUT = _env_int("YTDLP_INSTAGRAM_SOCKET_TIMEOUT", 30)
+    YTDLP_YOUTUBE_PLAYER_CLIENT = _env_str("YTDLP_YOUTUBE_PLAYER_CLIENT", "")
+    # Keep this empty when it is not configured so the legacy single-client
+    # setting can still take effect. The default chain is selected by the
+    # downloader, where "default" has an explicit meaning.
+    YTDLP_YOUTUBE_PLAYER_CLIENTS = _env_str("YTDLP_YOUTUBE_PLAYER_CLIENTS", "")
+
+
+reload_from_environment()

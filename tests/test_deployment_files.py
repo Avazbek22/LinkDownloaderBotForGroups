@@ -38,3 +38,12 @@ def test_compose_has_a_stable_default_project_name() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert compose.startswith("name: ${COMPOSE_PROJECT_NAME:-linkdownloaderbotforgroups}\n")
+
+
+def test_ytdlp_updater_restores_failed_candidate_without_falling_back_to_another_runtime() -> None:
+    updater = (ROOT / "scripts/update-ytdlp.sh").read_text(encoding="utf-8")
+
+    assert 'rollback_docker "$compose" 0' in updater
+    assert 'rollback_docker "$compose" 1' in updater
+    assert "if docker_runtime_exists; then" in updater
+    assert 'log "Docker yt-dlp update failed"' in updater

@@ -318,8 +318,8 @@ DISK_CACHE_MAX_FILES=3
 | `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallel download fragments |
 | `YTDLP_JS_RUNTIMES` | `node` | JavaScript runtime for yt-dlp |
 | `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Optional yt-dlp components |
-| `YTDLP_YOUTUBE_PLAYER_CLIENTS` | `web,android,ios` | YouTube player client fallback chain |
-| `YTDLP_YOUTUBE_PLAYER_CLIENT` | (legacy) | Optional single YouTube client override (`web`/`android`/`ios`) |
+| `YTDLP_YOUTUBE_PLAYER_CLIENTS` | `default,android,ios` | YouTube player client fallback chain |
+| `YTDLP_YOUTUBE_PLAYER_CLIENT` | (legacy) | Optional single YouTube client override (`default`/`android`/`ios`; `web` remains a default alias) |
 | `YTDLP_INSTAGRAM_IMPERSONATE` | `chrome` | Browser impersonation for Instagram |
 | `YTDLP_INSTAGRAM_RETRIES` | `8` | Instagram request retries |
 | `YTDLP_INSTAGRAM_FRAGMENT_RETRIES` | `8` | Instagram fragment retries |

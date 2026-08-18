@@ -11,6 +11,7 @@ class UnsafeUrlError(ValueError):
 
 
 _TRACKING_KEYS = {"fbclid", "gclid", "igshid", "si"}
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 
 def _is_public_ip(value: str) -> bool:
@@ -84,3 +85,17 @@ def safe_url_for_log(url: str) -> str:
         return urlunsplit((parts.scheme, host, parts.path, "", ""))[:512]
     except Exception:
         return "<invalid-url>"
+
+
+def safe_error_for_log(error: BaseException) -> str:
+    """Return a single-line error summary without URL queries or fragments."""
+
+    def replace_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trimmed = raw.rstrip(").,;:!?]}>\"'")
+        trailing = raw[len(trimmed) :]
+        clean = raw[: len(raw) - len(trailing)] if trailing else raw
+        return safe_url_for_log(clean) + trailing
+
+    summary = " ".join(str(error).split())
+    return _URL_IN_TEXT.sub(replace_url, summary)[:512]

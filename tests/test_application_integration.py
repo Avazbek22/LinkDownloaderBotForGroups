@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -266,6 +267,46 @@ def test_full_queue_clears_unconfirmed_eyes(tmp_path, monkeypatch) -> None:
     app._handle_group_message(message)
 
     assert [item[2] for item in fake.reactions] == ["👀", None]
+
+
+def test_full_queue_clears_eyes_for_jobs_that_joined_before_abort(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), max_queue=1))
+    fake = FakeBot()
+    app.bot = fake
+    joined = Job(
+        "joined",
+        -100,
+        None,
+        43,
+        8,
+        "https://example.com/video",
+        "https://example.com/video",
+        "Second User",
+        True,
+    )
+
+    class FullAfterJoin:
+        def put_nowait(self, _flight) -> None:
+            app._set_status_reaction(joined, "👀")
+            assert app.coordinator.submit(joined) is None
+            raise queue.Full
+
+    app.queue = FullAfterJoin()
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    app._handle_group_message(message)
+
+    by_message: dict[int, list[str | None]] = {}
+    for _, message_id, emoji, _ in fake.reactions:
+        by_message.setdefault(message_id, []).append(emoji)
+    assert by_message == {42: ["👀", None], 43: ["👀", None]}
 
 
 def test_metadata_failure_clears_eyes_for_every_joined_job(tmp_path, monkeypatch) -> None:

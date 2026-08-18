@@ -4,6 +4,7 @@ import logging
 
 from app.i18n import tr
 from app.logging_setup import configure_logging
+from app.url_security import safe_error_for_log
 
 
 def test_log_redacts_url_queries(tmp_path) -> None:
@@ -21,3 +22,10 @@ def test_log_redacts_url_queries(tmp_path) -> None:
 
 def test_translation_falls_back_to_english() -> None:
     assert "Only group administrators" in tr("unknown", "language_admin_only")
+
+
+def test_error_summary_redacts_url_query_and_newlines() -> None:
+    summary = safe_error_for_log(RuntimeError("failed\nhttps://example.com/video?token=secret"))
+
+    assert summary == "failed https://example.com/video"
+    assert "secret" not in summary

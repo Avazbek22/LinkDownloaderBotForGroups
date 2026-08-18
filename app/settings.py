@@ -74,6 +74,11 @@ class Settings:
 def load_settings(base_dir: Path | None = None) -> Settings:
     base = (base_dir or Path(__file__).resolve().parents[1]).resolve()
     _load_dotenv(base / ".env")
+    # app.download_backend is imported before main() loads a local .env file.
+    # Refresh its small compatibility configuration after dotenv is available.
+    from app import env_config
+
+    env_config.reload_from_environment()
 
     token = (os.getenv("BOT_TOKEN") or "").strip()
     if not token:
