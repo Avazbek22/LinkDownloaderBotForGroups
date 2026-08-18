@@ -314,6 +314,76 @@ def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, 
     assert options_seen[1]["js_runtimes"] == {"node": {}}
 
 
+def test_youtube_player_client_is_passed_to_extractor_args(monkeypatch) -> None:
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "android")
+
+    options = download_backend._site_options("https://www.youtube.com/watch?v=video", youtube_player_client="android")
+
+    assert options["extractor_args"] == {"youtube": {"player_client": ["android"]}}
+    assert options["js_runtimes"] == {"node": {}}
+
+
+def test_youtube_client_fallback_chain_and_order(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "web,android,ios")
+    clients_seen: list[str] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.client = (
+                options["extractor_args"]["youtube"]["player_client"][0]
+                if "extractor_args" in options and "youtube" in options["extractor_args"]
+                else "web"
+            )
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            clients_seen.append(f"proc:{self.client}")
+            if self.client == "ios":
+                (tmp_path / "fallback.mp4").write_bytes(b"video")
+                return {"id": "video"}
+            raise RuntimeError("expired media URL")
+
+        def extract_info(self, *_args, **_kwargs):
+            clients_seen.append(f"extract:{self.client}")
+            raise RuntimeError(f"{self.client} blocked")
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(download_backend, "_validate_downloaded_video", lambda *_args, **_kwargs: None)
+
+    metadata = MediaMetadata(
+        url="https://www.youtube.com/watch?v=video",
+        info={
+            "formats": [
+                {
+                    "format_id": "video",
+                    "ext": "mp4",
+                    "vcodec": "avc1",
+                    "acodec": "none",
+                    "filesize": 4_000_000,
+                },
+            ]
+        },
+        media_key="youtube:video",
+        source_name="YouTube",
+    )
+
+    download_backend.download_metadata(
+        metadata,
+        "fallback",
+        tmp_path,
+        max_send_bytes=10_000_000,
+        concurrent_fragments=2,
+    )
+
+    assert clients_seen == ["proc:web", "extract:web", "proc:android", "extract:android", "proc:ios"]
+
+
 def test_rejects_audio_only_attempt_and_uses_next_candidate(monkeypatch, tmp_path: Path) -> None:
     formats_seen: list[str] = []
 

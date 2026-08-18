@@ -224,7 +224,12 @@ def _impersonate(raw: str) -> Any | None:
         return None
 
 
-def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, Any]:
+def _site_options(
+    url: str,
+    *,
+    instagram_impersonate: bool = True,
+    youtube_player_client: str | None = None,
+) -> dict[str, Any]:
     options: dict[str, Any] = {}
     if is_youtube_url(url):
         runtimes = _csv(env_config.YTDLP_JS_RUNTIMES)
@@ -233,6 +238,10 @@ def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, 
             options["js_runtimes"] = {runtime: {} for runtime in runtimes}
         if components:
             options["remote_components"] = components
+        if youtube_player_client is not None:
+            options["extractor_args"] = {
+                "youtube": {"player_client": [youtube_player_client]},
+            }
     if is_instagram_url(url):
         options.update(
             retries=env_config.YTDLP_INSTAGRAM_RETRIES,
@@ -243,6 +252,28 @@ def _site_options(url: str, *, instagram_impersonate: bool = True) -> dict[str, 
         if target is not None:
             options["impersonate"] = target
     return options
+
+
+def _youtube_player_clients() -> list[str | None]:
+    clients_raw = env_config.YTDLP_YOUTUBE_PLAYER_CLIENTS
+    if not clients_raw.strip() and env_config.YTDLP_YOUTUBE_PLAYER_CLIENT.strip():
+        clients_raw = env_config.YTDLP_YOUTUBE_PLAYER_CLIENT
+
+    clients = _csv(clients_raw)
+    if not clients:
+        clients = ["web", "android", "ios"]
+
+    ordered: list[str | None] = []
+    for client in clients:
+        normalized = client.strip().lower()
+        if not normalized:
+            continue
+        value = None if normalized in {"web", "default"} else normalized
+        if value in ordered:
+            continue
+        ordered.append(value)
+
+    return ordered or [None, "android", "ios"]
 
 
 def _is_instagram_content_restriction(error: BaseException) -> bool:
@@ -412,7 +443,13 @@ def download_metadata(
         if deadline is not None and time.monotonic() > deadline:
             raise yt_dlp.utils.DownloadError("download deadline exceeded")
 
-    def options_for(plan: FormatPlan, fragments: int, *, instagram_impersonate: bool = True) -> dict[str, Any]:
+    def options_for(
+        plan: FormatPlan,
+        fragments: int,
+        *,
+        instagram_impersonate: bool = True,
+        youtube_player_client: str | None = None,
+    ) -> dict[str, Any]:
         options = _base_options(cookie_file)
         options.update(
             outtmpl=outtmpl,
@@ -424,29 +461,57 @@ def download_metadata(
         )
         if plan.merge_output_format:
             options["merge_output_format"] = plan.merge_output_format
-        options.update(_site_options(metadata.url, instagram_impersonate=instagram_impersonate))
+        options.update(
+            _site_options(
+                metadata.url,
+                instagram_impersonate=instagram_impersonate,
+                youtube_player_client=youtube_player_client,
+            )
+        )
         return options
 
     last_error: Exception | None = None
     for index, plan in enumerate(plans, start=1):
         _remove_attempt_files(output_folder, out_prefix)
         LOG.info("trying media format candidate=%s total=%s", index, len(plans))
-        try:
-            with yt_dlp.YoutubeDL(options_for(plan, concurrent_fragments)) as ydl:
-                result = ydl.process_ie_result(_unselect_info(metadata.info), download=True)
-        except Exception as primary_error:
-            last_error = primary_error
-            if not (is_youtube_url(metadata.url) or is_instagram_url(metadata.url)):
-                continue
-            _remove_attempt_files(output_folder, out_prefix)
+        is_youtube = is_youtube_url(metadata.url)
+        is_instagram = is_instagram_url(metadata.url)
+        for player_client in _youtube_player_clients() if is_youtube else [None]:
+            result: dict[str, Any] | None = None
             try:
-                # A fresh extraction recovers expired CDN URLs without making
-                # it the normal path for Instagram, which is sensitive to extra requests.
-                with yt_dlp.YoutubeDL(options_for(plan, 1, instagram_impersonate=False)) as ydl:
-                    result = ydl.extract_info(metadata.url, download=True)
-            except Exception as fallback_error:
-                last_error = fallback_error
-                continue
+                with yt_dlp.YoutubeDL(
+                    options_for(plan, concurrent_fragments, youtube_player_client=player_client)
+                ) as ydl:
+                    result = ydl.process_ie_result(_unselect_info(metadata.info), download=True)
+                    break
+            except Exception as primary_error:
+                last_error = primary_error
+                if not (is_youtube or is_instagram):
+                    result = None
+                    break
+                _remove_attempt_files(output_folder, out_prefix)
+                try:
+                    # A fresh extraction recovers expired CDN URLs without making
+                    # it the normal path for Instagram, which is sensitive to extra requests.
+                    with yt_dlp.YoutubeDL(
+                        options_for(
+                            plan,
+                            1,
+                            youtube_player_client=player_client,
+                            instagram_impersonate=False,
+                        )
+                    ) as ydl:
+                        result = ydl.extract_info(metadata.url, download=True)
+                        break
+                except Exception as fallback_error:
+                    last_error = fallback_error
+                    continue
+
+            if result is not None:
+                break
+
+        if result is None:
+            continue
 
         path = find_downloaded_file(result if isinstance(result, dict) else {}, out_prefix, output_folder)
         try:
