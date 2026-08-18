@@ -68,6 +68,10 @@ Instead, it uses reactions:
 | 👎 | The download failed |
 | 👍 | The video was posted, but the original link was kept |
 
+When the bot leaves 🙈 or 👎, a group member can add the same reaction to retry the original link. The bot must
+be a group administrator to receive reaction updates. A retry replaces the bot's failure reaction with 👀 and
+runs through the normal queue, validation, and download pipeline again.
+
 If the link turns out to be an ordinary article or another page without video, the bot simply removes 👀 and leaves the message untouched.
 
 When everything succeeds, the original link can be removed automatically.

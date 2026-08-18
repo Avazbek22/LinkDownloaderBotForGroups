@@ -61,6 +61,23 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
+def _reaction_update(
+    emoji: str,
+    *,
+    chat_id: int = -100,
+    message_id: int = 42,
+    user_id: int = 99,
+    old: tuple[str, ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        message_id=message_id,
+        user=SimpleNamespace(id=user_id, is_bot=False),
+        old_reaction=[SimpleNamespace(type="emoji", emoji=item) for item in old],
+        new_reaction=[SimpleNamespace(type="emoji", emoji=item) for item in (*old, emoji)],
+    )
+
+
 def test_three_requests_download_and_upload_once(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()
@@ -214,8 +231,10 @@ def test_disallowed_failure_reaction_clears_stale_eyes(tmp_path) -> None:
     app.bot = fake
     app._set_status_reaction(job, "👀")
     app._after_failure(job)
+    app._handle_retry_reaction(_reaction_update("👎"))
 
     assert [item[2] for item in fake.reactions] == ["👀", None]
+    assert app.queue.empty()
 
 
 def test_reactions_can_be_disabled(tmp_path) -> None:
@@ -227,6 +246,176 @@ def test_reactions_can_be_disabled(tmp_path) -> None:
     app._set_status_reaction(job, "👀")
 
     assert fake.reactions == []
+
+
+def test_matching_failure_reaction_queues_retry_and_replaces_bot_status(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("failed", -100, 17, 42, 7, "https://example.com/video", "key", "Original User", True)
+    app._after_failure(job)
+
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    retry_job = flight.jobs[0]
+    assert retry_job.job_id != job.job_id
+    assert retry_job.chat_id == job.chat_id
+    assert retry_job.message_thread_id == job.message_thread_id
+    assert retry_job.original_message_id == job.original_message_id
+    assert retry_job.user_id == job.user_id
+    assert retry_job.url == job.url
+    assert retry_job.sender_name == job.sender_name
+    assert [item[2] for item in fake.reactions] == ["👎", "👀"]
+    app.coordinator.abort(flight)
+
+
+def test_retry_requires_new_matching_reaction_from_human(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("restricted", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    app._after_instagram_restriction(job)
+
+    app._handle_retry_reaction(_reaction_update("👎"))
+    app._handle_retry_reaction(_reaction_update("🙈", old=("🙈",)))
+    bot_update = _reaction_update("🙈")
+    bot_update.user.is_bot = True
+    app._handle_retry_reaction(bot_update)
+
+    assert app.queue.empty()
+    assert [item[2] for item in fake.reactions] == ["🙈"]
+
+
+def test_matching_monkey_reaction_queues_restricted_link_retry(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("restricted", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    app._after_instagram_restriction(job)
+
+    app._handle_retry_reaction(_reaction_update("🙈"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert [item[2] for item in fake.reactions] == ["🙈", "👀"]
+    app.coordinator.abort(flight)
+
+
+def test_expired_failure_reaction_does_not_retry(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("failed", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+    app._after_failure(job)
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0 + main.FAILED_RETRY_TTL_SECONDS + 1)
+
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    assert app.queue.empty()
+    assert [item[2] for item in fake.reactions] == ["👎"]
+
+
+def test_only_one_reaction_retry_can_be_active_for_a_message(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("failed", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    app._after_failure(job)
+
+    app._handle_retry_reaction(_reaction_update("👎", user_id=10))
+    app._handle_retry_reaction(_reaction_update("👎", user_id=11))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert app.queue.empty()
+    assert [item[2] for item in fake.reactions] == ["👎", "👀"]
+    app.coordinator.abort(flight)
+
+
+def test_retry_probe_failure_restores_downvote_instead_of_clearing_status(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("failed", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    app._after_failure(job)
+    app._handle_retry_reaction(_reaction_update("👎"))
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(RuntimeError("failed")))
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👎", "👀", "👎"]
+    app._handle_retry_reaction(_reaction_update("👎", user_id=101))
+    second_flight = app.queue.get_nowait()
+    assert second_flight is not None
+    app.coordinator.abort(second_flight)
+
+
+def test_full_queue_restores_failure_status_and_unlocks_retry(tmp_path) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), max_queue=1))
+    fake = FakeBot()
+    app.bot = fake
+    app.queue.put_nowait(None)
+    job = Job("failed", -100, None, 42, 7, "https://example.com/video", "key", "User", True)
+    app._after_failure(job)
+
+    app._handle_retry_reaction(_reaction_update("👎", user_id=10))
+    app._handle_retry_reaction(_reaction_update("👎", user_id=11))
+
+    assert [item[2] for item in fake.reactions] == ["👎", "👀", "👎", "👀", "👎"]
+
+
+def test_success_forgets_failed_retry_entry(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job("failed", -100, None, 42, 7, "https://example.com/video", "key", "User", False)
+    app._after_failure(job)
+    app._handle_retry_reaction(_reaction_update("👎"))
+    flight = app.queue.get_nowait()
+    assert flight is not None
+
+    app._after_success(flight.jobs[0])
+    app.coordinator.abort(flight)
+    app._handle_retry_reaction(_reaction_update("👎", user_id=101))
+
+    assert app.queue.empty()
+    assert [item[2] for item in fake.reactions] == ["👎", "👀", "👍"]
+
+
+def test_reaction_handler_is_registered(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+
+    assert len(app.bot.message_reaction_handlers) == 1
+
+
+def test_polling_explicitly_requests_reaction_updates(tmp_path, monkeypatch) -> None:
+    class PollingBot(FakeBot):
+        def infinity_polling(self, **kwargs) -> None:
+            self.polling_options = kwargs
+
+    class DormantThread:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    app = main.BotApplication(_settings(tmp_path))
+    fake = PollingBot()
+    app.bot = fake
+    monkeypatch.setattr(app, "initialize_identity", lambda: None)
+    monkeypatch.setattr(app, "_set_commands", lambda: None)
+    monkeypatch.setattr(main.threading, "Thread", DormantThread)
+
+    app.start()
+
+    assert fake.polling_options["allowed_updates"] == ["message", "message_reaction"]
 
 
 def test_accepted_group_link_gets_eyes(tmp_path, monkeypatch) -> None:

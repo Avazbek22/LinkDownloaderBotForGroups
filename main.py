@@ -8,7 +8,9 @@ import signal
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import suppress
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,16 @@ from app.url_security import (
 
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+RETRYABLE_REACTIONS = frozenset({"👎", "🙈"})
+FAILED_RETRY_TTL_SECONDS = 7 * 24 * 60 * 60
+FAILED_RETRY_MAX_ITEMS = 1_000
+
+
+@dataclass(frozen=True)
+class FailedRetry:
+    job: Job
+    emoji: str
+    failed_at: float
 
 
 def extract_first_url(text: str) -> str | None:
@@ -63,6 +75,9 @@ class BotApplication:
         self.queue: queue.Queue[Flight | None] = queue.Queue(maxsize=settings.max_queue)
         self.stop_event = threading.Event()
         self.upload_slots = threading.BoundedSemaphore(settings.upload_workers)
+        self._failed_retry_lock = threading.RLock()
+        self._failed_retries: OrderedDict[tuple[int, int], FailedRetry] = OrderedDict()
+        self._retries_in_progress: set[tuple[int, int]] = set()
         self.bot = telebot.TeleBot(settings.token, threaded=True)
         self.bot_id = 0
         self.bot_username = ""
@@ -111,7 +126,11 @@ class BotApplication:
             self.settings.workers,
             self.settings.upload_workers,
         )
-        self.bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=None)
+        self.bot.infinity_polling(
+            timeout=30,
+            long_polling_timeout=30,
+            allowed_updates=["message", "message_reaction"],
+        )
 
     def stop(self) -> None:
         if self.stop_event.is_set():
@@ -149,7 +168,7 @@ class BotApplication:
                     jobs = list(flight.jobs)
                     self.coordinator.abort(flight)
                     if flight.media_key is None:
-                        self._clear_status_many(jobs)
+                        self._after_probe_failure_many(jobs)
                     else:
                         self._after_failure_many(jobs)
             finally:
@@ -218,7 +237,7 @@ class BotApplication:
                 type(exc).__name__,
                 safe_error_for_log(exc),
             )
-            self._clear_status_many(self.coordinator.abort(flight))
+            self._after_probe_failure_many(self.coordinator.abort(flight))
             return
 
         if not has_downloadable_video(metadata.info):
@@ -227,7 +246,7 @@ class BotApplication:
                 first.job_id,
                 safe_url_for_log(first.url),
             )
-            self._clear_status_many(self.coordinator.abort(flight))
+            self._after_probe_failure_many(self.coordinator.abort(flight))
             return
 
         media_key = f"{metadata.media_key}:mp4-h264-v2:{self.settings.max_filesize}"
@@ -382,6 +401,7 @@ class BotApplication:
         return self.bot.send_video(video=video, **kwargs)
 
     def _after_success(self, job: Job) -> None:
+        self._forget_failed_retry(job)
         if job.delete_original:
             try:
                 self.bot.delete_message(job.chat_id, job.original_message_id)
@@ -392,7 +412,10 @@ class BotApplication:
             self._clear_status_reaction(job)
 
     def _after_failure(self, job: Job) -> None:
-        if not self._set_status_reaction(job, "👎"):
+        if self._set_status_reaction(job, "👎"):
+            self._remember_failed_retry(job, "👎")
+        else:
+            self._forget_failed_retry(job)
             self._clear_status_reaction(job)
 
     def _after_failure_many(self, jobs: list[Job]) -> None:
@@ -400,7 +423,10 @@ class BotApplication:
             self._after_failure(job)
 
     def _after_instagram_restriction(self, job: Job) -> None:
-        if not self._set_status_reaction(job, "🙈"):
+        if self._set_status_reaction(job, "🙈"):
+            self._remember_failed_retry(job, "🙈")
+        else:
+            self._forget_failed_retry(job)
             self._clear_status_reaction(job)
 
     def _after_instagram_restriction_many(self, jobs: list[Job]) -> None:
@@ -410,6 +436,141 @@ class BotApplication:
     def _clear_status_many(self, jobs: list[Job]) -> None:
         for job in jobs:
             self._clear_status_reaction(job)
+
+    def _after_probe_failure_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            if self._retry_in_progress(job):
+                self._after_failure(job)
+            else:
+                self._clear_status_reaction(job)
+
+    @staticmethod
+    def _retry_key(job: Job) -> tuple[int, int]:
+        return job.chat_id, job.original_message_id
+
+    def _prune_failed_retries_locked(self, now: float) -> None:
+        expired = [
+            key for key, failed in self._failed_retries.items() if now - failed.failed_at > FAILED_RETRY_TTL_SECONDS
+        ]
+        for key in expired:
+            self._failed_retries.pop(key, None)
+            self._retries_in_progress.discard(key)
+        while len(self._failed_retries) > FAILED_RETRY_MAX_ITEMS:
+            key, _failed = self._failed_retries.popitem(last=False)
+            self._retries_in_progress.discard(key)
+
+    def _remember_failed_retry(self, job: Job, emoji: str) -> None:
+        if not self.settings.status_reactions or emoji not in RETRYABLE_REACTIONS:
+            return
+        key = self._retry_key(job)
+        now = time.monotonic()
+        with self._failed_retry_lock:
+            self._failed_retries.pop(key, None)
+            self._failed_retries[key] = FailedRetry(job=job, emoji=emoji, failed_at=now)
+            self._retries_in_progress.discard(key)
+            self._prune_failed_retries_locked(now)
+
+    def _forget_failed_retry(self, job: Job) -> None:
+        key = self._retry_key(job)
+        with self._failed_retry_lock:
+            self._failed_retries.pop(key, None)
+            self._retries_in_progress.discard(key)
+
+    def _retry_in_progress(self, job: Job) -> bool:
+        with self._failed_retry_lock:
+            return self._retry_key(job) in self._retries_in_progress
+
+    @staticmethod
+    def _reaction_emojis(reactions: Any) -> set[str]:
+        return {
+            emoji
+            for reaction in reactions or []
+            if isinstance((emoji := getattr(reaction, "emoji", None)), str) and emoji
+        }
+
+    def _claim_failed_retry(self, update: Any) -> FailedRetry | None:
+        if not self.settings.status_reactions:
+            return None
+        chat = getattr(update, "chat", None)
+        user = getattr(update, "user", None)
+        if getattr(chat, "type", "") not in {"group", "supergroup"}:
+            return None
+        if user is None or getattr(user, "is_bot", False):
+            return None
+        try:
+            key = int(chat.id), int(update.message_id)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        added = self._reaction_emojis(getattr(update, "new_reaction", None)) - self._reaction_emojis(
+            getattr(update, "old_reaction", None)
+        )
+        now = time.monotonic()
+        with self._failed_retry_lock:
+            self._prune_failed_retries_locked(now)
+            failed = self._failed_retries.get(key)
+            if failed is None or failed.emoji not in added or key in self._retries_in_progress:
+                return None
+            self._retries_in_progress.add(key)
+            return failed
+
+    def _restore_failed_retry(self, job: Job) -> None:
+        key = self._retry_key(job)
+        with self._failed_retry_lock:
+            self._retries_in_progress.discard(key)
+            failed = self._failed_retries.get(key)
+        if failed is not None and not self._set_status_reaction(job, failed.emoji):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+
+    def _restore_or_clear_unqueued(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            if self._retry_in_progress(job):
+                self._restore_failed_retry(job)
+            else:
+                self._clear_status_reaction(job)
+
+    def _handle_retry_reaction(self, update: Any) -> None:
+        failed = self._claim_failed_retry(update)
+        if failed is None:
+            return
+        retry_job = replace(failed.job, job_id=uuid.uuid4().hex[:16])
+        flight: Flight | None = None
+        queued = False
+        try:
+            if not self._set_status_reaction(retry_job, "👀"):
+                self._clear_status_reaction(retry_job)
+            flight = self.coordinator.submit(retry_job)
+            if flight is None:
+                self.log.info(
+                    "reaction retry joined URL flight job_id=%s chat_id=%s url=%s",
+                    retry_job.job_id,
+                    retry_job.chat_id,
+                    safe_url_for_log(retry_job.url),
+                )
+                return
+            try:
+                self.queue.put_nowait(flight)
+                queued = True
+                self.log.info(
+                    "reaction retry queued job_id=%s chat_id=%s url=%s",
+                    retry_job.job_id,
+                    retry_job.chat_id,
+                    safe_url_for_log(retry_job.url),
+                )
+            except queue.Full:
+                self._restore_or_clear_unqueued(self.coordinator.abort(flight))
+                self.log.warning("reaction retry queue full job_id=%s chat_id=%s", retry_job.job_id, retry_job.chat_id)
+                self._operator_alert("The download queue is full. Check bot.log.")
+        except Exception:
+            if not queued:
+                if flight is not None:
+                    self.coordinator.abort(flight)
+                self._restore_failed_retry(retry_job)
+            self.log.exception(
+                "reaction retry handler failed job_id=%s chat_id=%s",
+                retry_job.job_id,
+                retry_job.chat_id,
+            )
 
     def _set_status_reaction(self, job: Job, emoji: str) -> bool:
         if not self.settings.status_reactions:
@@ -531,6 +692,10 @@ class BotApplication:
 
     def _register_handlers(self) -> None:
         bot = self.bot
+
+        @bot.message_reaction_handler(func=lambda _update: True)
+        def retry_reaction(update: Any) -> None:
+            self._handle_retry_reaction(update)
 
         @bot.message_handler(content_types=["new_chat_members"])
         def new_members(message: Any) -> None:
