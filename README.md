@@ -321,7 +321,7 @@ DISK_CACHE_MAX_FILES=3
 | `FILE_ID_CACHE_TTL_DAYS` | `30` | Lifetime of Telegram media entries |
 | `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallel download fragments |
 | `YTDLP_JS_RUNTIMES` | `node` | JavaScript runtime for yt-dlp |
-| `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Optional yt-dlp components |
+| `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Optional yt-dlp components; set an explicit empty value to disable |
 | `YTDLP_YOUTUBE_PLAYER_CLIENTS` | `default,android,ios` | YouTube player client fallback chain |
 | `YTDLP_YOUTUBE_PLAYER_CLIENT` | (legacy) | Optional single YouTube client override (`default`/`android`/`ios`; `web` remains a default alias) |
 | `YTDLP_INSTAGRAM_IMPERSONATE` | `chrome` | Browser impersonation for Instagram |

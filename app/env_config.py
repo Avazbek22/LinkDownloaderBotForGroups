@@ -16,9 +16,12 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
-def _env_str(name: str, default: str) -> str:
-    raw = (os.getenv(name) or "").strip()
-    return raw or default
+def _env_str(name: str, default: str, *, allow_empty: bool = False) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value or allow_empty else default
 
 
 def reload_from_environment() -> None:
@@ -33,7 +36,9 @@ def reload_from_environment() -> None:
     global YTDLP_YOUTUBE_PLAYER_CLIENTS
 
     YTDLP_JS_RUNTIMES = _env_str("YTDLP_JS_RUNTIMES", "node")
-    YTDLP_REMOTE_COMPONENTS = _env_str("YTDLP_REMOTE_COMPONENTS", "ejs:github")
+    # Unlike an unset variable, an explicitly empty value disables remote
+    # components. This keeps the default convenient without making it mandatory.
+    YTDLP_REMOTE_COMPONENTS = _env_str("YTDLP_REMOTE_COMPONENTS", "ejs:github", allow_empty=True)
 
     YTDLP_INSTAGRAM_IMPERSONATE = _env_str("YTDLP_INSTAGRAM_IMPERSONATE", "chrome")
     YTDLP_INSTAGRAM_RETRIES = _env_int("YTDLP_INSTAGRAM_RETRIES", 8)

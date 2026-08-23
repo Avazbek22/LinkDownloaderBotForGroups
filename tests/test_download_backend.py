@@ -432,7 +432,43 @@ def test_youtube_metadata_uses_client_fallback(monkeypatch) -> None:
             clients_seen.append(self.client)
             if self.client == "default":
                 raise RuntimeError("default blocked")
-            return {"id": "video", "extractor_key": "Youtube", "formats": []}
+            return {
+                "id": "video",
+                "extractor_key": "Youtube",
+                "formats": [{"format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+            }
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,android,ios")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.youtube.com/watch?v=video")
+
+    assert metadata.media_key == "youtube:video"
+    assert clients_seen == ["default", "android"]
+
+
+def test_youtube_metadata_skips_client_without_video_formats(monkeypatch) -> None:
+    clients_seen: list[str] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.client = options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["default"])[0]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            clients_seen.append(self.client)
+            if self.client == "default":
+                return {"id": "video", "extractor_key": "Youtube", "formats": []}
+            return {
+                "id": "video",
+                "extractor_key": "Youtube",
+                "formats": [{"format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+            }
 
     monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,android,ios")
     monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)

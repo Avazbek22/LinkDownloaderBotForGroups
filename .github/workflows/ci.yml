@@ -38,7 +38,9 @@ jobs:
           for script in install.sh scripts/*.sh tests/shell/*.sh; do
             bash -n "$script"
           done
-          bash tests/shell/test-deploy.sh
+          for test_script in tests/shell/test-*.sh; do
+            bash "$test_script"
+          done
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:

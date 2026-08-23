@@ -448,6 +448,8 @@ def extract_metadata(
                     candidate = ydl.extract_info(url, download=False)
                 if not isinstance(candidate, dict):
                     raise RuntimeError("extractor returned no metadata")
+                if not has_downloadable_video(candidate):
+                    raise RuntimeError("extractor returned metadata without a downloadable video")
                 info = candidate
                 break
             except Exception as error:
