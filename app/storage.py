@@ -183,6 +183,62 @@ class Storage:
         key = "welcomed_groups" if kind == "group" else "welcomed_private"
         self.state.update(lambda data: data.setdefault(key, {}).__setitem__(str(identity), True))
 
+    def known_group_ids(self) -> set[int]:
+        """Return historical group IDs without treating them as current membership."""
+        settings_chats = self.settings.snapshot().get("chats", {})
+        welcomed_groups = self.state.snapshot().get("welcomed_groups", {})
+        candidates = set(settings_chats) if isinstance(settings_chats, dict) else set()
+        if isinstance(welcomed_groups, dict):
+            candidates.update(welcomed_groups)
+        result: set[int] = set()
+        for value in candidates:
+            try:
+                chat_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if chat_id < 0:
+                result.add(chat_id)
+        return result
+
+    def migrate_chat_id(self, old_chat_id: int, new_chat_id: int) -> None:
+        """Move preferences when Telegram upgrades a basic group to a supergroup."""
+        old_key = str(int(old_chat_id))
+        new_key = str(int(new_chat_id))
+        if old_key == new_key:
+            return
+
+        def migrate_settings(data: dict[str, Any]) -> None:
+            chats = data.setdefault("chats", {})
+            old = chats.pop(old_key, None)
+            if not isinstance(old, dict):
+                return
+            current = chats.get(new_key)
+            merged = copy.deepcopy(old)
+            if isinstance(current, dict):
+                merged.update(current)
+            chats[new_key] = merged
+
+        def migrate_users(data: dict[str, Any]) -> None:
+            groups = data.setdefault("opt_out", {})
+            old = groups.pop(old_key, None)
+            if not isinstance(old, dict):
+                return
+            current = groups.get(new_key)
+            merged = copy.deepcopy(old)
+            if isinstance(current, dict):
+                merged.update(current)
+            groups[new_key] = merged
+
+        def migrate_state(data: dict[str, Any]) -> None:
+            groups = data.setdefault("welcomed_groups", {})
+            old = groups.pop(old_key, None)
+            if old or new_key in groups:
+                groups[new_key] = bool(old or groups.get(new_key))
+
+        self.settings.update(migrate_settings)
+        self.users.update(migrate_users)
+        self.state.update(migrate_state)
+
     def get_file_id(self, media_key: str, ttl_days: int) -> str | None:
         item = self.media.snapshot().get("items", {}).get(media_key)
         if not isinstance(item, dict) or not isinstance(item.get("file_id"), str):

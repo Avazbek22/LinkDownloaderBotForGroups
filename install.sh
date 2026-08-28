@@ -30,6 +30,23 @@ compose() {
   if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi
 }
 
+env_value() {
+  local key="$1" file="$2"
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+
+set_env_value() {
+  local key="$1" value="$2" file="$3" temporary="$3.tmp"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    index($0, key "=") == 1 { print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "$file" >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$file"
+}
+
 install_prerequisites() {
   info "Checking prerequisites"
   if ! need git || ! need docker || ! need flock; then
@@ -65,9 +82,12 @@ prepare_repository() {
 prepare_environment() {
   info "Preparing configuration"
   local env_file="$INSTALL_DIR/.env"
+  local created_env=0
   if [[ ! -f "$env_file" ]]; then
     cp "$INSTALL_DIR/.env-example" "$env_file"
+    created_env=1
   fi
+  chmod 600 "$env_file"
   if ! grep -Eq '^BOT_TOKEN=.+$' "$env_file"; then
     local token="${BOT_TOKEN:-}"
     if [[ -z "$token" ]]; then
@@ -79,9 +99,63 @@ prepare_environment() {
     local temporary="$env_file.tmp"
     awk -v token="$token" 'BEGIN{done=0} /^BOT_TOKEN=/{print "BOT_TOKEN=" token; done=1; next} {print} END{if(!done) print "BOT_TOKEN=" token}' \
       "$env_file" >"$temporary"
+    chmod 600 "$temporary"
     mv "$temporary" "$env_file"
-    chmod 600 "$env_file"
   fi
+
+  local access_mode
+  access_mode="$(env_value GROUP_ACCESS_MODE "$env_file")"
+  if [[ -z "$access_mode" ]]; then
+    access_mode="${GROUP_ACCESS_MODE:-}"
+    if [[ -z "$access_mode" && -t 0 ]]; then
+      local answer
+      while true; do
+        if [[ "$created_env" == "1" ]]; then
+          printf 'Require owner approval for new groups? [Y/n]: ' >&2
+        else
+          printf 'Enable owner approval for this existing installation? [y/N]: ' >&2
+        fi
+        read -r answer
+        if [[ "$created_env" == "1" ]]; then
+          case "${answer,,}" in
+            ""|y|yes) access_mode="approval"; break ;;
+            n|no) access_mode="open"; break ;;
+            *) printf 'Please answer y or n.\n' >&2 ;;
+          esac
+        else
+          case "${answer,,}" in
+            y|yes) access_mode="approval"; break ;;
+            ""|n|no) access_mode="open"; break ;;
+            *) printf 'Please answer y or n.\n' >&2 ;;
+          esac
+        fi
+      done
+    fi
+    [[ -n "$access_mode" ]] || access_mode="open"
+  fi
+  access_mode="${access_mode,,}"
+  [[ "$access_mode" == "open" || "$access_mode" == "approval" ]] \
+    || die "GROUP_ACCESS_MODE must be open or approval"
+  set_env_value GROUP_ACCESS_MODE "$access_mode" "$env_file"
+
+  if [[ "$access_mode" == "approval" ]]; then
+    local owner_username
+    owner_username="$(env_value GROUP_OWNER_USERNAME "$env_file")"
+    owner_username="${owner_username:-${GROUP_OWNER_USERNAME:-}}"
+    if [[ -z "$owner_username" ]]; then
+      [[ -t 0 ]] || die "GROUP_OWNER_USERNAME is required when GROUP_ACCESS_MODE=approval"
+      printf 'Owner Telegram username (without @): ' >&2
+      read -r owner_username
+    fi
+    owner_username="${owner_username#@}"
+    owner_username="${owner_username,,}"
+    [[ "$owner_username" =~ ^[a-z0-9_]{5,32}$ ]] || die "Owner Telegram username has an invalid format"
+    set_env_value GROUP_OWNER_USERNAME "$owner_username" "$env_file"
+    if [[ -z "$(env_value PENDING_GROUP_TTL_HOURS "$env_file")" ]]; then
+      set_env_value PENDING_GROUP_TTL_HOURS "168" "$env_file"
+    fi
+  fi
+  chmod 600 "$env_file"
   mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
   ok "Configuration is ready"
 }
@@ -137,4 +211,6 @@ main() {
   printf '\nLogs: cd %q && docker compose -p %q logs -f --tail=200\n' "$INSTALL_DIR" "$COMPOSE_PROJECT"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

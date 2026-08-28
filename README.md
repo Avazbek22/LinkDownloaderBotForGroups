@@ -185,7 +185,7 @@ sudo git clone \
 sudo bash /opt/linkdownloaderbot/install.sh
 ```
 
-The installer asks for the Telegram bot token, builds the container, starts the bot, and prepares automatic updates when systemd is available.
+The installer asks for the Telegram bot token and whether new groups must be approved by the bot owner. It then builds the container, starts the bot, and prepares automatic updates when systemd is available.
 
 To update an existing installation, run the same command again:
 
@@ -234,6 +234,8 @@ No command is required.
 | `/settings` | Show group settings |
 | `/delete_original on` | Delete processed links after success |
 | `/delete_original off` | Keep original links |
+
+When owner approval is enabled, the owner also gets private `/groups` and `/pending_groups` commands. They are scoped to the owner's private chat and are not published in the global command menu.
 
 Language and group settings can be changed only by group administrators.
 
@@ -292,10 +294,47 @@ The most useful options are:
 | `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
 | `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
 | `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 👎, and 👍 reactions |
+| `GROUP_ACCESS_MODE` | `open` | Use `approval` to block unapproved groups |
+| `GROUP_OWNER_USERNAME` | empty | Telegram username used for the initial owner binding |
+| `PENDING_GROUP_TTL_HOURS` | `168` | Time before an unapproved group is left |
 | `COOKIES_FILE` | empty | Optional cookies file for restricted websites |
 | `LOG_LEVEL` | `INFO` | Logging detail level |
 
 See [`.env-example`](.env-example) for all available settings.
+
+### Private group approval
+
+For a private deployment, enable the approval policy:
+
+```env
+GROUP_ACCESS_MODE=approval
+GROUP_OWNER_USERNAME=your_telegram_username
+PENDING_GROUP_TTL_HOURS=168
+```
+
+The configured username is used only for the first private contact. Send `/start` to the bot from that account once; the bot then stores the account's stable numeric Telegram ID. A later username change does not remove access, and another account cannot rebind ownership.
+
+When someone adds the bot to a new group:
+
+1. the group is recorded immediately in `data/groups.json`;
+2. all link processing is blocked before URL validation, reactions, queues, or website requests;
+3. the owner receives a private Approve/Reject request;
+4. rejection makes the bot leave immediately;
+5. an unanswered request expires after the configured TTL and the bot leaves.
+
+If the bound owner adds the bot personally, that group is approved automatically. Previously approved groups remain approved when re-added. Notification delivery and failed leave attempts are retried safely in the background.
+
+Use `/groups` in the owner's private chat for the current, API-refreshed membership registry. `/pending_groups` shows only requests awaiting a decision. Telegram does not provide bots with an API that enumerates every group retrospectively, so the registry is built from membership updates, observed group messages, existing local chat records, and the optional verified bootstrap described below.
+
+#### Enabling approval on an existing bot
+
+Existing trusted groups can be seeded once without hard-coding IDs in the application:
+
+```env
+GROUP_BOOTSTRAP_CHAT_IDS=-1001234567890,-1009876543210
+```
+
+On startup, every configured ID is checked with Telegram. Only a group where the bot is currently a member or administrator is approved. A `left`, `kicked`, or unverifiable group is never approved. Historical local groups not listed in the bootstrap are discovered when possible but remain blocked and require an owner decision. After a successful first reconciliation the bootstrap value may be removed; the decisions remain in `groups.json`.
 
 ### Small VPS profile
 
@@ -348,6 +387,7 @@ The bot stores only the data needed to operate:
 
 ```text
 data/
+├── groups.json         # current membership, owner binding, and access decisions
 ├── settings.json       # group language and preferences
 ├── users.json          # personal opt-out choices
 ├── state.json          # welcome and migration state

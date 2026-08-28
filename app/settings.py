@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,40 @@ def _boolean(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
+def _group_access_mode() -> str:
+    value = (os.getenv("GROUP_ACCESS_MODE") or "open").strip().lower()
+    if value not in {"open", "approval"}:
+        raise RuntimeError("GROUP_ACCESS_MODE must be open or approval")
+    return value
+
+
+def _owner_username() -> str:
+    value = (os.getenv("GROUP_OWNER_USERNAME") or "").strip().lstrip("@").lower()
+    if value and not re.fullmatch(r"[a-z0-9_]{5,32}", value):
+        raise RuntimeError("GROUP_OWNER_USERNAME must be a valid Telegram username")
+    return value
+
+
+def _chat_ids(name: str) -> tuple[int, ...]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return ()
+    result: list[int] = []
+    seen: set[int] = set()
+    for item in raw.split(","):
+        value = item.strip()
+        try:
+            chat_id = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must contain comma-separated integer chat IDs") from exc
+        if chat_id >= 0:
+            raise RuntimeError(f"{name} must contain only negative group chat IDs")
+        if chat_id not in seen:
+            seen.add(chat_id)
+            result.append(chat_id)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class Settings:
     token: str
@@ -69,6 +104,10 @@ class Settings:
     delete_original: bool
     default_language: str
     log_level: str
+    group_access_mode: str = "open"
+    group_owner_username: str = ""
+    pending_group_ttl_hours: int = 168
+    group_bootstrap_chat_ids: tuple[int, ...] = ()
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -101,6 +140,10 @@ def load_settings(base_dir: Path | None = None) -> Settings:
     log_level = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise RuntimeError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    group_access_mode = _group_access_mode()
+    group_owner_username = _owner_username()
+    if group_access_mode == "approval" and not group_owner_username:
+        raise RuntimeError("GROUP_OWNER_USERNAME is required when GROUP_ACCESS_MODE=approval")
 
     return Settings(
         token=token,
@@ -124,4 +167,8 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         delete_original=_boolean("DELETE_ORIGINAL", True),
         default_language=default_language,
         log_level=log_level,
+        group_access_mode=group_access_mode,
+        group_owner_username=group_owner_username,
+        pending_group_ttl_hours=_integer("PENDING_GROUP_TTL_HOURS", 168, 1, 8760),
+        group_bootstrap_chat_ids=_chat_ids("GROUP_BOOTSTRAP_CHAT_IDS"),
     )

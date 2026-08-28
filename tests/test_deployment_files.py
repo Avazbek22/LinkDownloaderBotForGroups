@@ -24,6 +24,20 @@ def test_installer_enables_main_updater_and_detects_a_fork() -> None:
     assert "production-ready" not in deployer
 
 
+def test_installer_configures_optional_owner_approval_without_a_password() -> None:
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    example = (ROOT / ".env-example").read_text(encoding="utf-8")
+
+    assert "Require owner approval for new groups? [Y/n]" in installer
+    assert "Enable owner approval for this existing installation? [y/N]" in installer
+    assert "Owner Telegram username (without @)" in installer
+    assert "GROUP_ACCESS_MODE" in installer
+    assert "GROUP_OWNER_USERNAME" in installer
+    assert "PENDING_GROUP_TTL_HOURS" in installer
+    assert "GROUP_BOOTSTRAP_CHAT_IDS" in example
+    assert "password" not in installer.lower()
+
+
 def test_systemd_invokes_scripts_through_bash() -> None:
     systemd_dir = ROOT / "scripts/systemd"
     deploy_service = (systemd_dir / "linkdownloaderbotforgroups-deploy.service").read_text(encoding="utf-8")

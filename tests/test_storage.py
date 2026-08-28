@@ -37,6 +37,25 @@ def test_preferences_and_language_are_separate(tmp_path) -> None:
     assert "opt_out" in (tmp_path / "users.json").read_text(encoding="utf-8")
 
 
+def test_known_groups_filter_private_ids_and_migrate_group_preferences(tmp_path) -> None:
+    storage = Storage(tmp_path)
+    storage.set_chat_language(-123, "ru")
+    storage.set_delete_original(-123, False)
+    storage.toggle_opt_out(-123, 7)
+    storage.mark_welcomed("group", -123)
+    storage.set_chat_language(42, "ru")
+
+    assert storage.known_group_ids() == {-123}
+
+    storage.migrate_chat_id(-123, -100123)
+
+    assert storage.chat_language(-100123) == "ru"
+    assert storage.delete_original(-100123) is False
+    assert storage.is_opted_out(-100123, 7)
+    assert storage.was_welcomed("group", -100123)
+    assert -123 not in storage.known_group_ids()
+
+
 def test_corrupt_store_recovers_from_backup(tmp_path) -> None:
     path = tmp_path / "value.json"
     store = JsonFile(path, lambda: {"version": 1, "value": 0})

@@ -14,6 +14,10 @@ def test_local_dotenv_refreshes_downloader_settings_and_legacy_client(tmp_path) 
         "YTDLP_REMOTE_COMPONENTS",
         "YTDLP_YOUTUBE_PLAYER_CLIENT",
         "YTDLP_YOUTUBE_PLAYER_CLIENTS",
+        "GROUP_ACCESS_MODE",
+        "GROUP_OWNER_USERNAME",
+        "PENDING_GROUP_TTL_HOURS",
+        "GROUP_BOOTSTRAP_CHAT_IDS",
     )
     previous = {name: os.environ.get(name) for name in names}
     for name in names:
@@ -41,6 +45,60 @@ def test_local_dotenv_refreshes_downloader_settings_and_legacy_client(tmp_path) 
             else:
                 os.environ[name] = value
         env_config.reload_from_environment()
+
+
+def test_group_approval_settings_are_normalized_and_deduplicated(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("GROUP_ACCESS_MODE", "APPROVAL")
+    monkeypatch.setenv("GROUP_OWNER_USERNAME", "@Owner_Name")
+    monkeypatch.setenv("PENDING_GROUP_TTL_HOURS", "72")
+    monkeypatch.setenv("GROUP_BOOTSTRAP_CHAT_IDS", "-1001, -1002,-1001")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.group_access_mode == "approval"
+    assert settings.group_owner_username == "owner_name"
+    assert settings.pending_group_ttl_hours == 72
+    assert settings.group_bootstrap_chat_ids == (-1001, -1002)
+
+
+def test_approval_mode_requires_a_valid_owner_username(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("GROUP_ACCESS_MODE", "approval")
+    monkeypatch.delenv("GROUP_OWNER_USERNAME", raising=False)
+
+    try:
+        load_settings(tmp_path)
+    except RuntimeError as exc:
+        assert "GROUP_OWNER_USERNAME is required" in str(exc)
+    else:
+        raise AssertionError("approval mode accepted a missing owner")
+
+    monkeypatch.setenv("GROUP_OWNER_USERNAME", "bad name")
+    try:
+        load_settings(tmp_path)
+    except RuntimeError as exc:
+        assert "valid Telegram username" in str(exc)
+    else:
+        raise AssertionError("approval mode accepted an invalid owner")
+
+
+def test_group_access_defaults_to_backward_compatible_open_mode(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    for name in (
+        "GROUP_ACCESS_MODE",
+        "GROUP_OWNER_USERNAME",
+        "PENDING_GROUP_TTL_HOURS",
+        "GROUP_BOOTSTRAP_CHAT_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings(tmp_path)
+
+    assert settings.group_access_mode == "open"
+    assert settings.group_owner_username == ""
+    assert settings.pending_group_ttl_hours == 168
+    assert settings.group_bootstrap_chat_ids == ()
 
 
 def test_unset_remote_components_keeps_default(monkeypatch) -> None:

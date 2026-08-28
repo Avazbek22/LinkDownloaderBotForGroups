@@ -415,7 +415,12 @@ def test_polling_explicitly_requests_reaction_updates(tmp_path, monkeypatch) -> 
 
     app.start()
 
-    assert fake.polling_options["allowed_updates"] == ["message", "message_reaction"]
+    assert fake.polling_options["allowed_updates"] == [
+        "message",
+        "message_reaction",
+        "my_chat_member",
+        "callback_query",
+    ]
 
 
 def test_accepted_group_link_gets_eyes(tmp_path, monkeypatch) -> None:

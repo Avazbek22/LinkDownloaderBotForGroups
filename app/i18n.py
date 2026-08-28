@@ -43,6 +43,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "delete_changed": "Deleting original links is now {state}.",
         "state_on": "enabled",
         "state_off": "disabled",
+        "group_pending_approval": (
+            "⏳ This group is waiting for the bot owner's approval. Video links will not be processed yet."
+        ),
+        "group_approved": "✅ This group was approved. Video downloads are now enabled.",
+        "group_rejected": "⛔ The bot owner did not approve this group. I am leaving the group.",
+        "group_approval_expired": "⌛ Approval was not received in time. I am leaving the group.",
         "caption": '<a href="{url}">Original video · {source}</a>\nFrom {sender}',
     },
     "ru": {
@@ -85,6 +91,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "delete_changed": "Удаление исходных ссылок теперь {state}.",
         "state_on": "включено",
         "state_off": "выключено",
+        "group_pending_approval": (
+            "⏳ Эта группа ожидает подтверждения владельца бота. До подтверждения ссылки обрабатываться не будут."
+        ),
+        "group_approved": "✅ Группа подтверждена. Скачивание видео теперь включено.",
+        "group_rejected": "⛔ Владелец бота не подтвердил эту группу. Я покидаю группу.",
+        "group_approval_expired": "⌛ Подтверждение не получено вовремя. Я покидаю группу.",
         "caption": '<a href="{url}">Ссылка на видео · {source}</a>\nОт {sender}',
     },
 }
