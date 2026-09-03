@@ -25,7 +25,7 @@ from app.download_backend import (
     find_downloaded_file,
     has_downloadable_video,
 )
-from app.group_registry import ACTIVE_TELEGRAM_STATUSES, BLOCKED_ACCESS_STATUSES, GroupRegistry
+from app.group_registry import ACTIVE_TELEGRAM_STATUSES, GroupRegistry
 from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job
 from app.logging_setup import configure_logging
@@ -46,6 +46,7 @@ RETRYABLE_REACTIONS = frozenset({"👎", "🙈"})
 FAILED_RETRY_TTL_SECONDS = 7 * 24 * 60 * 60
 FAILED_RETRY_MAX_ITEMS = 1_000
 GROUP_NOTIFICATION_RETRY_SECONDS = 5 * 60
+GROUP_APPROVAL_ADMIN_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -690,6 +691,22 @@ class BotApplication:
         title = str(getattr(chat, "title", "") or "").strip()
         return title or None
 
+    @staticmethod
+    def _membership_status_from_error(exc: Exception) -> str | None:
+        """Return a definitive inactive status for known Telegram membership errors."""
+        try:
+            error_code = int(getattr(exc, "error_code", 0) or 0)
+        except (TypeError, ValueError):
+            error_code = 0
+        description = str(getattr(exc, "description", "") or exc).casefold()
+        if error_code != 403:
+            return None
+        if "bot was kicked" in description:
+            return "kicked"
+        if "bot is not a member" in description:
+            return "left"
+        return None
+
     def _refresh_group_registry(self) -> None:
         """Reconcile every known ID with Telegram without granting implicit access."""
         configured_bootstrap = set(self.settings.group_bootstrap_chat_ids)
@@ -707,21 +724,32 @@ class BotApplication:
                 member = self.bot.get_chat_member(chat_id, self.bot_id)
                 telegram_status = str(getattr(member, "status", "") or "unknown")
             except Exception as exc:
+                definitive_status = self._membership_status_from_error(exc)
                 self.log.info(
-                    "group membership verification failed chat_id=%s error=%s",
+                    "group membership verification failed chat_id=%s error=%s status=%s",
                     chat_id,
                     type(exc).__name__,
+                    definitive_status or "unknown",
                 )
                 if chat_id in configured_bootstrap and not self.group_registry.bootstrap_completed(chat_id):
-                    self.group_registry.record_bootstrap_result(chat_id, error=type(exc).__name__)
+                    if definitive_status is None:
+                        refreshed = self.group_registry.record_bootstrap_result(chat_id, error=type(exc).__name__)
+                    else:
+                        refreshed = self.group_registry.record_bootstrap_result(
+                            chat_id,
+                            title=existing.get("title"),
+                            chat_type=existing.get("type"),
+                            telegram_status=definitive_status,
+                        )
                 else:
-                    self.group_registry.record_presence(
+                    refreshed = self.group_registry.record_presence(
                         chat_id,
                         title=existing.get("title"),
                         chat_type=existing.get("type"),
-                        telegram_status="unknown",
+                        telegram_status=definitive_status or "unknown",
                         approval_required=self._approval_required,
                     )
+                self._sync_owner_card_after_presence(existing, refreshed)
                 continue
 
             title = existing.get("title")
@@ -734,20 +762,41 @@ class BotApplication:
                 self.log.info("group metadata refresh failed chat_id=%s error=%s", chat_id, type(exc).__name__)
 
             if chat_id in configured_bootstrap and not self.group_registry.bootstrap_completed(chat_id):
-                self.group_registry.record_bootstrap_result(
+                refreshed = self.group_registry.record_bootstrap_result(
                     chat_id,
                     title=title,
                     chat_type=chat_type,
                     telegram_status=telegram_status,
                 )
             else:
-                self.group_registry.record_presence(
+                refreshed = self.group_registry.record_presence(
                     chat_id,
                     title=title,
                     chat_type=chat_type,
                     telegram_status=telegram_status,
                     approval_required=self._approval_required,
                 )
+            self._sync_owner_card_after_presence(existing, refreshed)
+
+    def _sync_owner_card_after_presence(
+        self,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> None:
+        resolved_pending = previous.get("access_status") == "pending" and current.get("access_status") != "pending"
+        blocked_membership_changed = current.get("access_status") in {"rejected", "expired"} and previous.get(
+            "telegram_status"
+        ) != current.get("telegram_status")
+        if resolved_pending:
+            self.log.info(
+                "group approval state changed chat_id=%s request_id=%s access_status=%s resolution=%s",
+                current.get("chat_id"),
+                current.get("request_id"),
+                current.get("access_status"),
+                current.get("resolution"),
+            )
+        if resolved_pending or blocked_membership_changed:
+            self._update_owner_decision_card(current)
 
     def _record_group_access(
         self,
@@ -761,8 +810,9 @@ class BotApplication:
             chat_id = int(chat.id)
         except (AttributeError, TypeError, ValueError):
             return False
+        existing = self.group_registry.get_group(chat_id) or {}
+        explicit_telegram_status = telegram_status is not None
         if telegram_status is None:
-            existing = self.group_registry.get_group(chat_id) or {}
             known_status = str(existing.get("telegram_status") or "unknown")
             telegram_status = known_status if known_status in ACTIVE_TELEGRAM_STATUSES else "member"
         group = self.group_registry.record_presence(
@@ -775,7 +825,16 @@ class BotApplication:
             membership_started=membership_started,
         )
         allowed = self.group_registry.access_allowed(chat_id, self._approval_required)
+        self._sync_owner_card_after_presence(existing, group)
         if not allowed and group.get("access_status") == "pending":
+            pending_card_changed = existing.get("access_status") == "pending" and (
+                membership_started
+                or (explicit_telegram_status and existing.get("telegram_status") != group.get("telegram_status"))
+                or existing.get("added_by") != group.get("added_by")
+                or existing.get("title") != group.get("title")
+            )
+            if pending_card_changed:
+                self._update_pending_owner_card(group)
             self._send_pending_group_notice(group)
             self._flush_pending_group_notifications()
         return allowed
@@ -812,6 +871,101 @@ class BotApplication:
         suffix = f"@{username}" if username else "no username"
         return f"{name} · {suffix} · ID {actor.get('id')}"
 
+    @staticmethod
+    def _administrator_text(member: Any) -> tuple[int, str] | None:
+        status = str(getattr(member, "status", "") or "").casefold()
+        if status not in {"creator", "administrator"}:
+            return None
+        role = "Owner" if status == "creator" else "Admin"
+        custom_title = str(getattr(member, "custom_title", "") or "").strip()
+        is_anonymous = bool(getattr(member, "is_anonymous", False))
+        user = getattr(member, "user", None)
+        if is_anonymous:
+            identity = "Anonymous administrator"
+        else:
+            if user is None or bool(getattr(user, "is_bot", False)):
+                return None
+            first = str(getattr(user, "first_name", "") or "").strip()
+            last = str(getattr(user, "last_name", "") or "").strip()
+            name = f"{first} {last}".strip() or "Unknown"
+            username = str(getattr(user, "username", "") or "").strip()
+            try:
+                user_id = int(user.id)
+            except (AttributeError, TypeError, ValueError):
+                user_id = 0
+            identity = f"{name} · @{username}" if username else f"{name} · no username"
+            if user_id:
+                identity += f" · ID {user_id}"
+        title = f" ({custom_title[:64]})" if custom_title else ""
+        line = f"• {role}{title}: {identity}"
+        return (0 if status == "creator" else 1, html.escape(line, quote=False))
+
+    def _group_approval_context(self, chat_id: int) -> tuple[int | None, list[str] | None, int]:
+        member_count: int | None = None
+        administrators: list[str] | None = None
+        total_administrators = 0
+        try:
+            member_count = int(self.bot.get_chat_member_count(chat_id))
+        except Exception as exc:
+            self.log.info(
+                "group member count unavailable chat_id=%s error=%s",
+                chat_id,
+                type(exc).__name__,
+            )
+        try:
+            entries = []
+            for member in self.bot.get_chat_administrators(chat_id):
+                entry = self._administrator_text(member)
+                if entry is not None:
+                    entries.append(entry)
+            entries.sort(key=lambda item: (item[0], item[1].casefold()))
+            total_administrators = len(entries)
+            administrators = [line for _priority, line in entries[:GROUP_APPROVAL_ADMIN_LIMIT]]
+        except Exception as exc:
+            self.log.info(
+                "group administrators unavailable chat_id=%s error=%s",
+                chat_id,
+                type(exc).__name__,
+            )
+        return member_count, administrators, total_administrators
+
+    def _pending_card_text(self, group: dict[str, Any]) -> str:
+        chat_id = int(group["chat_id"])
+        title = html.escape(str(group.get("title") or "Untitled group"), quote=False)
+        actor = html.escape(self._added_by_text(group), quote=False)
+        telegram_status = html.escape(str(group.get("telegram_status") or "unknown"), quote=False)
+        member_count, administrators, total_administrators = self._group_approval_context(chat_id)
+        members = str(member_count) if member_count is not None else "unavailable"
+        lines = [
+            "<b>New group approval request</b>",
+            "",
+            f"Group: <b>{title}</b>",
+            f"Chat ID: <code>{chat_id}</code>",
+            f"Members: {members}",
+            f"Added by: {actor}",
+            f"Bot role: {telegram_status}",
+            "",
+            "<b>Management:</b>",
+        ]
+        if administrators is None:
+            lines.append("• unavailable")
+        elif not administrators:
+            lines.append("• no human administrators reported")
+        else:
+            lines.extend(administrators)
+            hidden = total_administrators - len(administrators)
+            if hidden > 0:
+                lines.append(f"• +{hidden} more administrators")
+        lines.extend(
+            [
+                "",
+                "<b>Status:</b> ⏳ Pending",
+                "",
+                "Downloads are blocked until you approve this group.",
+            ]
+        )
+        return "\n".join(lines)
+
     def _send_pending_card(self, owner_id: int, group: dict[str, Any], *, track_delivery: bool) -> bool:
         request_id = group.get("request_id")
         if not isinstance(request_id, str) or not request_id:
@@ -823,19 +977,11 @@ class BotApplication:
             or current.get("request_id") != request_id
         ):
             return False
-        title = html.escape(str(group.get("title") or "Untitled group"), quote=False)
-        actor = html.escape(self._added_by_text(group), quote=False)
-        text = (
-            "<b>New group approval request</b>\n\n"
-            f"Group: <b>{title}</b>\n"
-            f"Chat ID: <code>{int(group['chat_id'])}</code>\n"
-            f"Telegram status: {html.escape(str(group.get('telegram_status') or 'unknown'), quote=False)}\n"
-            f"Added by: {actor}\n\n"
-            "Downloads are blocked until you approve this group."
-        )
+        text = self._pending_card_text(current)
         success = False
+        sent_message: Any | None = None
         try:
-            self.bot.send_message(
+            sent_message = self.bot.send_message(
                 owner_id,
                 text,
                 parse_mode="HTML",
@@ -851,8 +997,201 @@ class BotApplication:
                 type(exc).__name__,
             )
         if track_delivery:
-            self.group_registry.mark_notification(request_id, success)
+            try:
+                message_id = int(getattr(sent_message, "message_id", 0) or 0) or None
+            except (TypeError, ValueError):
+                message_id = None
+            self.group_registry.mark_notification(
+                request_id,
+                success,
+                owner_chat_id=owner_id if success else None,
+                message_id=message_id,
+                base_text=text if success else None,
+            )
         return success
+
+    @staticmethod
+    def _message_html_text(message: Any) -> str | None:
+        if message is None:
+            return None
+        try:
+            value = getattr(message, "html_text", None)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    @staticmethod
+    def _message_not_modified(exc: Exception) -> bool:
+        description = str(getattr(exc, "description", "") or exc).casefold()
+        return "message is not modified" in description
+
+    @staticmethod
+    def _decision_status(group: dict[str, Any]) -> tuple[str, str, str]:
+        access_status = str(group.get("access_status") or "unreviewed")
+        telegram_status = str(group.get("telegram_status") or "unknown")
+        leave_failed = bool(group.get("leave_error"))
+        inactive = telegram_status in {"left", "kicked"}
+        if access_status == "approved":
+            return "approved", "✅ Approved", "Approved"
+        if access_status == "rejected":
+            if inactive:
+                return "rejected:left", "⛔ Rejected — bot is no longer in the group.", "Rejected; bot left the group"
+            if leave_failed:
+                return (
+                    "rejected:retry",
+                    "⛔ Rejected — automatic leave will be retried.",
+                    "Rejected; automatic leave will be retried",
+                )
+            return "rejected:leaving", "⛔ Rejected — leaving the group.", "Rejected; leaving the group"
+        if access_status == "expired":
+            if str(group.get("resolution") or "") == "left_before_review":
+                return "closed:left", "⚪ Closed — bot is no longer in the group.", "Closed; bot left the group"
+            if inactive:
+                return "expired:left", "⌛ Expired — bot left the group.", "Expired; bot left the group"
+            if leave_failed:
+                return (
+                    "expired:retry",
+                    "⌛ Expired — automatic leave will be retried.",
+                    "Expired; automatic leave will be retried",
+                )
+            return "expired:leaving", "⌛ Expired — leaving the group.", "Expired; leaving the group"
+        return access_status, html.escape(access_status, quote=False), access_status
+
+    @staticmethod
+    def _resolved_card_text(base_text: str | None, group: dict[str, Any], status_text: str) -> str:
+        if base_text:
+            prefix = base_text
+            for marker in ("\n\n<b>Status:</b>", "\n\nDownloads are blocked until you approve this group."):
+                if marker in prefix:
+                    prefix = prefix.split(marker, 1)[0]
+                    break
+        else:
+            title = html.escape(str(group.get("title") or "Untitled group"), quote=False)
+            prefix = (
+                "<b>Group approval request</b>\n\n"
+                f"Group: <b>{title}</b>\n"
+                f"Chat ID: <code>{int(group.get('chat_id') or 0)}</code>"
+            )
+        return f"{prefix}\n\n<b>Status:</b> {status_text}"
+
+    def _remember_callback_card(self, request_id: str, message: Any, owner_id: int) -> None:
+        try:
+            owner_chat_id = int(message.chat.id)
+            message_id = int(message.message_id)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if owner_chat_id != int(owner_id):
+            return
+        base_text = self._message_html_text(message)
+        if base_text is None:
+            group = self.group_registry.get_group_by_request_id(request_id)
+            notification = group.get("owner_notification") if isinstance(group, dict) else None
+            stored = notification.get("base_text") if isinstance(notification, dict) else None
+            base_text = stored if isinstance(stored, str) else ""
+        self.group_registry.remember_owner_card(request_id, owner_chat_id, message_id, base_text)
+
+    def _update_pending_owner_card(self, group: dict[str, Any]) -> None:
+        notification = group.get("owner_notification")
+        if not isinstance(notification, dict) or notification.get("status") != "sent":
+            return
+        try:
+            owner_chat_id = int(notification["chat_id"])
+            message_id = int(notification["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+        request_id = group.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        text = self._pending_card_text(group)
+        try:
+            self.bot.edit_message_text(
+                text,
+                chat_id=owner_chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=self._pending_markup(request_id),
+            )
+        except Exception as exc:
+            if not self._message_not_modified(exc):
+                self.log.info(
+                    "pending owner card refresh failed chat_id=%s request_id=%s error=%s",
+                    group.get("chat_id"),
+                    request_id,
+                    type(exc).__name__,
+                )
+                return
+        self.group_registry.remember_owner_card(request_id, owner_chat_id, message_id, text)
+
+    def _update_owner_decision_card(self, group: dict[str, Any], *, send_fallback: bool = True) -> None:
+        request_id = group.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        current = self.group_registry.get_group(int(group["chat_id"])) or group
+        notification = current.get("owner_notification")
+        if not isinstance(notification, dict):
+            notification = {}
+        view_state, status_html, status_plain = self._decision_status(current)
+        previous = notification.get("decision_update")
+        if isinstance(previous, dict) and previous.get("view_state") == view_state and previous.get("status") == "sent":
+            return
+        base_text = notification.get("base_text")
+        base_text = base_text if isinstance(base_text, str) and base_text else None
+        edited = False
+        edit_error: str | None = None
+        try:
+            owner_chat_id = int(notification["chat_id"])
+            message_id = int(notification["message_id"])
+        except (KeyError, TypeError, ValueError):
+            owner_chat_id = self.group_registry.owner_id()
+            message_id = None
+        if owner_chat_id is not None and message_id is not None:
+            try:
+                self.bot.edit_message_text(
+                    self._resolved_card_text(base_text, current, status_html),
+                    chat_id=owner_chat_id,
+                    message_id=message_id,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=None,
+                )
+                edited = True
+            except Exception as exc:
+                if self._message_not_modified(exc):
+                    edited = True
+                else:
+                    edit_error = type(exc).__name__
+                    self.log.warning(
+                        "owner decision card update failed chat_id=%s request_id=%s error=%s",
+                        current.get("chat_id"),
+                        request_id,
+                        edit_error,
+                    )
+        if edited:
+            self.group_registry.mark_owner_card_update(request_id, view_state, True)
+            return
+
+        fallback_already_sent = (
+            isinstance(previous, dict)
+            and previous.get("view_state") == view_state
+            and isinstance(previous.get("fallback_sent_at"), str)
+        )
+        fallback_sent = False
+        if send_fallback and owner_chat_id is not None and not fallback_already_sent:
+            title = str(current.get("title") or "Untitled group")
+            fallback_sent = self._safe_message(
+                owner_chat_id,
+                f"Group: {title} ({int(current.get('chat_id') or 0)})\nStatus: {status_plain}.",
+            )
+        self.group_registry.mark_owner_card_update(
+            request_id,
+            view_state,
+            False,
+            error=edit_error or "owner card reference unavailable",
+            fallback_sent=fallback_sent,
+        )
 
     def _flush_pending_group_notifications(self) -> None:
         owner_id = self.group_registry.owner_id()
@@ -897,24 +1236,68 @@ class BotApplication:
             if result is False:
                 raise RuntimeError("Telegram returned false")
             self.group_registry.mark_leave_attempt(chat_id, None)
+            self.log.info(
+                "blocked group left chat_id=%s access_status=%s",
+                chat_id,
+                group.get("access_status"),
+            )
         except Exception as exc:
             self.group_registry.mark_leave_attempt(chat_id, type(exc).__name__)
             self.log.warning("cannot leave blocked group chat_id=%s error=%s", chat_id, type(exc).__name__)
+        updated = self.group_registry.get_group(chat_id)
+        if updated is not None:
+            self._update_owner_decision_card(updated)
+
+    def _approve_pending_added_by_owner(self, owner_id: int) -> None:
+        for group in self.group_registry.approve_pending_added_by(owner_id):
+            self.log.info(
+                "group approval resolved chat_id=%s request_id=%s decision=approved owner_id=%s resolution=%s",
+                group.get("chat_id"),
+                group.get("request_id"),
+                owner_id,
+                group.get("resolution"),
+            )
+            self._update_owner_decision_card(group)
+            self._notify_group_approved(group)
+
+    def _repair_owner_decision_cards(self) -> None:
+        for group in self.group_registry.all_groups():
+            if group.get("access_status") not in {"approved", "rejected", "expired"}:
+                continue
+            request_id = group.get("request_id")
+            notification = group.get("owner_notification")
+            if not isinstance(request_id, str) or not isinstance(notification, dict):
+                continue
+            view_state, _status_html, _status_plain = self._decision_status(group)
+            previous = notification.get("decision_update")
+            if (
+                isinstance(previous, dict)
+                and previous.get("view_state") == view_state
+                and (previous.get("status") == "sent" or isinstance(previous.get("fallback_sent_at"), str))
+            ):
+                continue
+            self._update_owner_decision_card(group)
 
     def _maintain_group_access(self, *, flush_notifications: bool = True) -> None:
         if not self._approval_required:
             return
         owner_id = self.group_registry.owner_id()
         if owner_id is not None:
-            for group in self.group_registry.approve_pending_added_by(owner_id):
-                self._notify_group_approved(group)
+            self._approve_pending_added_by_owner(owner_id)
         newly_expired = self.group_registry.expire_pending(self.settings.pending_group_ttl_hours)
         for group in newly_expired:
+            self.log.info(
+                "group approval expired chat_id=%s request_id=%s resolution=%s",
+                group.get("chat_id"),
+                group.get("request_id"),
+                group.get("resolution"),
+            )
             self._leave_blocked_group(group, notify=True)
         for group in self.group_registry.pending_groups():
             self._send_pending_group_notice(group)
         for group in self.group_registry.blocked_groups_for_leave(retry_after_seconds=GROUP_NOTIFICATION_RETRY_SECONDS):
             self._leave_blocked_group(group, notify=False)
+        self._repair_owner_decision_cards()
         if flush_notifications:
             self._flush_pending_group_notifications()
 
@@ -935,8 +1318,7 @@ class BotApplication:
                 "Owner access is now bound to this Telegram account. Use /groups or /pending_groups.",
             )
             self._set_owner_commands(user_id)
-        for group in self.group_registry.approve_pending_added_by(user_id):
-            self._notify_group_approved(group)
+        self._approve_pending_added_by_owner(user_id)
         self._flush_pending_group_notifications()
         return True
 
@@ -994,18 +1376,12 @@ class BotApplication:
         self._refresh_group_registry()
         self._maintain_group_access()
         current = self.group_registry.current_groups()
-        uncertain = [group for group in self.group_registry.all_groups() if group.get("telegram_status") == "unknown"]
         self._send_long_html(
             owner_id,
             [
                 ("Approved", [group for group in current if group.get("access_status") == "approved"]),
                 ("Pending", [group for group in current if group.get("access_status") == "pending"]),
-                (
-                    "Blocked; leave will be retried",
-                    [group for group in current if group.get("access_status") in BLOCKED_ACCESS_STATUSES],
-                ),
                 ("Unreviewed", [group for group in current if group.get("access_status") == "unreviewed"]),
-                ("Membership could not be verified", uncertain),
             ],
         )
 
@@ -1046,6 +1422,8 @@ class BotApplication:
         if not self.group_registry.is_owner(user_id):
             self._answer_callback(callback_id, "Not authorized.", alert=True)
             return
+        message = getattr(call, "message", None)
+        self._remember_callback_card(parts[2], message, user_id)
         decision = "approved" if parts[1] == "a" else "rejected"
         result, group = self.group_registry.resolve_request(parts[2], decision, user_id)
         if result == "not_found" or group is None:
@@ -1053,15 +1431,24 @@ class BotApplication:
             return
         if result == "already_resolved":
             current = str(group.get("access_status") or "resolved")
+            self._update_owner_decision_card(group)
             self._answer_callback(callback_id, f"Already {current}.")
             return
+        self.log.info(
+            "group approval resolved chat_id=%s request_id=%s decision=%s owner_id=%s",
+            group.get("chat_id"),
+            parts[2],
+            decision,
+            user_id,
+        )
         if decision == "approved":
+            self._update_owner_decision_card(group)
             self._notify_group_approved(group)
             self._answer_callback(callback_id, "Group approved.")
         else:
+            self._update_owner_decision_card(group, send_fallback=False)
             self._leave_blocked_group(group, notify=True)
             self._answer_callback(callback_id, "Group rejected.")
-        message = getattr(call, "message", None)
         with suppress(Exception):
             self.bot.edit_message_reply_markup(message.chat.id, message.message_id, reply_markup=None)
 

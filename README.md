@@ -318,13 +318,18 @@ When someone adds the bot to a new group:
 
 1. the group is recorded immediately in `data/groups.json`;
 2. all link processing is blocked before URL validation, reactions, queues, or website requests;
-3. the owner receives a private Approve/Reject request;
-4. rejection makes the bot leave immediately;
-5. an unanswered request expires after the configured TTL and the bot leaves.
+3. the owner receives a private Approve/Reject request with the member count, the adding user when Telegram provides it, the bot's role, and a compact list of human administrators;
+4. the same request message is updated with the final decision, so approval history remains visible after its buttons disappear;
+5. rejection makes the bot leave immediately;
+6. if the request message cannot be edited or group details cannot be fetched, the decision and access policy still succeed and the owner receives a compact fallback status;
+7. failed leave attempts are retried, and the saved request message is updated after a later successful attempt;
+8. an unanswered request expires after the configured TTL and the bot leaves.
 
 If the bound owner adds the bot personally, that group is approved automatically. Previously approved groups remain approved when re-added. Notification delivery and failed leave attempts are retried safely in the background.
 
-Use `/groups` in the owner's private chat for the current, API-refreshed membership registry. `/pending_groups` shows only requests awaiting a decision. Telegram does not provide bots with an API that enumerates every group retrospectively, so the registry is built from membership updates, observed group messages, existing local chat records, and the optional verified bootstrap described below.
+Use `/groups` in the owner's private chat for groups whose current membership is confirmed and whose access state has not been rejected or expired. Rejected and departed groups remain in the durable registry and decision-message history but do not clutter this command. `/pending_groups` shows only requests awaiting a decision.
+
+Telegram exposes the current member count and administrators, but it does not provide bots with an API that enumerates every regular member or every group retrospectively. The group registry is therefore built from membership updates, observed group messages, existing local chat records, and the optional verified bootstrap described below. Missing member-count or administrator data is shown as unavailable and never blocks an approval request.
 
 #### Enabling approval on an existing bot
 

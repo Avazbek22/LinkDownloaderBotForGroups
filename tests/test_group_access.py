@@ -9,6 +9,13 @@ import main
 from app.settings import Settings
 
 
+class TelegramError(RuntimeError):
+    def __init__(self, error_code: int, description: str) -> None:
+        super().__init__(description)
+        self.error_code = error_code
+        self.description = description
+
+
 class GroupBot:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str, dict]] = []
@@ -16,9 +23,13 @@ class GroupBot:
         self.left: list[int] = []
         self.callback_answers: list[tuple[object, str, bool]] = []
         self.command_sets: list[tuple[list, object]] = []
+        self.edited_messages: list[tuple[int, int, str, dict]] = []
         self.members: dict[int, object] = {}
+        self.member_counts: dict[int, object] = {}
+        self.administrators: dict[int, object] = {}
         self.chats: dict[int, object] = {}
         self.fail_owner_cards = False
+        self.fail_edit = False
         self.fail_leave = False
 
     def send_message(self, chat_id, text, **kwargs):
@@ -47,6 +58,18 @@ class GroupBot:
             raise value
         return value
 
+    def get_chat_member_count(self, chat_id):
+        value = self.member_counts.get(int(chat_id), 3)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_chat_administrators(self, chat_id):
+        value = self.administrators.get(int(chat_id), [])
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     def leave_chat(self, chat_id):
         if self.fail_leave:
             raise RuntimeError("leave failed")
@@ -57,6 +80,12 @@ class GroupBot:
         self.callback_answers.append((callback_id, text, show_alert))
 
     def edit_message_reply_markup(self, *_args, **_kwargs):
+        return True
+
+    def edit_message_text(self, text, *, chat_id, message_id, **kwargs):
+        if self.fail_edit:
+            raise RuntimeError("edit failed")
+        self.edited_messages.append((int(chat_id), int(message_id), text, kwargs))
         return True
 
     def set_my_commands(self, commands, scope=None, **_kwargs):
@@ -129,7 +158,17 @@ def _callback(request_id: str, user_id: int, action: str) -> SimpleNamespace:
         id=f"callback-{user_id}-{action}",
         data=f"ga:{action}:{request_id}",
         from_user=_user(user_id, f"user_{user_id}"),
-        message=SimpleNamespace(chat=SimpleNamespace(id=user_id), message_id=9),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=user_id),
+            message_id=9,
+            html_text=(
+                "<b>New group approval request</b>\n\n"
+                "Group: <b>New group</b>\n"
+                "Chat ID: <code>-1001</code>\n\n"
+                "<b>Status:</b> ⏳ Pending\n\n"
+                "Downloads are blocked until you approve this group."
+            ),
+        ),
     )
 
 
@@ -336,3 +375,244 @@ def test_membership_and_callback_handlers_are_registered(tmp_path) -> None:
 
     assert len(app.bot.my_chat_member_handlers) == 1
     assert len(app.bot.callback_query_handlers) == 1
+
+
+def test_pending_card_contains_member_count_and_human_administrator_roles(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    bot.member_counts[-1001] = 148
+    bot.administrators[-1001] = [
+        SimpleNamespace(status="administrator", custom_title="Moderator & helper", user=_user(8, "bob")),
+        SimpleNamespace(status="creator", custom_title=None, user=_user(7, "alice")),
+        SimpleNamespace(status="administrator", custom_title=None, user=_user(500, "downloader", is_bot=True)),
+        SimpleNamespace(
+            status="administrator",
+            custom_title=None,
+            is_anonymous=True,
+            user=_user(1087968824, "GroupAnonymousBot", is_bot=True),
+        ),
+    ]
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+
+    app._handle_my_chat_member(_membership_update(-1001, _user(9, "adder")))
+
+    card = next(text for chat_id, text, kwargs in bot.messages if chat_id == 42 and kwargs.get("reply_markup"))
+    assert "Members: 148" in card
+    assert "• Owner: Test User · @alice · ID 7" in card
+    assert "• Admin (Moderator &amp; helper): Test User · @bob · ID 8" in card
+    assert "Anonymous administrator" in card
+    assert "@downloader" not in card
+    assert "<b>Status:</b> ⏳ Pending" in card
+
+
+def test_pending_card_keeps_working_when_group_context_is_unavailable(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    bot.member_counts[-1001] = RuntimeError("count unavailable")
+    bot.administrators[-1001] = RuntimeError("administrators unavailable")
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+
+    app._handle_my_chat_member(_membership_update(-1001, _user(9, "adder")))
+
+    card = next(text for chat_id, text, kwargs in bot.messages if chat_id == 42 and kwargs.get("reply_markup"))
+    assert "Members: unavailable" in card
+    assert "<b>Management:</b>\n• unavailable" in card
+    assert app.group_registry.get_group(-1001)["access_status"] == "pending"
+
+
+def test_late_membership_actor_refreshes_an_existing_pending_card(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._record_group_access(SimpleNamespace(id=-1001, title="New group", type="supergroup"))
+    assert "Added by: Unknown" in next(
+        text for chat_id, text, kwargs in bot.messages if chat_id == 42 and kwargs.get("reply_markup")
+    )
+
+    app._handle_my_chat_member(_membership_update(-1001, _user(9, "adder")))
+
+    assert bot.edited_messages
+    assert "Added by: Test User · @adder · ID 9" in bot.edited_messages[-1][2]
+    assert bot.edited_messages[-1][3]["reply_markup"] is not None
+
+
+def test_approve_edits_the_clicked_card_and_preserves_the_decision_record(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+
+    assert bot.edited_messages[-1][0:2] == (42, 9)
+    assert "<b>Status:</b> ✅ Approved" in bot.edited_messages[-1][2]
+    assert bot.edited_messages[-1][3]["reply_markup"] is None
+    notification = app.group_registry.get_group(-1001)["owner_notification"]
+    assert notification["base_text"]
+    assert notification["decision_update"]["view_state"] == "approved"
+    assert notification["decision_update"]["status"] == "sent"
+
+
+def test_reject_edits_card_with_final_leave_status_and_groups_hides_rejected(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+
+    app._handle_group_access_callback(_callback(request_id, 42, "r"))
+
+    group = app.group_registry.get_group(-1001)
+    assert group["access_status"] == "rejected"
+    assert group["telegram_status"] == "left"
+    assert "⛔ Rejected — bot is no longer in the group." in bot.edited_messages[-1][2]
+    assert bot.edited_messages[-1][3]["reply_markup"] is None
+    assert group["owner_notification"]["decision_update"]["view_state"] == "rejected:left"
+
+    bot.members[-1001] = TelegramError(403, "Forbidden: bot is not a member of the supergroup chat")
+    app._show_groups(42)
+    report = next(
+        text for chat_id, text, _kwargs in reversed(bot.messages) if chat_id == 42 and "Current bot groups" in text
+    )
+    assert "New group" not in report
+    assert "No group membership is currently confirmed." in report
+
+
+def test_failed_leave_updates_card_then_successful_retry_updates_it_again(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    bot.fail_leave = True
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+
+    app._handle_group_access_callback(_callback(request_id, 42, "r"))
+
+    assert "automatic leave will be retried" in bot.edited_messages[-1][2]
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "member"
+
+    bot.fail_leave = False
+    monkeypatch.setattr(main, "GROUP_NOTIFICATION_RETRY_SECONDS", 0)
+    app._maintain_group_access()
+
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    assert "bot is no longer in the group" in bot.edited_messages[-1][2]
+
+
+def test_owner_receives_fallback_result_when_card_cannot_be_edited(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    bot.fail_edit = True
+
+    app._handle_group_access_callback(_callback(request_id, 42, "r"))
+
+    fallback = [text for chat_id, text, kwargs in bot.messages if chat_id == 42 and kwargs.get("reply_markup") is None]
+    assert any("Status: Rejected; bot left the group." in text for text in fallback)
+    update = app.group_registry.get_group(-1001)["owner_notification"]["decision_update"]
+    assert update["view_state"] == "rejected:left"
+    assert update["status"] == "failed"
+    assert "fallback_sent_at" in update
+
+
+def test_definitive_not_member_error_is_recorded_as_left_but_other_errors_stay_unknown(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app.group_registry.record_bootstrap_result(
+        -1001,
+        title="Gone",
+        chat_type="supergroup",
+        telegram_status="administrator",
+    )
+    app.group_registry.record_bootstrap_result(
+        -1002,
+        title="Uncertain",
+        chat_type="supergroup",
+        telegram_status="administrator",
+    )
+    bot.members[-1001] = TelegramError(403, "Forbidden: bot is not a member of the supergroup chat")
+    bot.members[-1002] = RuntimeError("temporary network problem")
+
+    app._refresh_group_registry()
+
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    assert app.group_registry.get_group(-1002)["telegram_status"] == "unknown"
+
+
+def test_membership_refresh_closes_pending_card_when_bot_is_already_gone(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    bot.members[-1001] = TelegramError(403, "Forbidden: bot is not a member of the supergroup chat")
+
+    app._refresh_group_registry()
+
+    group = app.group_registry.get_group(-1001)
+    assert group["access_status"] == "expired"
+    assert group["resolution"] == "left_before_review"
+    assert group["telegram_status"] == "left"
+    assert "⚪ Closed — bot is no longer in the group." in bot.edited_messages[-1][2]
+    assert bot.edited_messages[-1][3]["reply_markup"] is None
+
+
+def test_clicking_a_stale_duplicate_card_shows_the_original_decision(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+    duplicate = _callback(request_id, 42, "r")
+    duplicate.message.message_id = 99
+
+    app._handle_group_access_callback(duplicate)
+
+    assert app.group_registry.get_group(-1001)["access_status"] == "approved"
+    assert bot.edited_messages[-1][0:2] == (42, 99)
+    assert "<b>Status:</b> ✅ Approved" in bot.edited_messages[-1][2]
+    assert "Already approved" in bot.callback_answers[-1][1]
+
+
+def test_maintenance_repairs_a_card_after_a_crash_between_leave_and_final_edit(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    group = app.group_registry.get_group(-1001)
+    request_id = group["request_id"]
+    app.group_registry.resolve_request(request_id, "rejected", 42)
+    app._update_owner_decision_card(app.group_registry.get_group(-1001))
+    assert "leaving the group" in bot.edited_messages[-1][2]
+    app.group_registry.mark_leave_attempt(-1001, None)
+    bot.edited_messages.clear()
+
+    app._maintain_group_access()
+
+    assert "bot is no longer in the group" in bot.edited_messages[-1][2]
+    assert app.group_registry.get_group(-1001)["owner_notification"]["decision_update"]["view_state"] == "rejected:left"

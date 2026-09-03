@@ -139,6 +139,55 @@ def test_resolution_is_idempotent_and_does_not_allow_decision_reversal(tmp_path)
     assert unchanged["access_status"] == "approved"
 
 
+def test_resolution_preserves_owner_card_for_durable_status_updates(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    group = registry.record_presence(
+        -1001,
+        title="Pending",
+        chat_type="supergroup",
+        telegram_status="member",
+        approval_required=True,
+    )
+    request_id = group["request_id"]
+    assert registry.mark_notification(
+        request_id,
+        True,
+        owner_chat_id=42,
+        message_id=9,
+        base_text="original card",
+    )
+
+    registry.resolve_request(request_id, "rejected", 42)
+
+    notification = registry.get_group(-1001)["owner_notification"]
+    assert notification["chat_id"] == 42
+    assert notification["message_id"] == 9
+    assert notification["base_text"] == "original card"
+    assert registry.mark_owner_card_update(request_id, "rejected:leaving", True)
+    assert registry.get_group(-1001)["owner_notification"]["decision_update"]["status"] == "sent"
+
+
+def test_remembering_another_copy_of_a_resolved_card_makes_it_updateable(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    group = registry.record_presence(
+        -1001,
+        title="Pending",
+        chat_type="supergroup",
+        telegram_status="member",
+        approval_required=True,
+    )
+    request_id = group["request_id"]
+    registry.resolve_request(request_id, "approved", 42)
+    registry.mark_owner_card_update(request_id, "approved", True)
+
+    assert registry.remember_owner_card(request_id, 42, 99, "duplicate card")
+
+    notification = registry.get_group(-1001)["owner_notification"]
+    assert notification["message_id"] == 99
+    assert notification["base_text"] == "duplicate card"
+    assert "decision_update" not in notification
+
+
 def test_pending_expiry_survives_restart_and_approved_groups_survive_readd(tmp_path) -> None:
     started = datetime(2026, 1, 1, tzinfo=UTC)
     registry = GroupRegistry(tmp_path, "owner_name", "approval")

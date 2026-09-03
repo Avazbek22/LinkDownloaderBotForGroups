@@ -185,7 +185,6 @@ class GroupRegistry:
         if owner_id is not None:
             group["resolved_by"] = int(owner_id)
         group["pending_since"] = None
-        group["owner_notification"] = None
 
     def record_presence(
         self,
@@ -257,7 +256,6 @@ class GroupRegistry:
                 group["resolved_at"] = timestamp
                 group["resolution"] = "left_before_review"
                 group["pending_since"] = None
-                group["owner_notification"] = None
             result = copy.deepcopy(group)
 
         self.store.update(mutate)
@@ -272,6 +270,12 @@ class GroupRegistry:
     def get_group(self, chat_id: int) -> dict[str, Any] | None:
         group = self.store.snapshot().get("groups", {}).get(str(int(chat_id)))
         return group if isinstance(group, dict) else None
+
+    def get_group_by_request_id(self, request_id: str) -> dict[str, Any] | None:
+        for group in self.store.snapshot().get("groups", {}).values():
+            if isinstance(group, dict) and group.get("request_id") == request_id:
+                return group
+        return None
 
     def claim_pending_notifications(
         self,
@@ -365,7 +369,16 @@ class GroupRegistry:
 
         self.store.update(mutate)
 
-    def mark_notification(self, request_id: str, success: bool, *, now: datetime | None = None) -> bool:
+    def mark_notification(
+        self,
+        request_id: str,
+        success: bool,
+        *,
+        owner_chat_id: int | None = None,
+        message_id: int | None = None,
+        base_text: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
         found = False
         timestamp = _timestamp(now)
 
@@ -385,6 +398,89 @@ class GroupRegistry:
                 notification["status"] = "sent" if success else "failed"
                 if success:
                     notification["sent_at"] = timestamp
+                    if isinstance(owner_chat_id, int):
+                        notification["chat_id"] = owner_chat_id
+                    if isinstance(message_id, int):
+                        notification["message_id"] = message_id
+                    if isinstance(base_text, str) and base_text:
+                        notification["base_text"] = base_text[:4000]
+                found = True
+                return
+
+        self.store.update(mutate)
+        return found
+
+    def remember_owner_card(
+        self,
+        request_id: str,
+        owner_chat_id: int,
+        message_id: int,
+        base_text: str,
+    ) -> bool:
+        """Remember the exact card used for a decision before resolving it."""
+        found = False
+
+        def mutate(data: dict[str, Any]) -> None:
+            nonlocal found
+            for group in data.setdefault("groups", {}).values():
+                if not isinstance(group, dict) or group.get("request_id") != request_id:
+                    continue
+                notification = group.get("owner_notification")
+                if not isinstance(notification, dict):
+                    notification = {}
+                    group["owner_notification"] = notification
+                card_changed = notification.get("chat_id") != int(owner_chat_id) or notification.get(
+                    "message_id"
+                ) != int(message_id)
+                notification["chat_id"] = int(owner_chat_id)
+                notification["message_id"] = int(message_id)
+                if base_text:
+                    notification["base_text"] = str(base_text)[:4000]
+                if card_changed:
+                    notification.pop("decision_update", None)
+                found = True
+                return
+
+        self.store.update(mutate)
+        return found
+
+    def mark_owner_card_update(
+        self,
+        request_id: str,
+        view_state: str,
+        success: bool,
+        *,
+        error: str | None = None,
+        fallback_sent: bool = False,
+        now: datetime | None = None,
+    ) -> bool:
+        found = False
+        timestamp = _timestamp(now)
+
+        def mutate(data: dict[str, Any]) -> None:
+            nonlocal found
+            for group in data.setdefault("groups", {}).values():
+                if not isinstance(group, dict) or group.get("request_id") != request_id:
+                    continue
+                notification = group.get("owner_notification")
+                if not isinstance(notification, dict):
+                    notification = {}
+                    group["owner_notification"] = notification
+                previous = notification.get("decision_update")
+                update = {
+                    "view_state": str(view_state),
+                    "status": "sent" if success else "failed",
+                    "last_attempt_at": timestamp,
+                }
+                if error:
+                    update["last_error"] = str(error)[:500]
+                if fallback_sent:
+                    update["fallback_sent_at"] = timestamp
+                elif isinstance(previous, dict) and previous.get("view_state") == view_state:
+                    prior_fallback = previous.get("fallback_sent_at")
+                    if isinstance(prior_fallback, str):
+                        update["fallback_sent_at"] = prior_fallback
+                notification["decision_update"] = update
                 found = True
                 return
 
@@ -419,7 +515,6 @@ class GroupRegistry:
                         group["resolved_by"] = int(owner_id)
                         group["resolution"] = "owner_rejected"
                         group["pending_since"] = None
-                        group["owner_notification"] = None
                     result = "resolved"
                 else:
                     result = "already_resolved"
@@ -464,7 +559,6 @@ class GroupRegistry:
                 group["resolved_at"] = timestamp
                 group["resolution"] = "approval_timeout"
                 group["pending_since"] = None
-                group["owner_notification"] = None
                 expired.append(copy.deepcopy(group))
 
         self.store.update(mutate)
