@@ -16,7 +16,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_help": (
             "<b>How to use</b>\n"
             "Post a video link. 👀 means it is being processed, 🙈 means Instagram hid or restricted the content, "
-            "and 👎 means it failed. "
+            "🤷 means no video was found, and 👎 means it failed. "
             "Add the same 🙈 or 👎 reaction yourself to retry a failed link. "
             "I will publish the video silently and delete the original message after success.\n\n"
             "<b>Personal opt-out</b>\n"
@@ -64,7 +64,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_help": (
             "<b>Как пользоваться</b>\n"
             "Отправьте ссылку на видео. 👀 означает, что ссылка обрабатывается, 🙈 — что Instagram скрыл или "
-            "ограничил контент, а 👎 — что скачать не удалось. "
+            "ограничил контент, 🤷 — что видео не найдено, а 👎 — что скачать не удалось. "
             "Добавьте такую же реакцию 🙈 или 👎, чтобы повторить неудачную загрузку. "
             "Я тихо опубликую видео, а после успеха удалю исходное сообщение.\n\n"
             "<b>Персональное отключение</b>\n"

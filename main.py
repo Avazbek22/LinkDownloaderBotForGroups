@@ -260,7 +260,7 @@ class BotApplication:
                 first.job_id,
                 safe_url_for_log(first.url),
             )
-            self._after_probe_failure_many(self.coordinator.abort(flight))
+            self._after_non_video_many(self.coordinator.abort(flight))
             return
 
         media_key = f"{metadata.media_key}:mp4-h264-v2:{self.settings.max_filesize}"
@@ -446,6 +446,15 @@ class BotApplication:
     def _after_instagram_restriction_many(self, jobs: list[Job]) -> None:
         for job in jobs:
             self._after_instagram_restriction(job)
+
+    def _after_non_video(self, job: Job) -> None:
+        self._forget_failed_retry(job)
+        if not self._set_status_reaction(job, "🤷"):
+            self._clear_status_reaction(job)
+
+    def _after_non_video_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            self._after_non_video(job)
 
     def _clear_status_many(self, jobs: list[Job]) -> None:
         for job in jobs:

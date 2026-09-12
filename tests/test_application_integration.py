@@ -566,7 +566,7 @@ def test_instagram_content_restriction_replaces_eyes_with_monkey(tmp_path, monke
     assert fake.deletes == []
 
 
-def test_non_video_metadata_clears_eyes_without_downvote(tmp_path, monkeypatch) -> None:
+def test_non_video_metadata_replaces_eyes_with_non_video_reaction(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()
     app.bot = fake
@@ -593,6 +593,47 @@ def test_non_video_metadata_clears_eyes_without_downvote(tmp_path, monkeypatch) 
         },
         media_key="generic:article",
         source_name="News",
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "🤷"]
+    assert fake.sends == []
+    assert fake.deletes == []
+
+
+def test_unavailable_non_video_reaction_clears_stale_eyes(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+
+    class RestrictedBot(FakeBot):
+        def set_message_reaction(self, chat_id, message_id, reaction, **kwargs):
+            if reaction and reaction[0].emoji == "🤷":
+                raise RuntimeError("reaction not allowed")
+            return super().set_message_reaction(chat_id, message_id, reaction, **kwargs)
+
+    fake = RestrictedBot()
+    app.bot = fake
+    job = Job(
+        "photo",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/photo",
+        "https://example.com/photo",
+        "User",
+        True,
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    metadata = MediaMetadata(
+        url=job.url,
+        info={"id": "photo", "extractor": "Generic", "formats": []},
+        media_key="generic:photo",
+        source_name="Example",
     )
     monkeypatch.setattr(main, "validate_public_url", lambda url: url)
     monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)

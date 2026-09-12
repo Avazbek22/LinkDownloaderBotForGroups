@@ -65,6 +65,7 @@ Instead, it uses reactions:
 |---|---|
 | 👀 | The link is being processed |
 | 🙈 | Instagram hid or restricted the content from the bot |
+| 🤷 | The link was checked, but no video was found |
 | 👎 | The download failed |
 | 👍 | The video was posted, but the original link was kept |
 
@@ -72,7 +73,7 @@ When the bot leaves 🙈 or 👎, a group member can add the same reaction to re
 be a group administrator to receive reaction updates. A retry replaces the bot's failure reaction with 👀 and
 runs through the normal queue, validation, and download pipeline again.
 
-If the link turns out to be an ordinary article or another page without video, the bot simply removes 👀 and leaves the message untouched.
+If the link turns out to be an ordinary article, an image post, or another page without video, the bot replaces 👀 with 🤷 and leaves the message untouched.
 
 When everything succeeds, the original link can be removed automatically.
 
@@ -293,7 +294,7 @@ The most useful options are:
 | `MAX_QUEUE` | `200` | Number of waiting requests |
 | `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
 | `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
-| `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 👎, and 👍 reactions |
+| `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 🤷, 👎, and 👍 reactions |
 | `GROUP_ACCESS_MODE` | `open` | Use `approval` to block unapproved groups |
 | `GROUP_OWNER_USERNAME` | empty | Telegram username used for the initial owner binding |
 | `PENDING_GROUP_TTL_HOURS` | `168` | Time before an unapproved group is left |
