@@ -1449,6 +1449,7 @@ class BotApplication:
                 [
                     telebot.types.BotCommand("start", "Show instructions"),
                     telebot.types.BotCommand("help", "Show instructions"),
+                    telebot.types.BotCommand("skip", "Leave one link untouched"),
                     telebot.types.BotCommand("en", "Switch to English (admins)"),
                     telebot.types.BotCommand("ru", "Переключить на русский (админы)"),
                     telebot.types.BotCommand("settings", "Show group settings"),
@@ -2039,13 +2040,16 @@ class BotApplication:
                 return
             if not self._record_group_access(message.chat):
                 return
-            group = self.group_registry.get_group(int(message.chat.id)) or {}
-            if group.get("resolution") in {"owner_approved", "added_by_owner"}:
-                self._welcome_group(int(message.chat.id), getattr(message, "message_thread_id", None))
             if getattr(message.from_user, "is_bot", False):
                 return
             text = message.text or message.caption or ""
-            if not text.strip() or text.lstrip().startswith("/"):
+            command = self._group_command(text, self.bot_username)
+            if command == "skip":
+                return
+            group = self.group_registry.get_group(int(message.chat.id)) or {}
+            if group.get("resolution") in {"owner_approved", "added_by_owner"}:
+                self._welcome_group(int(message.chat.id), getattr(message, "message_thread_id", None))
+            if not text.strip() or command is not None:
                 return
             chat_id = int(message.chat.id)
             user_id = int(message.from_user.id)
@@ -2101,6 +2105,20 @@ class BotApplication:
             if job is not None:
                 self._clear_status_reaction(job)
             self.log.exception("group handler failed chat_id=%s", getattr(message.chat, "id", None))
+
+    @staticmethod
+    def _group_command(text: str, bot_username: str | None) -> str | None:
+        stripped = (text or "").lstrip()
+        if not stripped.startswith("/"):
+            return None
+        token = stripped.split(maxsplit=1)[0]
+        match = re.fullmatch(r"/([a-z0-9_]+)(?:@([a-z0-9_]+))?", token, re.IGNORECASE)
+        if match is None:
+            return ""
+        command, target = (part.lower() if part else "" for part in match.groups())
+        if target and target != (bot_username or "").lower():
+            return ""
+        return command
 
     @staticmethod
     def _self_mention(text: str, username: str | None) -> bool:

@@ -292,6 +292,67 @@ def test_self_mention_requires_a_message_token() -> None:
     assert not main.BotApplication._self_mention("https://example.com/@alice/video", "alice")
 
 
+def test_group_command_recognizes_only_commands_for_this_bot() -> None:
+    assert main.BotApplication._group_command(" /SKIP https://example.com", "downloader") == "skip"
+    assert main.BotApplication._group_command("/skip@Downloader https://example.com", "downloader") == "skip"
+    assert main.BotApplication._group_command("/skip@another_bot https://example.com", "downloader") == ""
+    assert main.BotApplication._group_command("https://example.com /skip", "downloader") is None
+
+
+def test_skip_command_leaves_message_completely_untouched(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.bot_username = "downloader"
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="/skip@Downloader https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_public_url",
+        lambda _url: (_ for _ in ()).throw(AssertionError("skip must not validate the URL")),
+    )
+
+    app._handle_group_message(message)
+
+    assert app.queue.empty()
+    assert fake.reactions == []
+    assert fake.sends == []
+    assert fake.deletes == []
+    assert fake.messages == []
+    assert not app.storage.is_opted_out(-100, 7)
+
+
+def test_command_for_another_bot_never_downloads_its_link(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.bot_username = "downloader"
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="/skip@another_bot https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_public_url",
+        lambda _url: (_ for _ in ()).throw(AssertionError("foreign commands must be ignored")),
+    )
+
+    app._handle_group_message(message)
+
+    assert app.queue.empty()
+    assert fake.reactions == []
+    assert fake.sends == []
+    assert fake.deletes == []
+
+
 def test_status_reaction_lifecycle_for_retained_link(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()

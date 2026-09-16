@@ -224,12 +224,21 @@ https://www.youtube.com/watch?v=...
 
 No command is required.
 
+To publish one link without triggering the bot, put `/skip` before it:
+
+```text
+/skip https://www.youtube.com/watch?v=...
+```
+
+The bot stays completely silent for that message: it does not validate or download the URL, add a reaction, delete the message, or change the sender's personal preference. In groups, Telegram's explicit `/skip@BotName <link>` form works as well.
+
 ### Commands
 
 | Command | What it does |
 |---|---|
 | `/start` | Show the introduction |
 | `/help` | Show usage instructions |
+| `/skip <link>` | Leave one link untouched without changing personal settings |
 | `/en` | Change the group language to English |
 | `/ru` | Change the group language to Russian |
 | `/settings` | Show group settings |
