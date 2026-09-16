@@ -682,6 +682,91 @@ def test_definitive_not_member_error_is_recorded_as_left_but_other_errors_stay_u
     assert app.group_registry.get_group(-1002)["telegram_status"] == "unknown"
 
 
+def test_indeterminate_refresh_keeps_rejected_group_terminal_and_silent(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "r"))
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    bot.messages.clear()
+    bot.edited_messages.clear()
+    bot.left.clear()
+    bot.fail_edit = True
+    bot.members[-1001] = RuntimeError("temporary network problem")
+
+    app._refresh_group_registry()
+    app._maintain_group_access()
+
+    group = app.group_registry.get_group(-1001)
+    assert group["telegram_status"] == "left"
+    assert group["owner_notification"]["decision_update"]["view_state"] == "rejected:left"
+    assert bot.messages == []
+    assert bot.edited_messages == []
+    assert bot.left == []
+
+    bot.members[-1001] = SimpleNamespace(status="unknown")
+    app._refresh_group_registry()
+    app._maintain_group_access()
+
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    assert bot.messages == []
+    assert bot.edited_messages == []
+    assert bot.left == []
+
+
+def test_indeterminate_refresh_keeps_hard_revocation_terminal_and_silent(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+    app._handle_group_management_callback(_management_callback(-1001, 42, "x"))
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    bot.messages.clear()
+    bot.edited_messages.clear()
+    bot.left.clear()
+    bot.fail_edit = True
+    bot.members[-1001] = RuntimeError("temporary network problem")
+
+    app._refresh_group_registry()
+    app._maintain_group_access()
+
+    group = app.group_registry.get_group(-1001)
+    assert group["telegram_status"] == "left"
+    assert group["owner_notification"]["decision_update"]["view_state"] == "approved:hard:left"
+    assert bot.messages == []
+    assert bot.edited_messages == []
+    assert bot.left == []
+
+
+def test_confirmed_readdition_of_rejected_group_is_still_left_again(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "r"))
+    bot.left.clear()
+    bot.members[-1001] = SimpleNamespace(status="member")
+    monkeypatch.setattr(main, "GROUP_NOTIFICATION_RETRY_SECONDS", 0)
+
+    app._refresh_group_registry()
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "member"
+    app._maintain_group_access()
+
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    assert bot.left == [-1001]
+
+
 def test_membership_refresh_closes_pending_card_when_bot_is_already_gone(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
     bot = GroupBot()

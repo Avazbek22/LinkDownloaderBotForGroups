@@ -815,8 +815,6 @@ class GroupRegistry:
             normalized_type = str(chat_type or "").strip().lower()
             if normalized_type in {"group", "supergroup"}:
                 group["type"] = normalized_type
-            group["last_seen_at"] = timestamp
-            group["telegram_status"] = status
             bootstrap = group.get("bootstrap")
             if not isinstance(bootstrap, dict):
                 bootstrap = {}
@@ -825,6 +823,8 @@ class GroupRegistry:
             if error:
                 bootstrap["last_error"] = str(error)[:500]
             else:
+                group["last_seen_at"] = timestamp
+                group["telegram_status"] = status
                 bootstrap["status"] = status
                 valid_active_group = status in ACTIVE_TELEGRAM_STATUSES and group.get("type") in {
                     "group",

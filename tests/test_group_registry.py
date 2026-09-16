@@ -398,6 +398,21 @@ def test_bootstrap_approves_only_api_verified_active_membership(tmp_path) -> Non
     assert not registry.bootstrap_completed(-1004)
 
 
+def test_failed_bootstrap_verification_preserves_confirmed_inactive_membership(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    registry.record_bootstrap_result(
+        -1001,
+        title="Gone",
+        chat_type="supergroup",
+        telegram_status="left",
+    )
+
+    refreshed = registry.record_bootstrap_result(-1001, error="TemporaryTelegramError")
+
+    assert refreshed["telegram_status"] == "left"
+    assert refreshed["bootstrap"]["last_error"] == "TemporaryTelegramError"
+
+
 def test_chat_migration_keeps_approval_and_removes_old_record(tmp_path) -> None:
     registry = GroupRegistry(tmp_path, "owner_name", "approval")
     group = registry.record_presence(

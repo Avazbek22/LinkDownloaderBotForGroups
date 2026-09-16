@@ -25,7 +25,7 @@ from app.download_backend import (
     find_downloaded_file,
     has_downloadable_video,
 )
-from app.group_registry import ACTIVE_TELEGRAM_STATUSES, GroupRegistry
+from app.group_registry import ACTIVE_TELEGRAM_STATUSES, GroupRegistry, normalize_telegram_status
 from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job
 from app.logging_setup import configure_logging
@@ -784,6 +784,15 @@ class BotApplication:
             return "left"
         return None
 
+    @staticmethod
+    def _reconciled_membership_status(existing: dict[str, Any], observed_status: str | None) -> str:
+        """Keep a confirmed terminal state when Telegram returns no definitive status."""
+        observed = normalize_telegram_status(observed_status)
+        previous = normalize_telegram_status(existing.get("telegram_status"))
+        if observed == "unknown" and previous in {"left", "kicked"}:
+            return previous
+        return observed
+
     def _refresh_group_registry(self) -> None:
         """Reconcile every known ID with Telegram without granting implicit access."""
         configured_bootstrap = set(self.settings.group_bootstrap_chat_ids)
@@ -799,9 +808,13 @@ class BotApplication:
             existing = self.group_registry.get_group(chat_id) or {}
             try:
                 member = self.bot.get_chat_member(chat_id, self.bot_id)
-                telegram_status = str(getattr(member, "status", "") or "unknown")
+                telegram_status = self._reconciled_membership_status(
+                    existing,
+                    str(getattr(member, "status", "") or "unknown"),
+                )
             except Exception as exc:
                 definitive_status = self._membership_status_from_error(exc)
+                telegram_status = self._reconciled_membership_status(existing, definitive_status)
                 self.log.info(
                     "group membership verification failed chat_id=%s error=%s status=%s",
                     chat_id,
@@ -816,14 +829,14 @@ class BotApplication:
                             chat_id,
                             title=existing.get("title"),
                             chat_type=existing.get("type"),
-                            telegram_status=definitive_status,
+                            telegram_status=telegram_status,
                         )
                 else:
                     refreshed = self.group_registry.record_presence(
                         chat_id,
                         title=existing.get("title"),
                         chat_type=existing.get("type"),
-                        telegram_status=definitive_status or "unknown",
+                        telegram_status=telegram_status,
                         approval_required=self._approval_required,
                     )
                 self._sync_owner_card_after_presence(existing, refreshed)
