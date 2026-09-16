@@ -741,16 +741,28 @@ class BotApplication:
             self.log.exception("admin check failed chat_id=%s user_id=%s", chat_id, user_id)
             return False
 
-    def _admin_hint(self, chat_id: int, language: str) -> str:
+    def _admin_access_status(self, chat_id: int, language: str) -> str:
+        known_group = self.group_registry.get_group(chat_id)
+        known_status = normalize_telegram_status(
+            known_group.get("telegram_status") if isinstance(known_group, dict) else None
+        )
         try:
             member = self.bot.get_chat_member(chat_id, self.bot_id)
-            if str(getattr(member, "status", "")).lower() in {"administrator", "creator"} and bool(
-                getattr(member, "can_delete_messages", True)
-            ):
-                return ""
+            raw_status = str(getattr(member, "status", "") or "").lower()
+            status = normalize_telegram_status(raw_status)
+            if status == "administrator":
+                can_delete_messages = getattr(member, "can_delete_messages", None)
+                if raw_status == "creator" or can_delete_messages is True:
+                    return tr(language, "admin_ready")
+                if can_delete_messages is False:
+                    return tr(language, "admin_delete_missing")
+                return tr(language, "admin_delete_unverified")
+            if status == "unknown" and known_status == "administrator":
+                return tr(language, "admin_status_unverified")
         except Exception:
             self.log.exception("bot permission check failed chat_id=%s", chat_id)
-            return ""
+            if known_status == "administrator":
+                return tr(language, "admin_status_unverified")
         return tr(language, "admin_hint")
 
     def _help(self, chat_id: int, private: bool) -> str:
@@ -1317,7 +1329,7 @@ class BotApplication:
         if self.storage.was_welcomed("group", chat_id):
             self._safe_message(chat_id, prefix)
             return
-        text = f"{prefix}\n\n{self._admin_hint(chat_id, language)}{self._help(chat_id, private=False)}"
+        text = f"{prefix}\n\n{self._admin_access_status(chat_id, language)}{self._help(chat_id, private=False)}"
         if self._safe_message(chat_id, text, html_mode=True):
             self.storage.mark_welcomed("group", chat_id)
 
@@ -1327,7 +1339,7 @@ class BotApplication:
         if self.storage.was_welcomed("group", chat_id):
             return
         language = self.storage.chat_language(chat_id)
-        text = self._admin_hint(chat_id, language) + self._help(chat_id, private=False)
+        text = self._admin_access_status(chat_id, language) + self._help(chat_id, private=False)
         if self._safe_message(chat_id, text, thread_id, html_mode=True):
             self.storage.mark_welcomed("group", chat_id)
 

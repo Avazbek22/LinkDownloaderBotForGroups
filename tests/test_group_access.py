@@ -210,6 +210,76 @@ def test_observed_messages_do_not_downgrade_a_known_administrator_status(tmp_pat
     assert app.group_registry.get_group(-1001)["telegram_status"] == "administrator"
 
 
+def test_admin_access_status_distinguishes_role_from_delete_permission(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+
+    bot.members[-1001] = SimpleNamespace(status="administrator", can_delete_messages=True)
+    ready = app._admin_access_status(-1001, "en")
+    assert "✅ <b>The bot is already an administrator</b>" in ready
+    assert "Permission to delete messages is enabled." in ready
+    assert "✅ <b>Бот уже является администратором</b>" in app._admin_access_status(-1001, "ru")
+
+    bot.members[-1001] = SimpleNamespace(status="administrator", can_delete_messages=False)
+    missing_delete = app._admin_access_status(-1001, "en")
+    assert "✅ <b>The bot is already an administrator</b>" in missing_delete
+    assert "⚠️ Enable permission to delete messages" in missing_delete
+    assert "Administrator permission recommended" not in missing_delete
+
+    bot.members[-1001] = SimpleNamespace(status="member", can_delete_messages=False)
+    missing_role = app._admin_access_status(-1001, "en")
+    assert "⚠️ <b>Administrator permission recommended</b>" in missing_role
+    assert "already an administrator" not in missing_role
+
+
+def test_admin_access_status_uses_recorded_role_when_live_permission_check_fails(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app.group_registry.record_bootstrap_result(
+        -1001,
+        title="Admin group",
+        chat_type="supergroup",
+        telegram_status="administrator",
+    )
+    bot.members[-1001] = RuntimeError("temporary Telegram error")
+
+    status = app._admin_access_status(-1001, "en")
+
+    assert "✅ <b>Administrator rights were previously confirmed</b>" in status
+    assert "could not verify the current permissions" in status
+    assert "Administrator permission recommended" not in status
+
+
+def test_delayed_approval_confirms_administrator_rights_granted_while_pending(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app.bot_username = "downloader"
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    promotion = _membership_update(-1001, _user(8, "admin"))
+    promotion.old_chat_member.status = "member"
+    promotion.new_chat_member.status = "administrator"
+    bot.members[-1001] = SimpleNamespace(status="administrator", can_delete_messages=True)
+
+    app._handle_my_chat_member(promotion)
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "administrator"
+    bot.messages.clear()
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+
+    group_messages = [text for chat_id, text, _kwargs in bot.messages if chat_id == -1001]
+    assert len(group_messages) == 1
+    assert "✅ <b>The bot is already an administrator</b>" in group_messages[0]
+    assert "Permission to delete messages is enabled." in group_messages[0]
+    assert "Administrator permission recommended" not in group_messages[0]
+
+
 def test_owner_binding_flushes_pending_request_and_callback_is_private_and_idempotent(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
     bot = GroupBot()

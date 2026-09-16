@@ -28,6 +28,19 @@ TEXTS: dict[str, dict[str, str]] = {
             "⚠️ <b>Administrator permission recommended</b>\n"
             "Grant permission to delete messages so I can remove original links after a successful upload.\n\n"
         ),
+        "admin_ready": ("✅ <b>The bot is already an administrator</b>\nPermission to delete messages is enabled.\n\n"),
+        "admin_delete_missing": (
+            "✅ <b>The bot is already an administrator</b>\n"
+            "⚠️ Enable permission to delete messages so I can remove original links after a successful upload.\n\n"
+        ),
+        "admin_delete_unverified": (
+            "✅ <b>The bot is already an administrator</b>\n"
+            "⚠️ I could not verify the permission to delete messages right now.\n\n"
+        ),
+        "admin_status_unverified": (
+            "✅ <b>Administrator rights were previously confirmed</b>\n"
+            "⚠️ I could not verify the current permissions right now.\n\n"
+        ),
         "already_welcomed": "The instructions were already sent. Use /help to show them again.",
         "private_hint": "Use /help to see the instructions.",
         "opted_out": (
@@ -76,6 +89,19 @@ TEXTS: dict[str, dict[str, str]] = {
         "admin_hint": (
             "⚠️ <b>Рекомендуются права администратора</b>\n"
             "Разрешите удалять сообщения, чтобы я удалял исходные ссылки после успешной отправки.\n\n"
+        ),
+        "admin_ready": ("✅ <b>Бот уже является администратором</b>\nРазрешение на удаление сообщений включено.\n\n"),
+        "admin_delete_missing": (
+            "✅ <b>Бот уже является администратором</b>\n"
+            "⚠️ Разрешите удалять сообщения, чтобы я удалял исходные ссылки после успешной отправки.\n\n"
+        ),
+        "admin_delete_unverified": (
+            "✅ <b>Бот уже является администратором</b>\n"
+            "⚠️ Сейчас не удалось проверить разрешение на удаление сообщений.\n\n"
+        ),
+        "admin_status_unverified": (
+            "✅ <b>Права администратора были подтверждены ранее</b>\n"
+            "⚠️ Сейчас не удалось проверить актуальные разрешения.\n\n"
         ),
         "already_welcomed": "Инструкция уже отправлялась. Используйте /help, чтобы показать её снова.",
         "private_hint": "Используйте /help, чтобы увидеть инструкцию.",
