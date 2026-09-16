@@ -14,7 +14,9 @@ from app.download_backend import (
     display_source_name,
     download_metadata,
     extract_metadata,
+    has_downloadable_audio,
     has_downloadable_video,
+    select_audio_format_candidates,
     select_format,
     select_format_candidates,
 )
@@ -87,6 +89,49 @@ def test_video_metadata_detection_ignores_audio_and_articles() -> None:
     assert not has_downloadable_video({"id": "article", "title": "News article"})
     assert not has_downloadable_video({"formats": None, "entries": None})
     assert select_format_candidates({"formats": None}, 50_000_000)
+
+
+def test_audio_metadata_detection_accepts_audio_and_unknown_direct_media() -> None:
+    assert has_downloadable_audio({"formats": [{"ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2"}]})
+    assert has_downloadable_audio(
+        {
+            "formats": [
+                {
+                    "ext": "mp4",
+                    "vcodec": None,
+                    "acodec": None,
+                    "url": "https://cdn.example/media.mp4",
+                }
+            ]
+        }
+    )
+    assert has_downloadable_audio(
+        {
+            "formats": [
+                {
+                    "ext": "mp4",
+                    "vcodec": "avc1.4d401f",
+                    "acodec": None,
+                    "url": "https://cdn.example/media.mp4",
+                }
+            ]
+        }
+    )
+    assert not has_downloadable_audio({"formats": [{"ext": "mp4", "vcodec": "avc1.4d401f", "acodec": "none"}]})
+    assert not has_downloadable_audio({"id": "article", "title": "News article"})
+
+
+def test_audio_plan_chooses_highest_mp3_bitrate_with_headroom() -> None:
+    info = {
+        "duration": 600,
+        "formats": [{"format_id": "audio", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}],
+    }
+
+    plans = select_audio_format_candidates(info, 10_000_000)
+
+    assert plans == [FormatPlan("bestaudio/best", audio_bitrate_kbps=112)]
+    assert select_audio_format_candidates({**info, "duration": None}, 10_000_000) == []
+    assert select_audio_format_candidates({**info, "duration": 10_000}, 10_000_000) == []
 
 
 def test_site_detection_accepts_explicit_ports_and_trailing_dot() -> None:
@@ -302,6 +347,33 @@ def test_video_validation_requires_h264_stream(monkeypatch, tmp_path: Path) -> N
         download_backend._validate_downloaded_video(path, 1_000_000)
 
 
+def test_audio_validation_requires_mp3_stream_and_container(monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "audio.mp3"
+    path.write_bytes(b"not-a-real-audio-file")
+
+    def probe(codec: str, format_name: str = "mp3") -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=(
+                '{"streams":[{"codec_type":"audio","codec_name":"'
+                + codec
+                + '"}],"format":{"format_name":"'
+                + format_name
+                + '"}}'
+            )
+        )
+
+    monkeypatch.setattr(download_backend.subprocess, "run", lambda *_args, **_kwargs: probe("mp3"))
+    download_backend._validate_downloaded_audio(path, 1_000_000)
+
+    monkeypatch.setattr(download_backend.subprocess, "run", lambda *_args, **_kwargs: probe("aac", "mov,mp4,m4a"))
+    with pytest.raises(RuntimeError, match="codec is not Telegram-compatible"):
+        download_backend._validate_downloaded_audio(path, 1_000_000)
+
+    monkeypatch.setattr(download_backend.subprocess, "run", lambda *_args, **_kwargs: probe("mp3", "matroska"))
+    with pytest.raises(RuntimeError, match="container is not MP3-compatible"):
+        download_backend._validate_downloaded_audio(path, 1_000_000)
+
+
 def test_youtube_retry_reextracts_with_runtime_and_selected_format(monkeypatch, tmp_path: Path) -> None:
     options_seen: list[dict] = []
     process_calls = 0
@@ -477,6 +549,37 @@ def test_youtube_metadata_skips_client_without_video_formats(monkeypatch) -> Non
 
     assert metadata.media_key == "youtube:video"
     assert clients_seen == ["default", "android"]
+
+
+def test_youtube_audio_metadata_accepts_audio_only_client(monkeypatch) -> None:
+    clients_seen: list[str] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.client = options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["default"])[0]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            clients_seen.append(self.client)
+            return {
+                "id": "audio",
+                "duration": 120,
+                "extractor_key": "Youtube",
+                "formats": [{"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}],
+            }
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,android")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.youtube.com/watch?v=audio", media_kind="audio")
+
+    assert metadata.media_key == "youtube:audio"
+    assert clients_seen == ["default"]
 
 
 def test_generic_media_keys_include_url_identity(monkeypatch) -> None:
@@ -706,3 +809,51 @@ def test_rejects_audio_only_attempt_and_uses_next_candidate(monkeypatch, tmp_pat
     assert formats_seen == ["bad", "good"]
     assert not (tmp_path / "candidate.m4a").exists()
     assert (tmp_path / "candidate.mp4").exists()
+
+
+def test_audio_download_uses_size_planned_mp3_postprocessor(monkeypatch, tmp_path: Path) -> None:
+    options_seen: list[dict] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+            options_seen.append(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            (tmp_path / "audio.mp3").write_bytes(b"audio")
+            return {"id": "audio"}
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(download_backend, "_validate_downloaded_audio", lambda *_args, **_kwargs: None)
+    metadata = MediaMetadata(
+        url="https://example.com/media",
+        info={
+            "id": "audio",
+            "duration": 60,
+            "formats": [{"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}],
+        },
+        media_key="example:audio",
+        source_name="Example",
+    )
+
+    result = download_metadata(
+        metadata,
+        "audio",
+        tmp_path,
+        max_send_bytes=10_000_000,
+        concurrent_fragments=2,
+        media_kind="audio",
+    )
+
+    assert result["id"] == "audio"
+    assert len(options_seen) == 1
+    assert options_seen[0]["format"] == "bestaudio/best"
+    assert options_seen[0]["postprocessors"] == [
+        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+    ]

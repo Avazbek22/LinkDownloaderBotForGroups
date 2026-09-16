@@ -9,7 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yt_dlp
 
@@ -18,6 +18,9 @@ from app.url_security import safe_error_for_log
 from app.url_utils import is_instagram_url, is_youtube_url
 
 LOG = logging.getLogger(__name__)
+MediaKind = Literal["video", "audio"]
+AUDIO_HEADROOM_BYTES = 1_500_000
+AUDIO_BITRATES_KBPS = (192, 160, 128, 112, 96, 80, 64, 48, 32)
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -37,6 +40,7 @@ class MediaMetadata:
 class FormatPlan:
     format_spec: str
     merge_output_format: str | None = None
+    audio_bitrate_kbps: int | None = None
 
 
 class InstagramContentRestrictedError(RuntimeError):
@@ -236,6 +240,41 @@ def has_downloadable_video(info: dict[str, Any]) -> bool:
     return any(has_downloadable_video(entry) for entry in entries)
 
 
+def has_downloadable_audio(info: dict[str, Any]) -> bool:
+    """Return whether extractor metadata identifies a usable audio stream."""
+    raw_formats = info.get("formats")
+    formats = [item for item in raw_formats if isinstance(item, dict)] if isinstance(raw_formats, list) else []
+    candidates = [info, *formats]
+    for candidate in candidates:
+        audio_codec = candidate.get("acodec")
+        normalized_audio_codec = str(audio_codec or "").strip().lower()
+        if normalized_audio_codec and normalized_audio_codec != "none":
+            return True
+        if (
+            not normalized_audio_codec
+            and str(candidate.get("ext") or "").lower() in {"aac", "m4a", "mp3", "mp4", "ogg", "opus", "webm"}
+            and bool(candidate.get("url"))
+        ):
+            # Some direct media entries omit codec metadata. The converted
+            # MP3 is still validated with ffprobe before Telegram sees it.
+            return True
+    raw_entries = info.get("entries")
+    entries = [entry for entry in raw_entries if isinstance(entry, dict)] if isinstance(raw_entries, list) else []
+    return any(has_downloadable_audio(entry) for entry in entries)
+
+
+def select_audio_format_candidates(info: dict[str, Any], max_bytes: int) -> list[FormatPlan]:
+    """Return the highest MP3 bitrate that is guaranteed to fit the limit."""
+    duration = _duration(info)
+    if duration is None or not has_downloadable_audio(info):
+        return []
+    for bitrate in AUDIO_BITRATES_KBPS:
+        estimated_size = int(duration * bitrate * 1000 / 8)
+        if estimated_size + AUDIO_HEADROOM_BYTES <= max_bytes:
+            return [FormatPlan("bestaudio/best", audio_bitrate_kbps=bitrate)]
+    return []
+
+
 def _csv(raw: str) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
@@ -381,14 +420,15 @@ def _remove_attempt_files(output_folder: Path, out_prefix: str) -> None:
             path.unlink(missing_ok=True)
 
 
-def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
-    """Reject partial, audio-only, oversized, or Telegram-incompatible results."""
+def _validate_downloaded_size(path: Path, max_bytes: int) -> None:
     size = path.stat().st_size
     if size <= 0:
         raise RuntimeError("downloaded file is empty")
     if size > max_bytes:
         raise RuntimeError("downloaded file exceeds MAX_FILESIZE")
 
+
+def _probe_download(path: Path) -> dict[str, Any]:
     completed = subprocess.run(
         [
             "ffprobe",
@@ -406,7 +446,18 @@ def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
         timeout=30,
     )
     payload = json.loads(completed.stdout)
-    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise RuntimeError("ffprobe returned invalid media metadata")
+    return payload
+
+
+def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
+    """Reject partial, audio-only, oversized, or Telegram-incompatible results."""
+    _validate_downloaded_size(path, max_bytes)
+    payload = _probe_download(path)
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        streams = []
     video_streams = [
         stream for stream in (streams or []) if isinstance(stream, dict) and stream.get("codec_type") == "video"
     ]
@@ -429,11 +480,35 @@ def _validate_downloaded_video(path: Path, max_bytes: int) -> None:
         raise RuntimeError(f"downloaded video container is not MP4-compatible: {format_name or 'unknown'}")
 
 
+def _validate_downloaded_audio(path: Path, max_bytes: int) -> None:
+    """Reject partial, oversized, or non-MP3 audio before Telegram upload."""
+    _validate_downloaded_size(path, max_bytes)
+    payload = _probe_download(path)
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        streams = []
+    audio_streams = [
+        stream for stream in (streams or []) if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+    ]
+    if not audio_streams:
+        raise RuntimeError("downloaded file has no audio stream")
+    if not any(str(stream.get("codec_name") or "").lower() == "mp3" for stream in audio_streams):
+        codecs = ",".join(sorted({str(stream.get("codec_name") or "unknown") for stream in audio_streams}))
+        raise RuntimeError(f"downloaded audio codec is not Telegram-compatible: {codecs}")
+    format_info = payload.get("format")
+    format_name = str(format_info.get("format_name") or "") if isinstance(format_info, dict) else ""
+    if "mp3" not in {item.strip().lower() for item in format_name.split(",")}:
+        raise RuntimeError(f"downloaded audio container is not MP3-compatible: {format_name or 'unknown'}")
+
+
 def extract_metadata(
     url: str,
     cookie_file: Path | None = None,
     deadline: float | None = None,
+    media_kind: MediaKind = "video",
 ) -> MediaMetadata:
+    if media_kind not in {"video", "audio"}:
+        raise ValueError(f"unsupported media kind: {media_kind}")
     _check_deadline(deadline)
     info: Any
     if is_youtube_url(url):
@@ -448,8 +523,11 @@ def extract_metadata(
                     candidate = ydl.extract_info(url, download=False)
                 if not isinstance(candidate, dict):
                     raise RuntimeError("extractor returned no metadata")
-                if not has_downloadable_video(candidate):
-                    raise RuntimeError("extractor returned metadata without a downloadable video")
+                has_requested_media = (
+                    has_downloadable_audio(candidate) if media_kind == "audio" else has_downloadable_video(candidate)
+                )
+                if not has_requested_media:
+                    raise RuntimeError(f"extractor returned metadata without downloadable {media_kind}")
                 info = candidate
                 break
             except Exception as error:
@@ -515,7 +593,10 @@ def download_metadata(
     concurrent_fragments: int,
     cookie_file: Path | None = None,
     deadline: float | None = None,
+    media_kind: MediaKind = "video",
 ) -> dict[str, Any]:
+    if media_kind not in {"video", "audio"}:
+        raise ValueError(f"unsupported media kind: {media_kind}")
     output_folder.mkdir(parents=True, exist_ok=True)
     outtmpl = os.fspath(output_folder / f"{out_prefix}.%(ext)s")
     is_youtube = is_youtube_url(metadata.url)
@@ -560,6 +641,14 @@ def download_metadata(
         )
         if plan.merge_output_format:
             options["merge_output_format"] = plan.merge_output_format
+        if media_kind == "audio":
+            options["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": str(plan.audio_bitrate_kbps or 128),
+                }
+            ]
         options.update(
             _site_options(
                 metadata.url,
@@ -580,7 +669,11 @@ def download_metadata(
         youtube_player_client: str | None = None,
     ) -> dict[str, Any] | None:
         nonlocal last_error
-        plans = select_format_candidates(info, max_send_bytes)
+        plans = (
+            select_audio_format_candidates(info, max_send_bytes)
+            if media_kind == "audio"
+            else select_format_candidates(info, max_send_bytes)
+        )
         for index, plan in enumerate(plans, start=1):
             _check_deadline(deadline)
             _remove_attempt_files(output_folder, out_prefix)
@@ -603,10 +696,17 @@ def download_metadata(
                     result = ydl.process_ie_result(_unselect_info(info), download=True)
                 if not isinstance(result, dict):
                     raise RuntimeError("extractor returned no download result")
-                path = find_downloaded_file(result, out_prefix, output_folder)
+                preferred_suffixes = (".mp3",) if media_kind == "audio" else (".mp4",)
+                path = find_downloaded_file(
+                    result,
+                    out_prefix,
+                    output_folder,
+                    preferred_suffixes=preferred_suffixes,
+                )
                 if path is None:
                     raise RuntimeError("downloaded file not found")
-                _validate_downloaded_video(path, max_send_bytes)
+                validator = _validate_downloaded_audio if media_kind == "audio" else _validate_downloaded_video
+                validator(path, max_send_bytes)
                 _check_deadline(deadline)
                 return result
             except Exception as error:
@@ -686,13 +786,23 @@ def download_metadata(
 
     _remove_attempt_files(output_folder, out_prefix)
     _check_deadline(deadline)
-    raise RuntimeError("no compatible video format fits the configured size limit") from last_error
+    raise RuntimeError(f"no compatible {media_kind} format fits the configured size limit") from last_error
 
 
-def find_downloaded_file(info: dict[str, Any], prefix: str, output_folder: Path) -> Path | None:
-    exact = output_folder / f"{prefix}.mp4"
-    if exact.is_file():
-        return exact
+def find_downloaded_file(
+    info: dict[str, Any],
+    prefix: str,
+    output_folder: Path,
+    *,
+    preferred_suffixes: tuple[str, ...] = (".mp4",),
+) -> Path | None:
+    normalized_suffixes = tuple(
+        suffix.lower() if suffix.startswith(".") else f".{suffix.lower()}" for suffix in preferred_suffixes
+    )
+    for suffix in normalized_suffixes:
+        exact = output_folder / f"{prefix}{suffix}"
+        if exact.is_file():
+            return exact
     candidates: list[Path] = []
     for path in output_folder.glob(f"{prefix}.*"):
         lower = path.name.lower()
@@ -704,5 +814,6 @@ def find_downloaded_file(info: dict[str, Any], prefix: str, output_folder: Path)
         candidates.append(path)
     if not candidates:
         return None
-    candidates.sort(key=lambda path: (path.suffix.lower() == ".mp4", path.stat().st_mtime), reverse=True)
+    preference = {suffix: len(normalized_suffixes) - index for index, suffix in enumerate(normalized_suffixes)}
+    candidates.sort(key=lambda path: (preference.get(path.suffix.lower(), 0), path.stat().st_mtime), reverse=True)
     return candidates[0]

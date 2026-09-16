@@ -15,10 +15,11 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "group_help": (
             "<b>How to use</b>\n"
-            "Post a video link. 👀 means it is being processed, 🙈 means Instagram hid or restricted the content, "
-            "🤷 means no video was found, and 👎 means it failed. "
+            "Post a link for video, or use /audio &lt;link&gt; for MP3. "
+            "👀 means it is being processed, 🙈 means Instagram hid or restricted the content, "
+            "🤷 means the requested media was not found, and 👎 means it failed. "
             "Add the same 🙈 or 👎 reaction yourself to retry a failed link. "
-            "I will publish the video silently and delete the original message after success.\n\n"
+            "I will publish the result silently and delete the original message after success.\n\n"
             "Use /skip &lt;link&gt; to leave one link completely untouched.\n\n"
             "<b>Personal opt-out</b>\n"
             "Send {bot_mention} me to toggle automatic downloads for yourself.\n"
@@ -54,17 +55,19 @@ TEXTS: dict[str, dict[str, str]] = {
         "admin_only": "Only group administrators can change this setting.",
         "settings_summary": "<b>Group settings</b>\nLanguage: {language}\nDelete original link: {delete_original}",
         "delete_usage": "Use /delete_original on or /delete_original off.",
+        "audio_usage": "Use /audio <link> to download one link as MP3.",
         "delete_changed": "Deleting original links is now {state}.",
         "state_on": "enabled",
         "state_off": "disabled",
         "group_pending_approval": (
-            "⏳ This group is waiting for the bot owner's approval. Video links will not be processed yet."
+            "⏳ This group is waiting for the bot owner's approval. Media links will not be processed yet."
         ),
-        "group_approved": "✅ This group was approved. Video downloads are now enabled.",
+        "group_approved": "✅ This group was approved. Media downloads are now enabled.",
         "group_rejected": "⛔ The bot owner did not approve this group. I am leaving the group.",
         "group_approval_expired": "⌛ Approval was not received in time. I am leaving the group.",
         "group_access_revoked": "⛔ The bot owner revoked access to this group. I am leaving the group.",
         "caption": '<a href="{url}">Original video · {source}</a>\nFrom {sender}',
+        "audio_caption": '<a href="{url}">Original audio · {source}</a>\nFrom {sender}',
     },
     "ru": {
         "private_help": (
@@ -78,10 +81,11 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "group_help": (
             "<b>Как пользоваться</b>\n"
-            "Отправьте ссылку на видео. 👀 означает, что ссылка обрабатывается, 🙈 — что Instagram скрыл или "
-            "ограничил контент, 🤷 — что видео не найдено, а 👎 — что скачать не удалось. "
+            "Отправьте ссылку для скачивания видео или используйте /audio &lt;ссылка&gt; для MP3. "
+            "👀 означает, что ссылка обрабатывается, 🙈 — что Instagram скрыл или "
+            "ограничил контент, 🤷 — что нужное медиа не найдено, а 👎 — что скачать не удалось. "
             "Добавьте такую же реакцию 🙈 или 👎, чтобы повторить неудачную загрузку. "
-            "Я тихо опубликую видео, а после успеха удалю исходное сообщение.\n\n"
+            "Я тихо опубликую результат, а после успеха удалю исходное сообщение.\n\n"
             "Используйте /skip &lt;ссылка&gt;, чтобы один раз полностью проигнорировать ссылку.\n\n"
             "<b>Персональное отключение</b>\n"
             "Отправьте {bot_mention} я, чтобы отключить или включить автоматическое скачивание для себя.\n"
@@ -117,17 +121,19 @@ TEXTS: dict[str, dict[str, str]] = {
         "admin_only": "Изменять эту настройку могут только администраторы группы.",
         "settings_summary": "<b>Настройки группы</b>\nЯзык: {language}\nУдаление исходной ссылки: {delete_original}",
         "delete_usage": "Используйте /delete_original on или /delete_original off.",
+        "audio_usage": "Используйте /audio <ссылка>, чтобы скачать одну ссылку в MP3.",
         "delete_changed": "Удаление исходных ссылок теперь {state}.",
         "state_on": "включено",
         "state_off": "выключено",
         "group_pending_approval": (
             "⏳ Эта группа ожидает подтверждения владельца бота. До подтверждения ссылки обрабатываться не будут."
         ),
-        "group_approved": "✅ Группа подтверждена. Скачивание видео теперь включено.",
+        "group_approved": "✅ Группа подтверждена. Скачивание медиа теперь включено.",
         "group_rejected": "⛔ Владелец бота не подтвердил эту группу. Я покидаю группу.",
         "group_approval_expired": "⌛ Подтверждение не получено вовремя. Я покидаю группу.",
         "group_access_revoked": "⛔ Владелец бота отозвал доступ для этой группы. Я покидаю группу.",
         "caption": '<a href="{url}">Ссылка на видео · {source}</a>\nОт {sender}',
+        "audio_caption": '<a href="{url}">Ссылка на аудио · {source}</a>\nОт {sender}',
     },
 }
 

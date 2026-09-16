@@ -23,11 +23,12 @@ from app.download_backend import (
     download_metadata,
     extract_metadata,
     find_downloaded_file,
+    has_downloadable_audio,
     has_downloadable_video,
 )
 from app.group_registry import ACTIVE_TELEGRAM_STATUSES, GroupRegistry, normalize_telegram_status
 from app.i18n import tr
-from app.jobs import Flight, FlightCoordinator, Job
+from app.jobs import Flight, FlightCoordinator, Job, MediaKind
 from app.logging_setup import configure_logging
 from app.media_cache import DiskMediaCache
 from app.settings import Settings, load_settings
@@ -222,10 +223,19 @@ class BotApplication:
             return
         started = time.monotonic()
         deadline = started + self.settings.job_timeout
-        self.log.info("job metadata job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
+        self.log.info(
+            "job metadata job_id=%s kind=%s url=%s",
+            first.job_id,
+            first.media_kind,
+            safe_url_for_log(first.url),
+        )
         # Bump the profile whenever delivery compatibility changes so an old,
         # already-uploaded Telegram file_id cannot bypass the new validation.
-        cache_profile = f"mp4-h264-v2:{self.settings.max_filesize}"
+        cache_profile = (
+            f"mp3-v1:{self.settings.max_filesize}"
+            if first.media_kind == "audio"
+            else f"mp4-h264-v2:{self.settings.max_filesize}"
+        )
         cached = (
             self.storage.get_cached_by_url(f"{first.url_key}|{cache_profile}", self.settings.file_id_cache_ttl_days)
             if self.settings.media_cache_enabled
@@ -249,7 +259,7 @@ class BotApplication:
 
         try:
             validate_public_url(first.url)
-            metadata = extract_metadata(first.url, self.settings.cookies_file, deadline)
+            metadata = extract_metadata(first.url, self.settings.cookies_file, deadline, first.media_kind)
             final_url = metadata.info.get("webpage_url")
             if isinstance(final_url, str):
                 validate_public_url(final_url)
@@ -272,16 +282,22 @@ class BotApplication:
             self._after_probe_failure_many(self.coordinator.abort(flight))
             return
 
-        if not has_downloadable_video(metadata.info):
+        has_requested_media = (
+            has_downloadable_audio(metadata.info)
+            if first.media_kind == "audio"
+            else has_downloadable_video(metadata.info)
+        )
+        if not has_requested_media:
             self.log.info(
-                "link ignored because no video was found job_id=%s url=%s",
+                "link ignored because no %s was found job_id=%s url=%s",
+                first.media_kind,
                 first.job_id,
                 safe_url_for_log(first.url),
             )
-            self._after_non_video_many(self.coordinator.abort(flight))
+            self._after_no_media_many(self.coordinator.abort(flight))
             return
 
-        media_key = f"{metadata.media_key}:mp4-h264-v2:{self.settings.max_filesize}"
+        media_key = f"{metadata.media_key}:{cache_profile}"
         if cached is None and not self.coordinator.promote(flight, media_key):
             self.log.info("job joined media flight job_id=%s media_key=%s", first.job_id, media_key)
             return
@@ -300,7 +316,7 @@ class BotApplication:
                     if retry:
                         file_id = None
                         if file_path is None:
-                            file_path = self._obtain_file(metadata, media_key, deadline)
+                            file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
                         file_id = self._send_from_file(
                             retry,
                             file_path,
@@ -310,7 +326,7 @@ class BotApplication:
                         )
                 else:
                     if file_path is None:
-                        file_path = self._obtain_file(metadata, media_key, deadline)
+                        file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
                     file_id = self._send_from_file(
                         batch,
                         file_path,
@@ -323,13 +339,20 @@ class BotApplication:
 
         self.disk_cache.maintain()
         self.log.info(
-            "job complete job_id=%s media_key=%s elapsed=%.2f",
+            "job complete job_id=%s kind=%s media_key=%s elapsed=%.2f",
             first.job_id,
+            first.media_kind,
             media_key,
             time.monotonic() - started,
         )
 
-    def _obtain_file(self, metadata: MediaMetadata, media_key: str, deadline: float) -> Path:
+    def _obtain_file(
+        self,
+        metadata: MediaMetadata,
+        media_key: str,
+        deadline: float,
+        media_kind: MediaKind = "video",
+    ) -> Path:
         cached = self.disk_cache.get(media_key)
         if cached is not None:
             self.log.info("disk cache hit media_key=%s", media_key)
@@ -343,8 +366,15 @@ class BotApplication:
             concurrent_fragments=self.settings.concurrent_fragments,
             cookie_file=self.settings.cookies_file,
             deadline=deadline,
+            media_kind=media_kind,
         )
-        path = find_downloaded_file(info, prefix, self.settings.output_dir)
+        preferred_suffixes = (".mp3",) if media_kind == "audio" else (".mp4",)
+        path = find_downloaded_file(
+            info,
+            prefix,
+            self.settings.output_dir,
+            preferred_suffixes=preferred_suffixes,
+        )
         if path is None or not path.is_file():
             self.disk_cache.remove_prefix_except(prefix)
             raise RuntimeError("downloaded file not found")
@@ -369,7 +399,7 @@ class BotApplication:
                 self._clear_status_reaction(job)
                 continue
             try:
-                self._send_video(job, file_id, metadata, upload=False)
+                self._send_media(job, file_id, metadata, upload=False)
                 self._after_success(job)
             except Exception as exc:
                 if self._is_invalid_file_id(exc):
@@ -396,11 +426,11 @@ class BotApplication:
                 continue
             try:
                 if file_id:
-                    self._send_video(job, file_id, metadata, upload=False)
+                    self._send_media(job, file_id, metadata, upload=False)
                 else:
-                    response = self._send_video(job, path, metadata, upload=True)
-                    video = getattr(response, "video", None)
-                    candidate = getattr(video, "file_id", None)
+                    response = self._send_media(job, path, metadata, upload=True)
+                    sent_media = getattr(response, job.media_kind, None)
+                    candidate = getattr(sent_media, "file_id", None)
                     if isinstance(candidate, str) and candidate:
                         file_id = candidate
                         if self.settings.media_cache_enabled:
@@ -413,9 +443,14 @@ class BotApplication:
                             )
                 self._after_success(job)
             except Exception:
-                self.log.exception("video send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+                self.log.exception("media send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
                 self._after_failure(job)
         return file_id
+
+    def _send_media(self, job: Job, media: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
+        if job.media_kind == "audio":
+            return self._send_audio(job, media, metadata, upload=upload)
+        return self._send_video(job, media, metadata, upload=upload)
 
     def _send_video(self, job: Job, video: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
         language = self.storage.chat_language(job.chat_id)
@@ -439,6 +474,39 @@ class BotApplication:
             with self.upload_slots, Path(video).open("rb") as handle:
                 return self.bot.send_video(video=handle, **kwargs)
         return self.bot.send_video(video=video, **kwargs)
+
+    def _send_audio(self, job: Job, audio: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
+        language = self.storage.chat_language(job.chat_id)
+        caption = tr(
+            language,
+            "audio_caption",
+            url=html.escape(job.url, quote=True),
+            source=html.escape(metadata.source_name, quote=False),
+            sender=html.escape(job.sender_name, quote=False),
+        )
+        kwargs: dict[str, Any] = {
+            "chat_id": job.chat_id,
+            "caption": caption,
+            "parse_mode": "HTML",
+            "disable_notification": True,
+        }
+        title = " ".join(str(metadata.info.get("title") or "").split())
+        if title:
+            kwargs["title"] = title[:64]
+        for key in ("artist", "uploader", "channel"):
+            performer = " ".join(str(metadata.info.get(key) or "").split())
+            if performer:
+                kwargs["performer"] = performer[:64]
+                break
+        duration = metadata.info.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            kwargs["duration"] = int(duration)
+        if job.message_thread_id is not None:
+            kwargs["message_thread_id"] = job.message_thread_id
+        if upload:
+            with self.upload_slots, Path(audio).open("rb") as handle:
+                return self.bot.send_audio(audio=handle, **kwargs)
+        return self.bot.send_audio(audio=audio, **kwargs)
 
     def _after_success(self, job: Job) -> None:
         if not self._job_access_allowed(job):
@@ -485,7 +553,7 @@ class BotApplication:
         for job in jobs:
             self._after_instagram_restriction(job)
 
-    def _after_non_video(self, job: Job) -> None:
+    def _after_no_media(self, job: Job) -> None:
         if not self._job_access_allowed(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
@@ -494,9 +562,9 @@ class BotApplication:
         if not self._set_status_reaction(job, "🤷"):
             self._clear_status_reaction(job)
 
-    def _after_non_video_many(self, jobs: list[Job]) -> None:
+    def _after_no_media_many(self, jobs: list[Job]) -> None:
         for job in jobs:
-            self._after_non_video(job)
+            self._after_no_media(job)
 
     def _clear_status_many(self, jobs: list[Job]) -> None:
         for job in jobs:
@@ -1449,6 +1517,7 @@ class BotApplication:
                 [
                     telebot.types.BotCommand("start", "Show instructions"),
                     telebot.types.BotCommand("help", "Show instructions"),
+                    telebot.types.BotCommand("audio", "Download one link as MP3"),
                     telebot.types.BotCommand("skip", "Leave one link untouched"),
                     telebot.types.BotCommand("en", "Switch to English (admins)"),
                     telebot.types.BotCommand("ru", "Переключить на русский (админы)"),
@@ -1848,6 +1917,8 @@ class BotApplication:
                 [
                     telebot.types.BotCommand("start", "Show instructions"),
                     telebot.types.BotCommand("help", "Show instructions"),
+                    telebot.types.BotCommand("audio", "Download one link as MP3"),
+                    telebot.types.BotCommand("skip", "Leave one link untouched"),
                     telebot.types.BotCommand("en", "Switch to English (admins)"),
                     telebot.types.BotCommand("ru", "Переключить на русский (админы)"),
                     telebot.types.BotCommand("settings", "Show group settings"),
@@ -2049,10 +2120,11 @@ class BotApplication:
             group = self.group_registry.get_group(int(message.chat.id)) or {}
             if group.get("resolution") in {"owner_approved", "added_by_owner"}:
                 self._welcome_group(int(message.chat.id), getattr(message, "message_thread_id", None))
-            if not text.strip() or command is not None:
+            if not text.strip() or command not in {None, "audio"}:
                 return
             chat_id = int(message.chat.id)
             user_id = int(message.from_user.id)
+            media_kind: MediaKind = "audio" if command == "audio" else "video"
             mentioned = bool(self.bot_username and re.search(rf"(^|\s)@{re.escape(self.bot_username)}\b", text.lower()))
             username = getattr(message.from_user, "username", None)
             if mentioned and self._self_mention(text, username):
@@ -2067,8 +2139,14 @@ class BotApplication:
                 return
             url = extract_first_url(text)
             if url is None:
+                if media_kind == "audio":
+                    self._safe_message(
+                        chat_id,
+                        tr(self.storage.chat_language(chat_id), "audio_usage"),
+                        getattr(message, "message_thread_id", None),
+                    )
                 return
-            if self.storage.is_opted_out(chat_id, user_id) and not mentioned:
+            if media_kind == "video" and self.storage.is_opted_out(chat_id, user_id) and not mentioned:
                 return
             validate_public_url(url)
             job = Job(
@@ -2086,15 +2164,27 @@ class BotApplication:
                 sender_name=self._sender_name(message),
                 delete_original=self.storage.delete_original(chat_id),
                 runtime_revision=self.group_registry.runtime_revision(group),
+                media_kind=media_kind,
             )
             self._set_status_reaction(job, "👀")
             flight = self.coordinator.submit(job)
             if flight is None:
-                self.log.info("job joined URL flight job_id=%s url=%s", job.job_id, safe_url_for_log(url))
+                self.log.info(
+                    "job joined URL flight job_id=%s kind=%s url=%s",
+                    job.job_id,
+                    job.media_kind,
+                    safe_url_for_log(url),
+                )
                 return
             try:
                 self.queue.put_nowait(flight)
-                self.log.info("job queued job_id=%s chat_id=%s url=%s", job.job_id, chat_id, safe_url_for_log(url))
+                self.log.info(
+                    "job queued job_id=%s kind=%s chat_id=%s url=%s",
+                    job.job_id,
+                    job.media_kind,
+                    chat_id,
+                    safe_url_for_log(url),
+                )
             except queue.Full:
                 self._clear_status_many(self.coordinator.abort(flight))
                 self.log.warning("queue full job_id=%s chat_id=%s", job.job_id, chat_id)

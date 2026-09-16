@@ -65,21 +65,21 @@ Instead, it uses reactions:
 |---|---|
 | 👀 | The link is being processed |
 | 🙈 | Instagram hid or restricted the content from the bot |
-| 🤷 | The link was checked, but no video was found |
+| 🤷 | The link was checked, but the requested media was not found |
 | 👎 | The download failed |
-| 👍 | The video was posted, but the original link was kept |
+| 👍 | The requested media was posted, but the original link was kept |
 
 When the bot leaves 🙈 or 👎, a group member can add the same reaction to retry the original link. The bot must
 be a group administrator to receive reaction updates. A retry replaces the bot's failure reaction with 👀 and
 runs through the normal queue, validation, and download pipeline again.
 
-If the link turns out to be an ordinary article, an image post, or another page without video, the bot replaces 👀 with 🤷 and leaves the message untouched.
+If the link does not contain the requested video or audio, the bot replaces 👀 with 🤷 and leaves the message untouched.
 
 When everything succeeds, the original link can be removed automatically.
 
-### Faster when the same video appears again
+### Faster when the same media appears again
 
-If the same video is shared more than once, the bot can reuse the copy already stored by Telegram.
+If the same link is requested in the same format more than once, the bot can reuse the copy already stored by Telegram. Video and audio have separate cache identities, so one can never be returned in place of the other.
 
 That means:
 
@@ -89,7 +89,7 @@ That means:
 - less waiting;
 - lower VPS load.
 
-If several people post the same video at the same time, the bot downloads it only once and delivers it to everyone who requested it.
+If several people request the same format at the same time, the bot downloads it only once and delivers it to everyone who requested it.
 
 ### Works inside Telegram forum topics
 
@@ -125,6 +125,8 @@ This project is useful for:
 5. After a successful upload, the original link is removed when the bot has permission.
 6. If something fails, the original message remains available.
 
+For a one-time audio request, `/audio <link>` follows the same pipeline but extracts an MP3 and sends it through Telegram's native audio player. The bot chooses the highest standard bitrate from 192 to 32 kbps that fits the configured limit with safety headroom. If the duration is unknown or even 32 kbps cannot fit, the request fails safely instead of uploading an oversized file.
+
 ```mermaid
 flowchart LR
     A[Member posts a video link] --> B[Bot processes it quietly]
@@ -138,6 +140,7 @@ flowchart LR
 |---|---|
 | Made specifically for Telegram groups | ✅ |
 | Works without a `/download` command | ✅ |
+| Supports one-time `/audio <link>` MP3 downloads | ✅ |
 | Does not spam the chat with progress messages | ✅ |
 | Keeps videos in the same forum topic | ✅ |
 | Remembers previously uploaded videos | ✅ |
@@ -151,7 +154,7 @@ flowchart LR
 
 The bot uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports a large number of video websites.
 
-For Telegram delivery, it prefers the highest-quality H.264 MP4 candidate that fits the configured size limit. The completed file is checked with ffprobe before upload, so an audio-only or incompatible partial download is never cached as a video.
+For Telegram video delivery, it prefers the highest-quality H.264 MP4 candidate that fits the configured size limit. `/audio` selects the best available audio source and converts it to a size-planned MP3. Every completed file is checked with ffprobe before upload, so an incompatible or partial download is never cached.
 
 Common examples:
 
@@ -224,6 +227,14 @@ https://www.youtube.com/watch?v=...
 
 No command is required.
 
+To download one link as MP3 instead of video:
+
+```text
+/audio https://www.youtube.com/watch?v=...
+```
+
+This is a one-time choice and does not change future downloads. `/audio@BotName <link>` is also accepted in groups. A successful audio request follows the current `DELETE_ORIGINAL` setting just like a video request.
+
 To publish one link without triggering the bot, put `/skip` before it:
 
 ```text
@@ -238,6 +249,7 @@ The bot stays completely silent for that message: it does not validate or downlo
 |---|---|
 | `/start` | Show the introduction |
 | `/help` | Show usage instructions |
+| `/audio <link>` | Download one link as MP3 without changing future behavior |
 | `/skip <link>` | Leave one link untouched without changing personal settings |
 | `/en` | Change the group language to English |
 | `/ru` | Change the group language to Russian |
@@ -269,6 +281,8 @@ After opting out, that member can still request a download manually:
 @BotName https://example.com/video
 ```
 
+An explicit `/audio <link>` request also works while that member's automatic video downloads are disabled.
+
 Other members are not affected.
 
 ## Manual Docker installation
@@ -297,7 +311,7 @@ The most useful options are:
 | `BOT_TOKEN` | required | Telegram bot token |
 | `DEFAULT_LANGUAGE` | `en` | Default language: `en` or `ru` |
 | `DELETE_ORIGINAL` | `true` | Remove links after successful delivery |
-| `MAX_FILESIZE` | `52428800` | Maximum video size in bytes |
+| `MAX_FILESIZE` | `52428800` | Maximum delivered video or audio size in bytes |
 | `WORKERS` | `2` | Simultaneous downloads |
 | `UPLOAD_WORKERS` | `2` | Simultaneous Telegram uploads |
 | `MAX_QUEUE` | `200` | Number of waiting requests |
@@ -395,16 +409,16 @@ DISK_CACHE_MAX_FILES=3
 
 </details>
 
-## What happens when a video is shared twice?
+## What happens when media is requested twice?
 
 The bot tries to avoid repeated work at several levels:
 
-1. Equal links posted at the same time are grouped into one job.
-2. Different links that point to the same video are detected after metadata extraction.
+1. Equal links requested in the same format at the same time are grouped into one job.
+2. Different links that point to the same media are detected after metadata extraction.
 3. Recently downloaded files can be reused from the disk cache.
-4. Previously uploaded Telegram videos can be sent again using their `file_id`.
+4. Previously uploaded Telegram videos and audio can be sent again using their `file_id`.
 
-This is especially useful in several groups or active communities, where the same popular video may be shared repeatedly.
+Audio and video are deliberately isolated throughout this process. This is especially useful in several groups or active communities, where the same popular media may be shared repeatedly.
 
 ## Data and privacy
 
@@ -417,7 +431,7 @@ data/
 ├── users.json          # personal opt-out choices
 ├── state.json          # welcome and migration state
 ├── media_cache.json    # reusable Telegram media references
-└── cache/              # temporary video files
+└── cache/              # temporary media files
 ```
 
 Temporary media files are cleaned automatically.

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from typing import Literal
+
+MediaKind = Literal["video", "audio"]
 
 
 @dataclass(frozen=True)
@@ -16,48 +19,52 @@ class Job:
     sender_name: str
     delete_original: bool
     runtime_revision: int = 0
+    media_kind: MediaKind = "video"
 
 
 @dataclass
 class Flight:
     url_keys: set[str]
+    media_kind: MediaKind
     jobs: list[Job] = field(default_factory=list)
     cursor: int = 0
     media_key: str | None = None
 
 
 class FlightCoordinator:
-    """Coalesce equal URLs first and equal extractor media IDs after metadata."""
+    """Coalesce equal URLs and media IDs without mixing delivery formats."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._by_url: dict[str, Flight] = {}
-        self._by_media: dict[str, Flight] = {}
+        self._by_url: dict[tuple[MediaKind, str], Flight] = {}
+        self._by_media: dict[tuple[MediaKind, str], Flight] = {}
 
     def submit(self, job: Job) -> Flight | None:
         with self._lock:
-            existing = self._by_url.get(job.url_key)
+            request_key = job.media_kind, job.url_key
+            existing = self._by_url.get(request_key)
             if existing is not None:
                 existing.jobs.append(job)
                 return None
-            flight = Flight(url_keys={job.url_key}, jobs=[job])
-            self._by_url[job.url_key] = flight
+            flight = Flight(url_keys={job.url_key}, media_kind=job.media_kind, jobs=[job])
+            self._by_url[request_key] = flight
             return flight
 
     def promote(self, flight: Flight, media_key: str) -> bool:
         with self._lock:
-            existing = self._by_media.get(media_key)
+            request_key = flight.media_kind, media_key
+            existing = self._by_media.get(request_key)
             if existing is flight:
                 return True
             if existing is not None:
                 existing.jobs.extend(flight.jobs[flight.cursor :])
                 existing.url_keys.update(flight.url_keys)
                 for url_key in flight.url_keys:
-                    self._by_url[url_key] = existing
+                    self._by_url[(flight.media_kind, url_key)] = existing
                 flight.cursor = len(flight.jobs)
                 return False
             flight.media_key = media_key
-            self._by_media[media_key] = flight
+            self._by_media[request_key] = flight
             return True
 
     def pending(self, flight: Flight) -> list[Job]:
@@ -79,10 +86,12 @@ class FlightCoordinator:
             if flight.cursor < len(flight.jobs):
                 return False
             for url_key in flight.url_keys:
-                if self._by_url.get(url_key) is flight:
-                    self._by_url.pop(url_key, None)
-            if flight.media_key and self._by_media.get(flight.media_key) is flight:
-                self._by_media.pop(flight.media_key, None)
+                request_key = flight.media_kind, url_key
+                if self._by_url.get(request_key) is flight:
+                    self._by_url.pop(request_key, None)
+            media_request_key = (flight.media_kind, flight.media_key) if flight.media_key else None
+            if media_request_key and self._by_media.get(media_request_key) is flight:
+                self._by_media.pop(media_request_key, None)
             return True
 
     def abort(self, flight: Flight) -> list[Job]:

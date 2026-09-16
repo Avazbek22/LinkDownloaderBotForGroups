@@ -14,6 +14,7 @@ from app.settings import Settings
 class FakeBot:
     def __init__(self) -> None:
         self.sends = []
+        self.audio_sends = []
         self.deletes = []
         self.reactions = []
         self.messages = []
@@ -21,6 +22,10 @@ class FakeBot:
     def send_video(self, *, video, **kwargs):
         self.sends.append((video, kwargs))
         return SimpleNamespace(video=SimpleNamespace(file_id="telegram-file-id"))
+
+    def send_audio(self, *, audio, **kwargs):
+        self.audio_sends.append((audio, kwargs))
+        return SimpleNamespace(audio=SimpleNamespace(file_id="telegram-audio-file-id"))
 
     def delete_message(self, chat_id, message_id):
         self.deletes.append((chat_id, message_id))
@@ -353,6 +358,128 @@ def test_command_for_another_bot_never_downloads_its_link(tmp_path, monkeypatch)
     assert fake.deletes == []
 
 
+def test_audio_command_queues_one_audio_request_even_for_opted_out_user(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.bot_username = "downloader"
+    app.storage.toggle_opt_out(-100, 7)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="/audio@Downloader https://example.com/video",
+        caption=None,
+        message_id=42,
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    app._handle_group_message(message)
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert flight.media_kind == "audio"
+    assert len(flight.jobs) == 1
+    assert flight.jobs[0].media_kind == "audio"
+    assert app.storage.is_opted_out(-100, 7)
+    assert [item[2] for item in fake.reactions] == ["👀"]
+    app.coordinator.abort(flight)
+
+
+def test_audio_command_without_link_shows_usage_without_reaction(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="/audio",
+        caption=None,
+        message_id=42,
+    )
+
+    app._handle_group_message(message)
+
+    assert app.queue.empty()
+    assert fake.reactions == []
+    assert len(fake.messages) == 1
+    assert "/audio <link>" in fake.messages[0][1]
+
+
+def test_audio_request_uploads_and_reuses_only_audio_cache(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    metadata = MediaMetadata(
+        url=url,
+        info={
+            "id": "media",
+            "duration": 60,
+            "title": "Track title",
+            "artist": "Track artist",
+            "formats": [{"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}],
+        },
+        media_key="example:media",
+        source_name="Example",
+    )
+    audio_path = tmp_path / "audio.mp3"
+    audio_path.write_bytes(b"audio")
+    first = Job(
+        "audio-1",
+        -100,
+        17,
+        42,
+        7,
+        url,
+        url,
+        "Original User",
+        True,
+        media_kind="audio",
+    )
+    flight = app.coordinator.submit(first)
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: audio_path)
+
+    app._process_flight(flight)
+
+    audio_profile = f"{url}|mp3-v1:{app.settings.max_filesize}"
+    video_profile = f"{url}|mp4-h264-v2:{app.settings.max_filesize}"
+    assert app.storage.get_cached_by_url(audio_profile, app.settings.file_id_cache_ttl_days) is not None
+    assert app.storage.get_cached_by_url(video_profile, app.settings.file_id_cache_ttl_days) is None
+    assert len(fake.audio_sends) == 1
+    assert fake.sends == []
+    assert fake.deletes == [(-100, 42)]
+    assert fake.audio_sends[0][1]["message_thread_id"] == 17
+    assert fake.audio_sends[0][1]["title"] == "Track title"
+    assert fake.audio_sends[0][1]["performer"] == "Track artist"
+    assert fake.audio_sends[0][1]["duration"] == 60
+    assert "Original audio" in fake.audio_sends[0][1]["caption"]
+
+    second = Job(
+        "audio-2",
+        -200,
+        None,
+        43,
+        8,
+        url,
+        url,
+        "Later User",
+        True,
+        media_kind="audio",
+    )
+    cached_flight = app.coordinator.submit(second)
+    assert cached_flight is not None
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probe")))
+
+    app._process_flight(cached_flight)
+
+    assert len(fake.audio_sends) == 2
+    assert fake.audio_sends[1][0] == "telegram-audio-file-id"
+    assert fake.deletes == [(-100, 42), (-200, 43)]
+
+
 def test_status_reaction_lifecycle_for_retained_link(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()
@@ -463,6 +590,33 @@ def test_matching_failure_reaction_queues_retry_and_replaces_bot_status(tmp_path
     assert retry_job.url == job.url
     assert retry_job.sender_name == job.sender_name
     assert [item[2] for item in fake.reactions] == ["👎", "👀"]
+    app.coordinator.abort(flight)
+
+
+def test_audio_failure_retry_preserves_audio_request(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "failed-audio",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "key",
+        "User",
+        True,
+        media_kind="audio",
+    )
+    app._after_failure(job)
+
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert flight.media_kind == "audio"
+    assert flight.jobs[0].media_kind == "audio"
     app.coordinator.abort(flight)
 
 
@@ -799,6 +953,45 @@ def test_non_video_metadata_replaces_eyes_with_non_video_reaction(tmp_path, monk
     assert fake.deletes == []
 
 
+def test_audio_request_without_audio_replaces_eyes_with_no_media_reaction(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "silent-video",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "User",
+        True,
+        media_kind="audio",
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    metadata = MediaMetadata(
+        url=job.url,
+        info={
+            "id": "silent-video",
+            "duration": 60,
+            "formats": [{"format_id": "video", "ext": "mp4", "vcodec": "avc1", "acodec": "none"}],
+        },
+        media_key="generic:silent-video",
+        source_name="Example",
+    )
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "🤷"]
+    assert fake.audio_sends == []
+    assert fake.deletes == []
+
+
 def test_unavailable_non_video_reaction_clears_stale_eyes(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
 
@@ -868,6 +1061,8 @@ def test_telegram_commands_offer_only_short_language_switches(tmp_path) -> None:
     app._set_commands()
 
     names = [command.command for command in fake.commands]
+    assert "audio" in names
+    assert "skip" in names
     assert "en" in names
     assert "ru" in names
     assert "language" not in names

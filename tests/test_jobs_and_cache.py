@@ -3,12 +3,23 @@ from __future__ import annotations
 import os
 import time
 
-from app.jobs import FlightCoordinator, Job
+from app.jobs import FlightCoordinator, Job, MediaKind
 from app.media_cache import DiskMediaCache
 
 
-def _job(job_id: str, url_key: str = "url") -> Job:
-    return Job(job_id, -1, None, 1, 2, "https://example.com/v", url_key, "User", True)
+def _job(job_id: str, url_key: str = "url", *, media_kind: MediaKind = "video") -> Job:
+    return Job(
+        job_id,
+        -1,
+        None,
+        1,
+        2,
+        "https://example.com/v",
+        url_key,
+        "User",
+        True,
+        media_kind=media_kind,
+    )
 
 
 def test_coalesces_same_url_and_media() -> None:
@@ -33,6 +44,22 @@ def test_new_job_prevents_flight_from_finishing() -> None:
     assert not coordinator.finish_if_idle(flight)
     assert [job.job_id for job in coordinator.pending(flight)] == ["b"]
     assert coordinator.finish_if_idle(flight)
+
+
+def test_video_and_audio_requests_never_share_a_flight() -> None:
+    coordinator = FlightCoordinator()
+
+    video = coordinator.submit(_job("video", media_kind="video"))
+    audio = coordinator.submit(_job("audio", media_kind="audio"))
+
+    assert video is not None
+    assert audio is not None
+    assert coordinator.promote(video, "youtube:id")
+    assert coordinator.promote(audio, "youtube:id")
+    assert [job.job_id for job in coordinator.pending(video)] == ["video"]
+    assert [job.job_id for job in coordinator.pending(audio)] == ["audio"]
+    assert coordinator.finish_if_idle(video)
+    assert coordinator.finish_if_idle(audio)
 
 
 def test_disk_cache_ttl_and_lru(tmp_path) -> None:
