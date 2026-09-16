@@ -153,6 +153,140 @@ def test_extract_first_url_trims_punctuation() -> None:
     assert main.extract_first_url("look (https://example.com/video).") == "https://example.com/video"
 
 
+def test_pausing_group_invalidates_queued_job_before_metadata_probe(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.group_registry.record_bootstrap_result(
+        -100,
+        title="Paused",
+        chat_type="supergroup",
+        telegram_status="member",
+    )
+    job = Job(
+        "queued",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "User",
+        True,
+        runtime_revision=0,
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    result, _group = app.group_registry.set_runtime_mode(-100, "soft", 42, expected_revision=0)
+    assert result == "changed"
+    app._invalidate_group_work(-100)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probed")))
+
+    app._process_flight(flight)
+
+    assert fake.sends == []
+    assert fake.deletes == []
+    assert fake.reactions[0][2] == "👀"
+    assert fake.reactions[-1][2] is None
+
+
+def test_pausing_one_group_does_not_cancel_shared_delivery_to_another(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    for chat_id in (-100, -200):
+        app.group_registry.record_bootstrap_result(
+            chat_id,
+            title=f"Group {chat_id}",
+            chat_type="supergroup",
+            telegram_status="member",
+        )
+    paused = Job(
+        "paused",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "Paused User",
+        True,
+        runtime_revision=0,
+    )
+    active = Job(
+        "active",
+        -200,
+        None,
+        43,
+        8,
+        "https://example.com/video",
+        "https://example.com/video",
+        "Active User",
+        True,
+        runtime_revision=0,
+    )
+    flight = app.coordinator.submit(paused)
+    assert flight is not None
+    assert app.coordinator.submit(active) is None
+    app._set_status_reaction(paused, "👀")
+    app._set_status_reaction(active, "👀")
+    app.group_registry.set_runtime_mode(-100, "soft", 42, expected_revision=0)
+    app._invalidate_group_work(-100)
+    metadata = MediaMetadata(
+        url=active.url,
+        info={
+            "id": "video",
+            "extractor": "Test",
+            "formats": [{"format_id": "video", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        },
+        media_key="test:video",
+        source_name="Test",
+    )
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    assert [kwargs["chat_id"] for _video, kwargs in fake.sends] == [-200]
+    assert fake.deletes == [(-200, 43)]
+
+
+def test_pausing_group_clears_and_disables_existing_failure_retry(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.group_registry.record_bootstrap_result(
+        -100,
+        title="Paused",
+        chat_type="supergroup",
+        telegram_status="member",
+    )
+    job = Job(
+        "failed",
+        -100,
+        None,
+        42,
+        7,
+        "https://example.com/video",
+        "https://example.com/video",
+        "User",
+        True,
+        runtime_revision=0,
+    )
+    app._after_failure(job)
+
+    app.group_registry.set_runtime_mode(-100, "soft", 42, expected_revision=0)
+    app._invalidate_group_work(-100)
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    assert [item[2] for item in fake.reactions] == ["👎", None]
+    assert app.queue.empty()
+
+
 def test_self_mention_requires_a_message_token() -> None:
     assert main.BotApplication._self_mention("hello @alice", "alice")
     assert not main.BotApplication._self_mention("https://example.com/@alice/video", "alice")

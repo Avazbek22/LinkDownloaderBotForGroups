@@ -184,6 +184,21 @@ class BotApplication:
             finally:
                 self.queue.task_done()
 
+    def _job_access_allowed(self, job: Job) -> bool:
+        return self.group_registry.access_allowed(job.chat_id, self._approval_required) and (
+            self.group_registry.runtime_revision_for(job.chat_id) == job.runtime_revision
+        )
+
+    def _filter_active_jobs(self, jobs: list[Job]) -> list[Job]:
+        active: list[Job] = []
+        for job in jobs:
+            if self._job_access_allowed(job):
+                active.append(job)
+            else:
+                self._forget_failed_retry(job)
+                self._clear_status_reaction(job)
+        return active
+
     def _maintenance_loop(self) -> None:
         interval = min(60, self.settings.disk_cache_ttl)
         while not self.stop_event.wait(interval):
@@ -201,7 +216,10 @@ class BotApplication:
                 self.log.exception("group access maintenance failed")
 
     def _process_flight(self, flight: Flight) -> None:
-        first = flight.jobs[0]
+        first = next((job for job in flight.jobs if self._job_access_allowed(job)), None)
+        if first is None:
+            self._clear_status_many(self.coordinator.abort(flight))
+            return
         started = time.monotonic()
         deadline = started + self.settings.job_timeout
         self.log.info("job metadata job_id=%s url=%s", first.job_id, safe_url_for_log(first.url))
@@ -220,7 +238,7 @@ class BotApplication:
                 return
             metadata = MediaMetadata(first.url, {"id": media_key}, media_key, display_source_name(source_name))
             while True:
-                batch = self.coordinator.pending(flight)
+                batch = self._filter_active_jobs(self.coordinator.pending(flight))
                 if batch:
                     retry_jobs = self._send_by_file_id(batch, file_id, metadata, media_key)
                     if retry_jobs:
@@ -274,7 +292,7 @@ class BotApplication:
         file_path = self.disk_cache.get(media_key) if self.settings.media_cache_enabled else None
 
         while True:
-            batch = retry_jobs or self.coordinator.pending(flight)
+            batch = self._filter_active_jobs(retry_jobs or self.coordinator.pending(flight))
             retry_jobs = []
             if batch:
                 if file_id:
@@ -346,6 +364,10 @@ class BotApplication:
         media_key: str,
     ) -> list[Job]:
         for index, job in enumerate(jobs):
+            if not self._job_access_allowed(job):
+                self._forget_failed_retry(job)
+                self._clear_status_reaction(job)
+                continue
             try:
                 self._send_video(job, file_id, metadata, upload=False)
                 self._after_success(job)
@@ -368,6 +390,10 @@ class BotApplication:
     ) -> str | None:
         file_id: str | None = None
         for job in jobs:
+            if not self._job_access_allowed(job):
+                self._forget_failed_retry(job)
+                self._clear_status_reaction(job)
+                continue
             try:
                 if file_id:
                     self._send_video(job, file_id, metadata, upload=False)
@@ -415,6 +441,10 @@ class BotApplication:
         return self.bot.send_video(video=video, **kwargs)
 
     def _after_success(self, job: Job) -> None:
+        if not self._job_access_allowed(job):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+            return
         self._forget_failed_retry(job)
         if job.delete_original:
             try:
@@ -426,6 +456,10 @@ class BotApplication:
             self._clear_status_reaction(job)
 
     def _after_failure(self, job: Job) -> None:
+        if not self._job_access_allowed(job):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+            return
         if self._set_status_reaction(job, "👎"):
             self._remember_failed_retry(job, "👎")
         else:
@@ -437,6 +471,10 @@ class BotApplication:
             self._after_failure(job)
 
     def _after_instagram_restriction(self, job: Job) -> None:
+        if not self._job_access_allowed(job):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+            return
         if self._set_status_reaction(job, "🙈"):
             self._remember_failed_retry(job, "🙈")
         else:
@@ -448,6 +486,10 @@ class BotApplication:
             self._after_instagram_restriction(job)
 
     def _after_non_video(self, job: Job) -> None:
+        if not self._job_access_allowed(job):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+            return
         self._forget_failed_retry(job)
         if not self._set_status_reaction(job, "🤷"):
             self._clear_status_reaction(job)
@@ -498,6 +540,18 @@ class BotApplication:
         with self._failed_retry_lock:
             self._failed_retries.pop(key, None)
             self._retries_in_progress.discard(key)
+
+    def _invalidate_group_work(self, chat_id: int) -> None:
+        jobs_to_clear = {self._retry_key(job): job for job in self.coordinator.jobs_for_chat(chat_id)}
+        with self._failed_retry_lock:
+            keys = [key for key in self._failed_retries if key[0] == int(chat_id)]
+            for key in keys:
+                failed = self._failed_retries.pop(key, None)
+                if failed is not None:
+                    jobs_to_clear.setdefault(key, failed.job)
+                self._retries_in_progress.discard(key)
+        for job in jobs_to_clear.values():
+            self._clear_status_reaction(job)
 
     def _retry_in_progress(self, job: Job) -> bool:
         with self._failed_retry_lock:
@@ -559,6 +613,10 @@ class BotApplication:
         if failed is None:
             return
         retry_job = replace(failed.job, job_id=uuid.uuid4().hex[:16])
+        if not self._job_access_allowed(retry_job):
+            self._forget_failed_retry(retry_job)
+            self._clear_status_reaction(retry_job)
+            return
         flight: Flight | None = None
         queued = False
         try:
@@ -598,7 +656,7 @@ class BotApplication:
             )
 
     def _set_status_reaction(self, job: Job, emoji: str) -> bool:
-        if not self.settings.status_reactions:
+        if not self.settings.status_reactions or not self._job_access_allowed(job):
             return False
         method = getattr(self.bot, "set_message_reaction", None)
         if method is None:
@@ -636,7 +694,15 @@ class BotApplication:
         text = str(exc).lower()
         return "file_id" in text or "file identifier" in text or "file reference" in text
 
-    def _safe_message(self, chat_id: int, text: str, thread_id: int | None = None, *, html_mode: bool = False) -> bool:
+    def _safe_message(
+        self,
+        chat_id: int,
+        text: str,
+        thread_id: int | None = None,
+        *,
+        html_mode: bool = False,
+        reply_markup: Any | None = None,
+    ) -> bool:
         try:
             kwargs: dict[str, Any] = {
                 "disable_notification": True,
@@ -646,6 +712,8 @@ class BotApplication:
                 kwargs["parse_mode"] = "HTML"
             if thread_id is not None:
                 kwargs["message_thread_id"] = thread_id
+            if reply_markup is not None:
+                kwargs["reply_markup"] = reply_markup
             self.bot.send_message(chat_id, text, **kwargs)
             return True
         except Exception:
@@ -796,6 +864,9 @@ class BotApplication:
         blocked_membership_changed = current.get("access_status") in {"rejected", "expired"} and previous.get(
             "telegram_status"
         ) != current.get("telegram_status")
+        approved_runtime_changed = current.get("access_status") == "approved" and (
+            self.group_registry.runtime_revision(previous) != self.group_registry.runtime_revision(current)
+        )
         if resolved_pending:
             self.log.info(
                 "group approval state changed chat_id=%s request_id=%s access_status=%s resolution=%s",
@@ -804,7 +875,7 @@ class BotApplication:
                 current.get("access_status"),
                 current.get("resolution"),
             )
-        if resolved_pending or blocked_membership_changed:
+        if resolved_pending or blocked_membership_changed or approved_runtime_changed:
             self._update_owner_decision_card(current)
 
     def _record_group_access(
@@ -1042,6 +1113,19 @@ class BotApplication:
         telegram_status = str(group.get("telegram_status") or "unknown")
         leave_failed = bool(group.get("leave_error"))
         inactive = telegram_status in {"left", "kicked"}
+        runtime_mode = GroupRegistry.runtime_mode(group)
+        if runtime_mode == "soft":
+            return "approved:soft", "⏸ Approved — processing is paused.", "Approved; processing paused"
+        if runtime_mode == "hard":
+            if inactive:
+                return "approved:hard:left", "⛔ Access revoked — bot left the group.", "Access revoked; bot left"
+            if leave_failed:
+                return (
+                    "approved:hard:retry",
+                    "⛔ Access revoked — automatic leave will be retried.",
+                    "Access revoked; automatic leave will be retried",
+                )
+            return "approved:hard:leaving", "⛔ Access revoked — leaving the group.", "Access revoked; leaving"
         if access_status == "approved":
             return "approved", "✅ Approved", "Approved"
         if access_status == "rejected":
@@ -1238,7 +1322,10 @@ class BotApplication:
         chat_id = int(group["chat_id"])
         if notify:
             language = self.storage.chat_language(chat_id)
-            key = "group_rejected" if group.get("access_status") == "rejected" else "group_approval_expired"
+            if self.group_registry.runtime_mode(group) == "hard":
+                key = "group_access_revoked"
+            else:
+                key = "group_rejected" if group.get("access_status") == "rejected" else "group_approval_expired"
             self._safe_message(chat_id, tr(language, key))
         try:
             result = self.bot.leave_chat(chat_id)
@@ -1342,6 +1429,7 @@ class BotApplication:
                     telebot.types.BotCommand("settings", "Show group settings"),
                     telebot.types.BotCommand("delete_original", "Configure link deletion (admins)"),
                     telebot.types.BotCommand("groups", "Show current bot groups"),
+                    telebot.types.BotCommand("group", "Manage one bot group"),
                     telebot.types.BotCommand("pending_groups", "Review pending groups"),
                 ],
                 scope=telebot.types.BotCommandScopeChat(chat_id=owner_id),
@@ -1355,7 +1443,8 @@ class BotApplication:
         chat_id = int(group.get("chat_id") or 0)
         chat_type = html.escape(str(group.get("type") or "unknown"), quote=False)
         telegram_status = html.escape(str(group.get("telegram_status") or "unknown"), quote=False)
-        return f"• <b>{title}</b> — <code>{chat_id}</code> ({chat_type}; {telegram_status})"
+        runtime_mode = html.escape(GroupRegistry.runtime_mode(group), quote=False)
+        return f"• <b>{title}</b> — <code>{chat_id}</code> ({chat_type}; {telegram_status}; {runtime_mode})"
 
     def _send_long_html(self, chat_id: int, sections: list[tuple[str, list[dict[str, Any]]]]) -> None:
         chunks: list[str] = []
@@ -1388,11 +1477,162 @@ class BotApplication:
         self._send_long_html(
             owner_id,
             [
-                ("Approved", [group for group in current if group.get("access_status") == "approved"]),
+                (
+                    "Approved",
+                    [
+                        group
+                        for group in current
+                        if group.get("access_status") == "approved"
+                        and self.group_registry.runtime_mode(group) == "active"
+                    ],
+                ),
+                (
+                    "Paused",
+                    [
+                        group
+                        for group in current
+                        if group.get("access_status") == "approved"
+                        and self.group_registry.runtime_mode(group) == "soft"
+                    ],
+                ),
+                (
+                    "Revoked / leaving",
+                    [group for group in current if self.group_registry.runtime_mode(group) == "hard"],
+                ),
                 ("Pending", [group for group in current if group.get("access_status") == "pending"]),
                 ("Unreviewed", [group for group in current if group.get("access_status") == "unreviewed"]),
             ],
         )
+        manageable = [group for group in current if group.get("access_status") == "approved"]
+        if manageable:
+            markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+            for group in manageable[:50]:
+                title = str(group.get("title") or group.get("chat_id") or "Untitled group")
+                label = title if len(title) <= 42 else f"{title[:39]}..."
+                markup.add(
+                    telebot.types.InlineKeyboardButton(
+                        f"⚙️ {label}",
+                        callback_data=self._group_management_callback_data("o", group),
+                    )
+                )
+            suffix = (
+                ""
+                if len(manageable) <= 50
+                else "\nShowing the first 50 groups. Use /group &lt;chat_id&gt; for another group."
+            )
+            self._safe_message(owner_id, f"<b>Manage a group</b>{suffix}", html_mode=True, reply_markup=markup)
+
+    @staticmethod
+    def _group_management_callback_data(action: str, group: dict[str, Any]) -> str:
+        return f"gm:{action}:{int(group.get('chat_id') or 0)}:{GroupRegistry.runtime_revision(group)}"
+
+    def _group_management_markup(self, group: dict[str, Any], *, confirm_hard: bool = False) -> Any | None:
+        if group.get("access_status") != "approved":
+            return None
+        mode = self.group_registry.runtime_mode(group)
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        if confirm_hard:
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    "⛔ Confirm revoke & leave",
+                    callback_data=self._group_management_callback_data("x", group),
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "Cancel",
+                    callback_data=self._group_management_callback_data("o", group),
+                ),
+            )
+            return markup
+        if mode == "active":
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    "⏸ Pause silently",
+                    callback_data=self._group_management_callback_data("s", group),
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "⛔ Revoke & leave",
+                    callback_data=self._group_management_callback_data("h", group),
+                ),
+            )
+        elif mode == "soft":
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    "▶ Resume silently",
+                    callback_data=self._group_management_callback_data("u", group),
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "⛔ Revoke & leave",
+                    callback_data=self._group_management_callback_data("h", group),
+                ),
+            )
+        return markup if mode in {"active", "soft"} else None
+
+    def _group_management_text(self, group: dict[str, Any], *, confirm_hard: bool = False) -> str:
+        title = html.escape(str(group.get("title") or "Untitled group"), quote=False)
+        chat_id = int(group.get("chat_id") or 0)
+        approval = html.escape(str(group.get("access_status") or "unknown"), quote=False)
+        membership = html.escape(str(group.get("telegram_status") or "unknown"), quote=False)
+        mode = self.group_registry.runtime_mode(group)
+        mode_label = {"active": "✅ Active", "soft": "⏸ Paused", "hard": "⛔ Revoked"}[mode]
+        lines = [
+            "<b>Group management</b>",
+            "",
+            f"Group: <b>{title}</b>",
+            f"Chat ID: <code>{chat_id}</code>",
+            f"Approval: {approval}",
+            f"Membership: {membership}",
+            f"Mode: {mode_label}",
+        ]
+        if mode == "soft":
+            lines.extend(["", "The bot remains in the group and silently ignores messages, commands, and reactions."])
+        elif mode == "hard":
+            if membership in {"left", "kicked"}:
+                lines.extend(["", "The bot is no longer in the group."])
+            elif group.get("leave_error"):
+                lines.extend(["", "The bot is blocked and automatic leave will be retried."])
+            else:
+                lines.extend(["", "The bot is blocked and is leaving the group."])
+        if confirm_hard:
+            lines.extend(
+                [
+                    "",
+                    "<b>Confirm hard revoke?</b>",
+                    "The bot will notify the group once, block all processing, and leave. Re-adding it will require approval again.",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _send_group_management(self, owner_id: int, chat_id: int) -> None:
+        group = self.group_registry.get_group(chat_id)
+        if group is None:
+            self._safe_message(owner_id, "Group not found.")
+            return
+        self._safe_message(
+            owner_id,
+            self._group_management_text(group),
+            html_mode=True,
+            reply_markup=self._group_management_markup(group),
+        )
+
+    def _edit_group_management(self, call: Any, group: dict[str, Any], *, confirm_hard: bool = False) -> None:
+        message = getattr(call, "message", None)
+        try:
+            chat_id = int(message.chat.id)
+            message_id = int(message.message_id)
+            self.bot.edit_message_text(
+                self._group_management_text(group, confirm_hard=confirm_hard),
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=self._group_management_markup(group, confirm_hard=confirm_hard),
+            )
+        except Exception as exc:
+            if self._message_not_modified(exc):
+                return
+            owner_id = self.group_registry.owner_id()
+            if owner_id is not None:
+                self._send_group_management(owner_id, int(group["chat_id"]))
 
     def _show_pending_groups(self, owner_id: int) -> None:
         self._refresh_group_registry()
@@ -1460,6 +1700,88 @@ class BotApplication:
             self._answer_callback(callback_id, "Group rejected.")
         with suppress(Exception):
             self.bot.edit_message_reply_markup(message.chat.id, message.message_id, reply_markup=None)
+
+    def _handle_group_management_callback(self, call: Any) -> None:
+        data = str(getattr(call, "data", "") or "")
+        parts = data.split(":")
+        callback_id = getattr(call, "id", None)
+        if len(parts) != 4 or parts[0] != "gm" or parts[1] not in {"o", "s", "u", "h", "x"}:
+            self._answer_callback(callback_id, "Invalid group action.", alert=True)
+            return
+        try:
+            user_id = int(call.from_user.id)
+            chat_id = int(parts[2])
+            expected_revision = int(parts[3])
+        except (AttributeError, TypeError, ValueError):
+            self._answer_callback(callback_id, "Invalid group action.", alert=True)
+            return
+        if not self.group_registry.is_owner(user_id):
+            self._answer_callback(callback_id, "Not authorized.", alert=True)
+            return
+        group = self.group_registry.get_group(chat_id)
+        if group is None:
+            self._answer_callback(callback_id, "Group not found.", alert=True)
+            return
+        action = parts[1]
+        current_revision = self.group_registry.runtime_revision(group)
+        if action == "o":
+            self._edit_group_management(call, group)
+            self._answer_callback(callback_id, "Group status refreshed.")
+            return
+        if expected_revision != current_revision:
+            self._edit_group_management(call, group)
+            self._answer_callback(callback_id, "Group state changed. The card was refreshed.", alert=True)
+            return
+        if action == "h":
+            if group.get("access_status") != "approved" or self.group_registry.runtime_mode(group) == "hard":
+                self._edit_group_management(call, group)
+                self._answer_callback(callback_id, "This group cannot be revoked from its current state.", alert=True)
+                return
+            self._edit_group_management(call, group, confirm_hard=True)
+            self._answer_callback(callback_id, "Confirm the hard revoke.")
+            return
+
+        requested_mode = {"s": "soft", "u": "active", "x": "hard"}[action]
+        result, updated = self.group_registry.set_runtime_mode(
+            chat_id,
+            requested_mode,
+            user_id,
+            expected_revision=expected_revision,
+        )
+        if result != "changed" or updated is None:
+            current = self.group_registry.get_group(chat_id) or group
+            self._edit_group_management(call, current)
+            message = {
+                "stale": "Group state changed. The card was refreshed.",
+                "already_set": "The group is already in that mode.",
+                "hard_revoked": "Hard revocation cannot be undone from this membership.",
+                "not_approved": "Only an approved group can be managed.",
+            }.get(result, "The requested transition is not available.")
+            self._answer_callback(callback_id, message, alert=True)
+            return
+
+        self._invalidate_group_work(chat_id)
+        self.log.info(
+            "group runtime changed chat_id=%s mode=%s revision=%s owner_id=%s",
+            chat_id,
+            requested_mode,
+            self.group_registry.runtime_revision(updated),
+            user_id,
+        )
+        if requested_mode == "hard":
+            self._leave_blocked_group(updated, notify=True)
+            updated = self.group_registry.get_group(chat_id) or updated
+            response = "Access revoked. The bot left the group."
+            if str(updated.get("telegram_status")) not in {"left", "kicked"}:
+                response = "Access revoked. Leaving will be retried automatically."
+        elif requested_mode == "soft":
+            self._update_owner_decision_card(updated)
+            response = "Group processing paused silently."
+        else:
+            self._update_owner_decision_card(updated)
+            response = "Group processing resumed silently."
+        self._edit_group_management(call, updated)
+        self._answer_callback(callback_id, response)
 
     def _handle_my_chat_member(self, update: Any) -> None:
         chat = getattr(update, "chat", None)
@@ -1531,6 +1853,10 @@ class BotApplication:
         @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("ga:"))
         def group_access_callback(call: Any) -> None:
             self._handle_group_access_callback(call)
+
+        @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("gm:"))
+        def group_management_callback(call: Any) -> None:
+            self._handle_group_management_callback(call)
 
         @bot.message_reaction_handler(func=lambda _update: True)
         def retry_reaction(update: Any) -> None:
@@ -1636,7 +1962,7 @@ class BotApplication:
             state = tr(language_code, "state_on" if enabled else "state_off")
             self._safe_message(chat_id, tr(language_code, "delete_changed", state=state))
 
-        @bot.message_handler(commands=["groups", "pending_groups"])
+        @bot.message_handler(commands=["groups", "group", "pending_groups"])
         def owner_groups(message: Any) -> None:
             if getattr(message.chat, "type", "") != "private":
                 return
@@ -1649,8 +1975,19 @@ class BotApplication:
             command = (message.text or "").split(maxsplit=1)[0].split("@", 1)[0].lower()
             if command == "/groups":
                 self._show_groups(user_id)
-            else:
+            elif command == "/pending_groups":
                 self._show_pending_groups(user_id)
+            else:
+                parts = (message.text or "").split(maxsplit=1)
+                if len(parts) != 2:
+                    self._safe_message(int(message.chat.id), "Use /group <chat_id>.")
+                    return
+                try:
+                    chat_id = int(parts[1].strip())
+                except ValueError:
+                    self._safe_message(int(message.chat.id), "Use /group <chat_id>.")
+                    return
+                self._send_group_management(user_id, chat_id)
 
         @bot.message_handler(func=lambda item: getattr(item.chat, "type", "") == "private", content_types=["text"])
         def private_text(message: Any) -> None:
@@ -1719,6 +2056,7 @@ class BotApplication:
                 url_key=normalized_url_key(url),
                 sender_name=self._sender_name(message),
                 delete_original=self.storage.delete_original(chat_id),
+                runtime_revision=self.group_registry.runtime_revision(group),
             )
             self._set_status_reaction(job, "👀")
             flight = self.coordinator.submit(job)

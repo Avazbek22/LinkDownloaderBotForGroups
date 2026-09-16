@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -23,6 +24,34 @@ def test_owner_binding_uses_username_once_then_stable_numeric_id(tmp_path) -> No
     restarted = GroupRegistry(tmp_path, "owner_name", "approval")
     assert restarted.owner_id() == 42
     assert restarted.bind_owner(42, None) == "owner"
+
+
+def test_existing_registry_is_migrated_to_active_runtime_mode(tmp_path) -> None:
+    legacy = {
+        "version": 1,
+        "owner": {"configured_username": "owner_name", "user_id": 42, "bound_at": None},
+        "policy": {"mode": "approval"},
+        "groups": {
+            "-1001": {
+                "chat_id": -1001,
+                "title": "Existing",
+                "type": "supergroup",
+                "telegram_status": "member",
+                "access_status": "approved",
+                "first_seen_at": "2026-01-01T00:00:00+00:00",
+            }
+        },
+    }
+    (tmp_path / "groups.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    group = registry.get_group(-1001)
+
+    assert registry.snapshot()["version"] == 2
+    assert GroupRegistry.runtime_mode(group) == "active"
+    assert GroupRegistry.runtime_revision(group) == 0
+    assert group["runtime_history"] == []
+    assert registry.access_allowed(-1001, True)
 
 
 def test_unapproved_group_is_pending_and_owner_addition_is_approved(tmp_path) -> None:
@@ -233,6 +262,114 @@ def test_pending_expiry_survives_restart_and_approved_groups_survive_readd(tmp_p
     assert readded["access_status"] == "approved"
 
 
+def test_soft_pause_is_persistent_revisioned_and_reversible(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    group = registry.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="member",
+        approval_required=True,
+    )
+    registry.resolve_request(group["request_id"], "approved", 42)
+
+    result, paused = registry.set_runtime_mode(-1001, "soft", 42, expected_revision=0)
+
+    assert result == "changed"
+    assert GroupRegistry.runtime_mode(paused) == "soft"
+    assert GroupRegistry.runtime_revision(paused) == 1
+    assert not registry.access_allowed(-1001, True)
+    stale, _group = registry.set_runtime_mode(-1001, "active", 42, expected_revision=0)
+    assert stale == "stale"
+
+    restarted = GroupRegistry(tmp_path, "owner_name", "approval")
+    assert GroupRegistry.runtime_mode(restarted.get_group(-1001)) == "soft"
+    restarted.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="left",
+        approval_required=True,
+    )
+    readded = restarted.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="member",
+        added_by=_user(7, "member"),
+        approval_required=True,
+        membership_started=True,
+    )
+    assert GroupRegistry.runtime_mode(readded) == "soft"
+    assert not restarted.access_allowed(-1001, True)
+    resumed, active = restarted.set_runtime_mode(-1001, "active", 42, expected_revision=1)
+    assert resumed == "changed"
+    assert GroupRegistry.runtime_mode(active) == "active"
+    assert restarted.access_allowed(-1001, True)
+    assert [entry["reason"] for entry in active["runtime_history"]] == ["owner_paused", "owner_resumed"]
+
+
+def test_hard_revoke_requires_review_after_member_readds_bot(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    assert registry.bind_owner(42, "owner_name") == "claimed"
+    group = registry.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="member",
+        approval_required=True,
+    )
+    registry.resolve_request(group["request_id"], "approved", 42)
+    result, revoked = registry.set_runtime_mode(-1001, "hard", 42, expected_revision=0)
+    assert result == "changed"
+    registry.mark_leave_attempt(-1001, None)
+
+    readded = registry.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="member",
+        added_by=_user(7, "member"),
+        approval_required=True,
+        membership_started=True,
+    )
+
+    assert GroupRegistry.runtime_mode(revoked) == "hard"
+    assert readded["access_status"] == "pending"
+    assert GroupRegistry.runtime_mode(readded) == "active"
+    assert not registry.access_allowed(-1001, True)
+
+
+def test_bound_owner_readding_hard_revoked_group_restores_access(tmp_path) -> None:
+    registry = GroupRegistry(tmp_path, "owner_name", "approval")
+    assert registry.bind_owner(42, "owner_name") == "claimed"
+    group = registry.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="member",
+        approval_required=True,
+    )
+    registry.resolve_request(group["request_id"], "approved", 42)
+    registry.set_runtime_mode(-1001, "hard", 42, expected_revision=0)
+    registry.mark_leave_attempt(-1001, None)
+
+    readded = registry.record_presence(
+        -1001,
+        title="Approved",
+        chat_type="supergroup",
+        telegram_status="administrator",
+        added_by=_user(42, "renamed_owner"),
+        approval_required=True,
+        membership_started=True,
+    )
+
+    assert readded["access_status"] == "approved"
+    assert readded["resolution"] == "readded_by_owner"
+    assert GroupRegistry.runtime_mode(readded) == "active"
+    assert registry.access_allowed(-1001, True)
+
+
 def test_bootstrap_approves_only_api_verified_active_membership(tmp_path) -> None:
     registry = GroupRegistry(tmp_path, "owner_name", "approval")
 
@@ -271,12 +408,15 @@ def test_chat_migration_keeps_approval_and_removes_old_record(tmp_path) -> None:
         approval_required=True,
     )
     registry.resolve_request(group["request_id"], "approved", 42)
+    registry.set_runtime_mode(-123, "soft", 42, expected_revision=0)
 
     registry.migrate_chat_id(-123, -100123)
 
     assert registry.get_group(-123) is None
     migrated = registry.get_group(-100123)
     assert migrated["access_status"] == "approved"
+    assert GroupRegistry.runtime_mode(migrated) == "soft"
+    assert GroupRegistry.runtime_revision(migrated) == 1
     assert migrated["type"] == "supergroup"
 
 

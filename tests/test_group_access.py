@@ -172,6 +172,15 @@ def _callback(request_id: str, user_id: int, action: str) -> SimpleNamespace:
     )
 
 
+def _management_callback(chat_id: int, user_id: int, action: str, revision: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=f"management-{user_id}-{action}",
+        data=f"gm:{action}:{chat_id}:{revision}",
+        from_user=_user(user_id, f"user_{user_id}"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=user_id), message_id=19, html_text="management"),
+    )
+
+
 def test_pending_group_is_blocked_before_url_validation_reaction_and_queue(tmp_path, monkeypatch) -> None:
     app = main.BotApplication(_settings(tmp_path))
     bot = GroupBot()
@@ -365,7 +374,7 @@ def test_owner_commands_are_scoped_and_not_in_the_global_menu(tmp_path) -> None:
     owner_commands = [command.command for command in bot.command_sets[1][0]]
     assert "groups" not in global_commands
     assert "pending_groups" not in global_commands
-    assert {"groups", "pending_groups"}.issubset(owner_commands)
+    assert {"groups", "group", "pending_groups"}.issubset(owner_commands)
     assert bot.command_sets[0][1] is None
     assert bot.command_sets[1][1].chat_id == 42
 
@@ -374,7 +383,122 @@ def test_membership_and_callback_handlers_are_registered(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
 
     assert len(app.bot.my_chat_member_handlers) == 1
-    assert len(app.bot.callback_query_handlers) == 1
+    assert len(app.bot.callback_query_handlers) == 2
+
+
+def test_owner_can_pause_and_resume_group_without_group_messages(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app.bot_username = "downloader"
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+    bot.messages.clear()
+    bot.reactions.clear()
+    bot.edited_messages.clear()
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "s"))
+
+    paused = app.group_registry.get_group(-1001)
+    assert app.group_registry.runtime_mode(paused) == "soft"
+    assert bot.messages == []
+    assert bot.left == []
+    assert "Mode: ⏸ Paused" in bot.edited_messages[-1][2]
+    monkeypatch.setattr(main, "validate_public_url", lambda _url: (_ for _ in ()).throw(AssertionError("parsed")))
+    app._handle_group_message(_message())
+    assert app.queue.empty()
+    assert bot.reactions == []
+    assert bot.messages == []
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "u", revision=1))
+
+    resumed = app.group_registry.get_group(-1001)
+    assert app.group_registry.runtime_mode(resumed) == "active"
+    assert bot.messages == []
+    assert "Mode: ✅ Active" in bot.edited_messages[-1][2]
+
+
+def test_hard_revoke_requires_confirmation_then_notifies_and_leaves(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+    bot.messages.clear()
+    bot.left.clear()
+    bot.edited_messages.clear()
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "h"))
+
+    assert app.group_registry.runtime_mode(app.group_registry.get_group(-1001)) == "active"
+    assert bot.messages == []
+    assert bot.left == []
+    assert "Confirm hard revoke?" in bot.edited_messages[-1][2]
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "x"))
+
+    revoked = app.group_registry.get_group(-1001)
+    assert app.group_registry.runtime_mode(revoked) == "hard"
+    assert revoked["telegram_status"] == "left"
+    assert bot.left == [-1001]
+    group_messages = [text for chat_id, text, _kwargs in bot.messages if chat_id == -1001]
+    assert group_messages == ["⛔ The bot owner revoked access to this group. I am leaving the group."]
+    assert "Mode: ⛔ Revoked" in bot.edited_messages[-1][2]
+
+
+def test_hard_revoke_retries_failed_leave_without_repeating_group_notice(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    bot.fail_leave = True
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+    bot.messages.clear()
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "x"))
+
+    revoked = app.group_registry.get_group(-1001)
+    assert app.group_registry.runtime_mode(revoked) == "hard"
+    assert revoked["leave_error"] == "RuntimeError"
+    assert [chat_id for chat_id, _text, _kwargs in bot.messages] == [-1001]
+
+    bot.fail_leave = False
+    monkeypatch.setattr(main, "GROUP_NOTIFICATION_RETRY_SECONDS", 0)
+    app._maintain_group_access()
+
+    assert app.group_registry.get_group(-1001)["telegram_status"] == "left"
+    assert [chat_id for chat_id, _text, _kwargs in bot.messages] == [-1001]
+
+
+def test_group_management_rejects_unauthorized_and_stale_actions(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    bot = GroupBot()
+    app.bot = bot
+    app.bot_id = 500
+    app._maybe_bind_owner(_user(42, "owner_name"))
+    app._handle_my_chat_member(_membership_update(-1001, _user(7, "adder")))
+    request_id = app.group_registry.get_group(-1001)["request_id"]
+    app._handle_group_access_callback(_callback(request_id, 42, "a"))
+
+    app._handle_group_management_callback(_management_callback(-1001, 99, "s"))
+    assert app.group_registry.runtime_mode(app.group_registry.get_group(-1001)) == "active"
+    assert bot.callback_answers[-1][2] is True
+
+    app._handle_group_management_callback(_management_callback(-1001, 42, "s"))
+    app._handle_group_management_callback(_management_callback(-1001, 42, "x", revision=0))
+
+    assert app.group_registry.runtime_mode(app.group_registry.get_group(-1001)) == "soft"
+    assert bot.callback_answers[-1][2] is True
+    assert "state changed" in bot.callback_answers[-1][1]
 
 
 def test_pending_card_contains_member_count_and_human_administrator_roles(tmp_path) -> None:

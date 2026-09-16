@@ -10,6 +10,8 @@ from app.storage import JsonFile
 
 ACTIVE_TELEGRAM_STATUSES = frozenset({"member", "administrator"})
 BLOCKED_ACCESS_STATUSES = frozenset({"rejected", "expired"})
+RUNTIME_MODES = frozenset({"active", "soft", "hard"})
+RUNTIME_HISTORY_LIMIT = 50
 
 
 def normalize_username(value: str | None) -> str:
@@ -72,7 +74,7 @@ class GroupRegistry:
         self.store = JsonFile(
             data_dir / "groups.json",
             lambda: {
-                "version": 1,
+                "version": 2,
                 "owner": {
                     "configured_username": normalize_username(configured_owner_username),
                     "user_id": None,
@@ -86,9 +88,10 @@ class GroupRegistry:
 
     def configure(self, owner_username: str, access_mode: str) -> None:
         normalized = normalize_username(owner_username)
+        timestamp = _timestamp()
 
         def mutate(data: dict[str, Any]) -> None:
-            data["version"] = 1
+            data["version"] = 2
             owner = data.get("owner")
             if not isinstance(owner, dict):
                 owner = {}
@@ -105,6 +108,9 @@ class GroupRegistry:
             policy["mode"] = access_mode
             if not isinstance(data.get("groups"), dict):
                 data["groups"] = {}
+            for group in data["groups"].values():
+                if isinstance(group, dict):
+                    self._ensure_runtime(group, timestamp)
 
         self.store.update(mutate)
 
@@ -154,7 +160,75 @@ class GroupRegistry:
             "pending_since": None,
             "request_id": None,
             "owner_notification": None,
+            "runtime": {
+                "mode": "active",
+                "revision": 0,
+                "changed_at": timestamp,
+                "changed_by": None,
+                "reason": "initial",
+            },
+            "runtime_history": [],
         }
+
+    @staticmethod
+    def _ensure_runtime(group: dict[str, Any], timestamp: str) -> dict[str, Any]:
+        runtime = group.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            group["runtime"] = runtime
+        mode = str(runtime.get("mode") or "active").lower()
+        runtime["mode"] = mode if mode in RUNTIME_MODES else "active"
+        try:
+            revision = int(runtime.get("revision") or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        runtime["revision"] = max(0, revision)
+        if not isinstance(runtime.get("changed_at"), str):
+            runtime["changed_at"] = str(group.get("first_seen_at") or timestamp)
+        if not isinstance(runtime.get("changed_by"), int):
+            runtime["changed_by"] = None
+        if not isinstance(runtime.get("reason"), str):
+            runtime["reason"] = "legacy_default"
+        history = group.get("runtime_history")
+        if not isinstance(history, list):
+            group["runtime_history"] = []
+        elif len(history) > RUNTIME_HISTORY_LIMIT:
+            group["runtime_history"] = history[-RUNTIME_HISTORY_LIMIT:]
+        return runtime
+
+    @classmethod
+    def _change_runtime(
+        cls,
+        group: dict[str, Any],
+        mode: str,
+        timestamp: str,
+        *,
+        owner_id: int | None,
+        reason: str,
+    ) -> None:
+        runtime = cls._ensure_runtime(group, timestamp)
+        previous = str(runtime["mode"])
+        revision = int(runtime["revision"]) + 1
+        runtime.update(
+            mode=mode,
+            revision=revision,
+            changed_at=timestamp,
+            changed_by=int(owner_id) if owner_id is not None else None,
+            reason=reason,
+        )
+        history = group.setdefault("runtime_history", [])
+        history.append(
+            {
+                "from": previous,
+                "to": mode,
+                "revision": revision,
+                "changed_at": timestamp,
+                "changed_by": int(owner_id) if owner_id is not None else None,
+                "reason": reason,
+            }
+        )
+        if len(history) > RUNTIME_HISTORY_LIMIT:
+            del history[:-RUNTIME_HISTORY_LIMIT]
 
     @staticmethod
     def _start_pending(group: dict[str, Any], timestamp: str) -> None:
@@ -170,6 +244,8 @@ class GroupRegistry:
         group.pop("resolved_at", None)
         group.pop("resolved_by", None)
         group.pop("resolution", None)
+        group.pop("leave_attempted_at", None)
+        group.pop("leave_error", None)
         group["group_notice"] = {
             "status": "pending",
             "attempts": 0,
@@ -237,13 +313,43 @@ class GroupRegistry:
             if actor is not None and membership_started:
                 group["added_by"] = actor
 
+            runtime = self._ensure_runtime(group, timestamp)
             access_status = str(group.get("access_status") or "unreviewed")
             if normalized_status in ACTIVE_TELEGRAM_STATUSES:
                 owner_id = data.get("owner", {}).get("user_id")
                 actor_is_owner = (
                     membership_started and actor is not None and isinstance(owner_id, int) and actor["id"] == owner_id
                 )
-                if access_status == "approved":
+                if membership_started and runtime["mode"] == "hard":
+                    group.pop("leave_attempted_at", None)
+                    group.pop("leave_error", None)
+                    if actor_is_owner:
+                        self._change_runtime(
+                            group,
+                            "active",
+                            timestamp,
+                            owner_id=owner_id,
+                            reason="readded_by_owner",
+                        )
+                        self._approve(group, timestamp, reason="readded_by_owner", owner_id=owner_id)
+                    elif approval_required:
+                        self._change_runtime(
+                            group,
+                            "active",
+                            timestamp,
+                            owner_id=None,
+                            reason="readded_for_review",
+                        )
+                        self._start_pending(group, timestamp)
+                    else:
+                        self._change_runtime(
+                            group,
+                            "active",
+                            timestamp,
+                            owner_id=None,
+                            reason="readded_in_open_mode",
+                        )
+                elif access_status == "approved":
                     pass
                 elif actor_is_owner:
                     self._approve(group, timestamp, reason="added_by_owner", owner_id=owner_id)
@@ -262,10 +368,85 @@ class GroupRegistry:
         return result
 
     def access_allowed(self, chat_id: int, approval_required: bool) -> bool:
+        group = self.store.snapshot().get("groups", {}).get(str(int(chat_id)))
+        if isinstance(group, dict) and self.runtime_mode(group) != "active":
+            return False
         if not approval_required:
             return True
-        group = self.store.snapshot().get("groups", {}).get(str(int(chat_id)))
         return isinstance(group, dict) and group.get("access_status") == "approved"
+
+    @staticmethod
+    def runtime_mode(group: dict[str, Any] | None) -> str:
+        runtime = group.get("runtime") if isinstance(group, dict) else None
+        mode = str(runtime.get("mode") or "active").lower() if isinstance(runtime, dict) else "active"
+        return mode if mode in RUNTIME_MODES else "active"
+
+    @staticmethod
+    def runtime_revision(group: dict[str, Any] | None) -> int:
+        runtime = group.get("runtime") if isinstance(group, dict) else None
+        try:
+            return max(0, int(runtime.get("revision") or 0)) if isinstance(runtime, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def runtime_revision_for(self, chat_id: int) -> int:
+        return self.runtime_revision(self.get_group(chat_id))
+
+    def set_runtime_mode(
+        self,
+        chat_id: int,
+        mode: str,
+        owner_id: int,
+        *,
+        expected_revision: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        requested = str(mode or "").lower()
+        if requested not in RUNTIME_MODES:
+            raise ValueError("unsupported runtime mode")
+        result = "not_found"
+        updated_group: dict[str, Any] | None = None
+        timestamp = _timestamp(now)
+
+        def mutate(data: dict[str, Any]) -> None:
+            nonlocal result, updated_group
+            group = data.setdefault("groups", {}).get(str(int(chat_id)))
+            if not isinstance(group, dict):
+                return
+            runtime = self._ensure_runtime(group, timestamp)
+            current_mode = str(runtime["mode"])
+            current_revision = int(runtime["revision"])
+            if expected_revision is not None and current_revision != int(expected_revision):
+                result = "stale"
+            elif group.get("access_status") != "approved":
+                result = "not_approved"
+            elif current_mode == requested:
+                result = "already_set"
+            elif current_mode == "hard":
+                result = "hard_revoked"
+            elif requested == "active" and current_mode != "soft":
+                result = "invalid_transition"
+            else:
+                reason = {
+                    "active": "owner_resumed",
+                    "soft": "owner_paused",
+                    "hard": "owner_revoked",
+                }[requested]
+                self._change_runtime(
+                    group,
+                    requested,
+                    timestamp,
+                    owner_id=owner_id,
+                    reason=reason,
+                )
+                if requested == "hard":
+                    group.pop("leave_error", None)
+                    group.pop("leave_attempted_at", None)
+                result = "changed"
+            updated_group = copy.deepcopy(group)
+
+        self.store.update(mutate)
+        return result, updated_group
 
     def get_group(self, chat_id: int) -> dict[str, Any] | None:
         group = self.store.snapshot().get("groups", {}).get(str(int(chat_id)))
@@ -594,7 +775,7 @@ class GroupRegistry:
         current = _utc_now(now)
         result: list[dict[str, Any]] = []
         for group in self.current_groups():
-            if group.get("access_status") not in BLOCKED_ACCESS_STATUSES:
+            if group.get("access_status") not in BLOCKED_ACCESS_STATUSES and self.runtime_mode(group) != "hard":
                 continue
             last_attempt = _parse_timestamp(group.get("leave_attempted_at"))
             if last_attempt is None or current - last_attempt >= timedelta(seconds=retry_after_seconds):
@@ -717,6 +898,9 @@ class GroupRegistry:
                             target[field] = copy.deepcopy(source[field])
                         else:
                             target.pop(field, None)
+                if self.runtime_revision(source) > self.runtime_revision(target):
+                    target["runtime"] = copy.deepcopy(source.get("runtime"))
+                    target["runtime_history"] = copy.deepcopy(source.get("runtime_history", []))
                 if normalize_telegram_status(target.get("telegram_status")) == "unknown":
                     target["telegram_status"] = normalize_telegram_status(source.get("telegram_status"))
             target["chat_id"] = int(new_chat_id)

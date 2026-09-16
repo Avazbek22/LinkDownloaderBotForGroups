@@ -49,6 +49,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_approved": "✅ This group was approved. Video downloads are now enabled.",
         "group_rejected": "⛔ The bot owner did not approve this group. I am leaving the group.",
         "group_approval_expired": "⌛ Approval was not received in time. I am leaving the group.",
+        "group_access_revoked": "⛔ The bot owner revoked access to this group. I am leaving the group.",
         "caption": '<a href="{url}">Original video · {source}</a>\nFrom {sender}',
     },
     "ru": {
@@ -97,6 +98,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_approved": "✅ Группа подтверждена. Скачивание видео теперь включено.",
         "group_rejected": "⛔ Владелец бота не подтвердил эту группу. Я покидаю группу.",
         "group_approval_expired": "⌛ Подтверждение не получено вовремя. Я покидаю группу.",
+        "group_access_revoked": "⛔ Владелец бота отозвал доступ для этой группы. Я покидаю группу.",
         "caption": '<a href="{url}">Ссылка на видео · {source}</a>\nОт {sender}',
     },
 }

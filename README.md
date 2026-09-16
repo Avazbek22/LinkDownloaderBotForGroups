@@ -236,7 +236,7 @@ No command is required.
 | `/delete_original on` | Delete processed links after success |
 | `/delete_original off` | Keep original links |
 
-When owner approval is enabled, the owner also gets private `/groups` and `/pending_groups` commands. They are scoped to the owner's private chat and are not published in the global command menu.
+When owner approval is enabled, the owner also gets private `/groups`, `/group <chat_id>`, and `/pending_groups` commands. They are scoped to the owner's private chat and are not published in the global command menu.
 
 Language and group settings can be changed only by group administrators.
 
@@ -326,9 +326,19 @@ When someone adds the bot to a new group:
 7. failed leave attempts are retried, and the saved request message is updated after a later successful attempt;
 8. an unanswered request expires after the configured TTL and the bot leaves.
 
-If the bound owner adds the bot personally, that group is approved automatically. Previously approved groups remain approved when re-added. Notification delivery and failed leave attempts are retried safely in the background.
+The group receives one localized waiting-for-approval message. Approval posts a localized confirmation (and the normal usage help on the first welcome). Rejection or expiry posts one localized explanation before the bot leaves. If the bound owner adds the bot personally, that group is approved automatically. Previously approved groups remain approved when re-added unless their access was explicitly revoked with the hard action described below. Notification delivery and failed leave attempts are retried safely in the background.
 
-Use `/groups` in the owner's private chat for groups whose current membership is confirmed and whose access state has not been rejected or expired. Rejected and departed groups remain in the durable registry and decision-message history but do not clutter this command. `/pending_groups` shows only requests awaiting a decision.
+Use `/groups` in the owner's private chat to see confirmed memberships, their access and runtime state, and a management button for each approved group. `/group <chat_id>` opens the same management card directly, including for a group that no longer appears in the current-membership list. `/pending_groups` shows only requests awaiting a decision. Rejected and departed groups remain in the durable registry and decision-message history but do not clutter `/groups`.
+
+#### Managing an approved group
+
+An approved group has three durable runtime modes:
+
+- **Active** — normal link processing.
+- **Soft pause** — the bot stays in the group but silently ignores group messages, commands, mentions, and retry reactions. It sends no pause or resume message to the group and adds no new status reactions. Queued and retryable work for that group is invalidated, and its live processing/retry reactions are cleared on a best-effort basis. The owner can resume processing from the private management card. The pause survives restarts and remains in effect if the bot is removed and re-added.
+- **Hard revoke** — after a separate confirmation, processing is blocked immediately, the group receives one localized revocation message, and the bot leaves. A failed leave is retried in the background without repeating that group message. Hard revoke cannot be resumed for the same membership: if a regular member adds the bot again, a fresh approval request is created; if the bound owner adds it, the existing owner auto-approval rule applies.
+
+Every mode change uses a revision check so an old inline button cannot overwrite a newer decision. Runtime changes and a bounded audit history are stored in `data/groups.json`.
 
 Telegram exposes the current member count and administrators, but it does not provide bots with an API that enumerates every regular member or every group retrospectively. The group registry is therefore built from membership updates, observed group messages, existing local chat records, and the optional verified bootstrap described below. Missing member-count or administrator data is shown as unavailable and never blocks an approval request.
 
@@ -393,7 +403,7 @@ The bot stores only the data needed to operate:
 
 ```text
 data/
-├── groups.json         # current membership, owner binding, and access decisions
+├── groups.json         # membership, owner binding, access decisions, and runtime modes
 ├── settings.json       # group language and preferences
 ├── users.json          # personal opt-out choices
 ├── state.json          # welcome and migration state
@@ -507,7 +517,7 @@ Disable **Group Privacy** in BotFather and restart the bot.
 Grant the bot permission to delete messages, or use:
 
 ```text
-/delete_original off
+/delete_original on
 ```
 
 ### A website suddenly stops working

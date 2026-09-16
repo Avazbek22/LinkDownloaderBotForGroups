@@ -15,6 +15,7 @@ class Job:
     url_key: str
     sender_name: str
     delete_original: bool
+    runtime_revision: int = 0
 
 
 @dataclass
@@ -64,6 +65,14 @@ class FlightCoordinator:
             jobs = list(flight.jobs[flight.cursor :])
             flight.cursor = len(flight.jobs)
             return jobs
+
+    def jobs_for_chat(self, chat_id: int) -> list[Job]:
+        """Return live queued or in-flight jobs for a chat without mutating flights."""
+        with self._lock:
+            flights: dict[int, Flight] = {}
+            for flight in (*self._by_url.values(), *self._by_media.values()):
+                flights[id(flight)] = flight
+            return [job for flight in flights.values() for job in flight.jobs if job.chat_id == int(chat_id)]
 
     def finish_if_idle(self, flight: Flight) -> bool:
         with self._lock:
