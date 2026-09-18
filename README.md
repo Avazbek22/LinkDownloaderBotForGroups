@@ -65,13 +65,19 @@ Instead, it uses reactions:
 |---|---|
 | 👀 | The link is being processed |
 | 🙈 | Instagram hid or restricted the content from the bot |
+| 😴 | Instagram or YouTube temporarily rate-limited the bot |
 | 🤷 | The link was checked, but the requested media was not found |
 | 👎 | The download failed |
 | 👍 | The requested media was posted, but the original link was kept |
 
-When the bot leaves 🙈 or 👎, a group member can add the same reaction to retry the original link. The bot must
+When the bot leaves 🙈, 😴, or 👎, a group member can add the same reaction to retry the original link. The bot must
 be a group administrator to receive reaction updates. A retry replaces the bot's failure reaction with 👀 and
 runs through the normal queue, validation, and download pipeline again.
+
+The 😴 status is protected by a per-platform cooldown shared across all groups. Cached Telegram media is still
+delivered immediately, while uncached requests make no Instagram or YouTube request until the cooldown expires.
+After expiry, only one request is allowed to probe recovery. Another explicit limit doubles the cooldown up to
+the configured maximum. If a chat does not permit 😴, the bot falls back to 👎 instead of silently clearing 👀.
 
 If the link does not contain the requested video or audio, the bot replaces 👀 with 🤷 and leaves the message untouched.
 
@@ -317,7 +323,7 @@ The most useful options are:
 | `MAX_QUEUE` | `200` | Number of waiting requests |
 | `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
 | `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
-| `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 🤷, 👎, and 👍 reactions |
+| `STATUS_REACTIONS` | `true` | Show 👀, 🙈, 😴, 🤷, 👎, and 👍 reactions |
 | `GROUP_ACCESS_MODE` | `open` | Use `approval` to block unapproved groups |
 | `GROUP_OWNER_USERNAME` | empty | Telegram username used for the initial owner binding |
 | `PENDING_GROUP_TTL_HOURS` | `168` | Time before an unapproved group is left |
@@ -397,6 +403,8 @@ DISK_CACHE_MAX_FILES=3
 | `DISK_CACHE_TTL_SECONDS` | `300` | Lifetime of recent disk files |
 | `FILE_ID_CACHE_MAX_ITEMS` | `500` | Maximum remembered Telegram media entries |
 | `FILE_ID_CACHE_TTL_DAYS` | `30` | Lifetime of Telegram media entries |
+| `SOURCE_COOLDOWN_INITIAL_SECONDS` | `900` | Initial pause after an explicit Instagram or YouTube rate limit |
+| `SOURCE_COOLDOWN_MAX_SECONDS` | `21600` | Maximum exponentially increased source pause |
 | `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallel download fragments |
 | `YTDLP_JS_RUNTIMES` | `node` | JavaScript runtime for yt-dlp |
 | `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Optional yt-dlp components; set an explicit empty value to disable |

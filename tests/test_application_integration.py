@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
-from app.download_backend import InstagramContentRestrictedError, MediaMetadata
+from app.download_backend import InstagramContentRestrictedError, MediaMetadata, SourceRateLimitedError
 from app.jobs import Job
 from app.settings import Settings
 
@@ -913,6 +913,228 @@ def test_instagram_content_restriction_replaces_eyes_with_monkey(tmp_path, monke
     assert [item[2] for item in fake.reactions] == ["👀", "🙈"]
     assert fake.sends == []
     assert fake.deletes == []
+
+
+def test_source_limit_replaces_eyes_and_short_circuits_later_requests(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    calls = 0
+
+    def limited_probe(*_args):
+        nonlocal calls
+        calls += 1
+        raise SourceRateLimitedError("instagram")
+
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", limited_probe)
+
+    for index in range(2):
+        job = Job(
+            f"limited-{index}",
+            -100,
+            None,
+            42 + index,
+            7,
+            f"https://www.instagram.com/reel/limited-{index}/",
+            f"https://www.instagram.com/reel/limited-{index}",
+            "User",
+            True,
+        )
+        app._set_status_reaction(job, "👀")
+        flight = app.coordinator.submit(job)
+        assert flight is not None
+        app._process_flight(flight)
+
+    assert calls == 1
+    by_message: dict[int, list[str]] = {}
+    for _, message_id, emoji, _ in fake.reactions:
+        by_message.setdefault(message_id, []).append(emoji)
+    assert by_message == {42: ["👀", "😴"], 43: ["👀", "😴"]}
+    assert fake.sends == []
+
+
+def test_source_limit_during_download_replaces_eyes_with_sleeping_status(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "download-limited",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.youtube.com/watch?v=limited",
+        "https://www.youtube.com/watch?v=limited",
+        "User",
+        True,
+    )
+    metadata = MediaMetadata(
+        url=job.url,
+        info={
+            "id": "limited",
+            "extractor": "Youtube",
+            "formats": [{"format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        },
+        media_key="youtube:limited",
+        source_name="YouTube",
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: metadata)
+    monkeypatch.setattr(
+        app,
+        "_obtain_file",
+        lambda *_args: (_ for _ in ()).throw(SourceRateLimitedError("youtube")),
+    )
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "😴"]
+    assert fake.sends == []
+
+
+def test_telegram_cache_bypasses_active_source_cooldown(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "cached-during-cooldown",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.instagram.com/reel/cached/",
+        "https://www.instagram.com/reel/cached",
+        "User",
+        True,
+    )
+    cache_profile = f"mp4-h264-v2:{app.settings.max_filesize}"
+    app.storage.put_file_id(
+        "instagram:cached:profile",
+        "cached-file-id",
+        app.settings.file_id_cache_max_items,
+        source_name="Instagram",
+        url_keys={f"{job.url_key}|{cache_profile}"},
+    )
+    app.source_cooldowns.limited("instagram")
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probe")))
+
+    app._process_flight(flight)
+
+    assert fake.sends[0][0] == "cached-file-id"
+    assert fake.deletes == [(-100, 42)]
+    assert [item[2] for item in fake.reactions] == ["👀"]
+
+
+def test_invalid_telegram_cache_falls_back_to_sleeping_status_during_cooldown(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+
+    class InvalidCacheBot(FakeBot):
+        def send_video(self, *, video, **kwargs):
+            if video == "invalid-file-id":
+                raise RuntimeError("Bad Request: wrong file identifier")
+            return super().send_video(video=video, **kwargs)
+
+    fake = InvalidCacheBot()
+    app.bot = fake
+    job = Job(
+        "invalid-cache",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.instagram.com/reel/invalid-cache/",
+        "https://www.instagram.com/reel/invalid-cache",
+        "User",
+        True,
+    )
+    cache_profile = f"mp4-h264-v2:{app.settings.max_filesize}"
+    app.storage.put_file_id(
+        "instagram:invalid-cache:profile",
+        "invalid-file-id",
+        app.settings.file_id_cache_max_items,
+        source_name="Instagram",
+        url_keys={f"{job.url_key}|{cache_profile}"},
+    )
+    app.source_cooldowns.limited("instagram")
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probe")))
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "😴"]
+    fresh = app.coordinator.submit(replace(job, job_id="fresh"))
+    assert fresh is not None
+    app.coordinator.abort(fresh)
+
+
+def test_sleeping_reaction_falls_back_to_downvote_when_unavailable(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+
+    class NoSleepingReactionBot(FakeBot):
+        def set_message_reaction(self, chat_id, message_id, reaction, **kwargs):
+            emoji = reaction[0].emoji if reaction else None
+            if emoji == "😴":
+                raise RuntimeError("reaction not allowed")
+            return super().set_message_reaction(chat_id, message_id, reaction, **kwargs)
+
+    fake = NoSleepingReactionBot()
+    app.bot = fake
+    job = Job(
+        "fallback",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.instagram.com/reel/limited/",
+        "https://www.instagram.com/reel/limited",
+        "User",
+        True,
+    )
+
+    app._after_source_rate_limit(job)
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert [item[2] for item in fake.reactions] == ["👎", "👀"]
+    app.coordinator.abort(flight)
+
+
+def test_sleeping_reaction_retry_never_bypasses_active_cooldown(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "sleeping-retry",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.youtube.com/watch?v=limited",
+        "https://www.youtube.com/watch?v=limited",
+        "User",
+        True,
+    )
+    app.source_cooldowns.limited("youtube")
+    app._after_source_rate_limit(job)
+    app._handle_retry_reaction(_reaction_update("😴"))
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probe")))
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["😴", "👀", "😴"]
+    assert fake.sends == []
 
 
 def test_non_video_metadata_replaces_eyes_with_non_video_reaction(tmp_path, monkeypatch) -> None:

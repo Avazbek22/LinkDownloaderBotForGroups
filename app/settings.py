@@ -108,6 +108,8 @@ class Settings:
     group_owner_username: str = ""
     pending_group_ttl_hours: int = 168
     group_bootstrap_chat_ids: tuple[int, ...] = ()
+    source_cooldown_initial_seconds: int = 15 * 60
+    source_cooldown_max_seconds: int = 6 * 60 * 60
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -144,6 +146,13 @@ def load_settings(base_dir: Path | None = None) -> Settings:
     group_owner_username = _owner_username()
     if group_access_mode == "approval" and not group_owner_username:
         raise RuntimeError("GROUP_OWNER_USERNAME is required when GROUP_ACCESS_MODE=approval")
+    source_cooldown_initial_seconds = _integer("SOURCE_COOLDOWN_INITIAL_SECONDS", 15 * 60, 30, 86_400)
+    source_cooldown_max_seconds = _integer(
+        "SOURCE_COOLDOWN_MAX_SECONDS",
+        6 * 60 * 60,
+        source_cooldown_initial_seconds,
+        7 * 24 * 60 * 60,
+    )
 
     return Settings(
         token=token,
@@ -171,4 +180,6 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         group_owner_username=group_owner_username,
         pending_group_ttl_hours=_integer("PENDING_GROUP_TTL_HOURS", 168, 1, 8760),
         group_bootstrap_chat_ids=_chat_ids("GROUP_BOOTSTRAP_CHAT_IDS"),
+        source_cooldown_initial_seconds=source_cooldown_initial_seconds,
+        source_cooldown_max_seconds=source_cooldown_max_seconds,
     )

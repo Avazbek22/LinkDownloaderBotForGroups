@@ -11,6 +11,7 @@ from app.download_backend import (
     FormatPlan,
     InstagramContentRestrictedError,
     MediaMetadata,
+    SourceRateLimitedError,
     display_source_name,
     download_metadata,
     extract_metadata,
@@ -70,6 +71,133 @@ def test_instagram_probe_preserves_restriction_across_fallback(monkeypatch) -> N
 
     with pytest.raises(InstagramContentRestrictedError):
         download_backend.extract_metadata("https://www.instagram.com/reel/restricted/")
+
+
+def test_rate_limit_detection_is_specific_and_follows_wrapped_errors() -> None:
+    instagram_limit = RuntimeError(
+        "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
+    )
+    youtube_limit = RuntimeError("ERROR: [youtube] Sign in to confirm you're not a bot")
+    wrapped_youtube_limit = RuntimeError("all YouTube metadata clients failed")
+    wrapped_youtube_limit.__cause__ = youtube_limit
+
+    assert download_backend._is_source_rate_limit(instagram_limit, "instagram")
+    assert download_backend._is_source_rate_limit(wrapped_youtube_limit, "youtube")
+    assert not download_backend._is_source_rate_limit(
+        RuntimeError("ERROR: [Instagram] Requested content is not available, rate-limit reached or login required"),
+        "instagram",
+    )
+    assert not download_backend._is_source_rate_limit(
+        RuntimeError("ERROR: [youtube] Sign in to confirm your age"),
+        "youtube",
+    )
+    assert not download_backend._is_source_rate_limit(
+        RuntimeError("ERROR: [youtube] Video https://youtu.be/429 is unavailable"),
+        "youtube",
+    )
+
+
+def test_instagram_anonymous_limit_stops_before_fallback_request(monkeypatch) -> None:
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError(
+                "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
+            )
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(SourceRateLimitedError, match="Instagram") as raised:
+        extract_metadata("https://www.instagram.com/reel/rate-limited/")
+
+    assert raised.value.source == "instagram"
+    assert calls == 1
+
+
+def test_youtube_bot_challenge_stops_client_fallback(monkeypatch) -> None:
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("ERROR: [youtube] Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,android,ios")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(SourceRateLimitedError, match="YouTube") as raised:
+        extract_metadata("https://www.youtube.com/watch?v=rate-limited")
+
+    assert raised.value.source == "youtube"
+    assert calls == 1
+
+
+def test_download_rate_limit_stops_format_fallback_and_removes_partial_file(monkeypatch, tmp_path: Path) -> None:
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            (tmp_path / "limited.part").write_bytes(b"partial")
+            raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(
+        download_backend,
+        "select_format_candidates",
+        lambda *_args, **_kwargs: [FormatPlan("first"), FormatPlan("second")],
+    )
+    metadata = MediaMetadata(
+        url="https://www.youtube.com/watch?v=limited",
+        info={"id": "limited", "formats": []},
+        media_key="youtube:limited",
+        source_name="YouTube",
+    )
+
+    with pytest.raises(SourceRateLimitedError) as raised:
+        download_metadata(
+            metadata,
+            "limited",
+            tmp_path,
+            max_send_bytes=10_000_000,
+            concurrent_fragments=2,
+        )
+
+    assert raised.value.source == "youtube"
+    assert calls == 1
+    assert not (tmp_path / "limited.part").exists()
 
 
 def test_source_names_use_brand_spelling() -> None:

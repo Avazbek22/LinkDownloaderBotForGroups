@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from app import env_config
 from app.download_backend import _site_options, _youtube_player_clients
 from app.settings import load_settings
@@ -18,6 +20,8 @@ def test_local_dotenv_refreshes_downloader_settings_and_legacy_client(tmp_path) 
         "GROUP_OWNER_USERNAME",
         "PENDING_GROUP_TTL_HOURS",
         "GROUP_BOOTSTRAP_CHAT_IDS",
+        "SOURCE_COOLDOWN_INITIAL_SECONDS",
+        "SOURCE_COOLDOWN_MAX_SECONDS",
     )
     previous = {name: os.environ.get(name) for name in names}
     for name in names:
@@ -90,6 +94,8 @@ def test_group_access_defaults_to_backward_compatible_open_mode(tmp_path, monkey
         "GROUP_OWNER_USERNAME",
         "PENDING_GROUP_TTL_HOURS",
         "GROUP_BOOTSTRAP_CHAT_IDS",
+        "SOURCE_COOLDOWN_INITIAL_SECONDS",
+        "SOURCE_COOLDOWN_MAX_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -99,6 +105,23 @@ def test_group_access_defaults_to_backward_compatible_open_mode(tmp_path, monkey
     assert settings.group_owner_username == ""
     assert settings.pending_group_ttl_hours == 168
     assert settings.group_bootstrap_chat_ids == ()
+    assert settings.source_cooldown_initial_seconds == 15 * 60
+    assert settings.source_cooldown_max_seconds == 6 * 60 * 60
+
+
+def test_source_cooldown_settings_require_an_ordered_range(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("SOURCE_COOLDOWN_INITIAL_SECONDS", "120")
+    monkeypatch.setenv("SOURCE_COOLDOWN_MAX_SECONDS", "600")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.source_cooldown_initial_seconds == 120
+    assert settings.source_cooldown_max_seconds == 600
+
+    monkeypatch.setenv("SOURCE_COOLDOWN_MAX_SECONDS", "60")
+    with pytest.raises(RuntimeError, match="SOURCE_COOLDOWN_MAX_SECONDS"):
+        load_settings(tmp_path)
 
 
 def test_unset_remote_components_keeps_default(monkeypatch) -> None:

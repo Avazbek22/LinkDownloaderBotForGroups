@@ -14,6 +14,7 @@ from typing import Any, Literal
 import yt_dlp
 
 from app import env_config
+from app.source_limits import SourcePlatform, source_platform
 from app.url_security import safe_error_for_log
 from app.url_utils import is_instagram_url, is_youtube_url
 
@@ -45,6 +46,14 @@ class FormatPlan:
 
 class InstagramContentRestrictedError(RuntimeError):
     """Instagram did not expose the requested content to this client."""
+
+
+class SourceRateLimitedError(RuntimeError):
+    """A supported upstream temporarily limited this bot's source access."""
+
+    def __init__(self, source: SourcePlatform) -> None:
+        self.source = source
+        super().__init__(f"{display_source_name(source)} temporarily rate-limited source access")
 
 
 class DownloadDeadlineExceeded(RuntimeError):
@@ -371,6 +380,93 @@ def _is_instagram_content_restriction(error: BaseException) -> bool:
     return False
 
 
+def _error_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        nested = (current.__cause__, current.__context__, getattr(current, "cause", None))
+        pending.extend(item for item in nested if isinstance(item, BaseException))
+        exc_info = getattr(current, "exc_info", None)
+        if isinstance(exc_info, tuple) and len(exc_info) > 1 and isinstance(exc_info[1], BaseException):
+            pending.append(exc_info[1])
+    return chain
+
+
+def _normalized_error_text(error: BaseException) -> str:
+    translation = str.maketrans(
+        {
+            "\N{LEFT SINGLE QUOTATION MARK}": "'",
+            "\N{RIGHT SINGLE QUOTATION MARK}": "'",
+            "\N{EN DASH}": "-",
+            "\N{EM DASH}": "-",
+            "\N{NON-BREAKING HYPHEN}": "-",
+        }
+    )
+    return " ".join(str(error).casefold().translate(translation).split())
+
+
+def _is_source_rate_limit(error: BaseException, source: SourcePlatform) -> bool:
+    """Recognize explicit throttling without treating ordinary login errors as limits."""
+    messages: list[str] = []
+    for current in _error_chain(error):
+        for attribute in ("status", "status_code", "code"):
+            try:
+                if int(getattr(current, attribute, 0)) == 429:
+                    return True
+            except (TypeError, ValueError, OverflowError):
+                pass
+        messages.append(_normalized_error_text(current))
+
+    combined = "\n".join(messages)
+    explicit_limit_markers = (
+        "exceeded the rate-limit for accessing posts anonymously",
+        "exceeded the rate limit for accessing posts anonymously",
+        "rate limit exceeded",
+        "rate-limit exceeded",
+        "rate limit has been exceeded",
+        "rate-limit has been exceeded",
+        "you have exceeded the rate limit",
+        "you've exceeded the rate limit",
+        "too many requests",
+        "http error 429",
+        "status code 429",
+        "response code 429",
+        "server returned 429",
+        "429: too many requests",
+        "превышен лимит анонимного доступа к публикациям",
+        "слишком много запросов",
+    )
+    if any(marker in combined for marker in explicit_limit_markers):
+        return True
+    if source == "instagram" and "anonymous" in combined and "posts" in combined and "limit" in combined:
+        return True
+    if source == "youtube":
+        youtube_markers = (
+            "sign in to confirm you're not a bot",
+            "sign in to confirm you are not a bot",
+            "confirm you're not a bot",
+            "confirm you are not a bot",
+            "has been rate-limited by youtube",
+            "подтвердите, что вы не робот",
+        )
+        return any(marker in combined for marker in youtube_markers)
+    return False
+
+
+def _raise_if_source_rate_limited(url: str, error: BaseException) -> None:
+    if isinstance(error, SourceRateLimitedError):
+        raise error
+    source = source_platform(url)
+    if source is not None and _is_source_rate_limit(error, source):
+        raise SourceRateLimitedError(source) from error
+
+
 def _base_options(cookie_file: Path | None) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
@@ -531,6 +627,7 @@ def extract_metadata(
                 info = candidate
                 break
             except Exception as error:
+                _raise_if_source_rate_limited(url, error)
                 last_error = error
                 LOG.info(
                     "YouTube metadata client failed client=%s error=%s detail=%s",
@@ -551,12 +648,14 @@ def extract_metadata(
             _check_deadline(deadline)
             if not is_instagram_url(url):
                 raise
+            _raise_if_source_rate_limited(url, primary_error)
             fallback = _base_options(cookie_file)
             try:
                 with yt_dlp.YoutubeDL(fallback) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as fallback_error:
                 _check_deadline(deadline)
+                _raise_if_source_rate_limited(url, fallback_error)
                 # Preserve an explicit content restriction even if Instagram gives
                 # the fallback request a less useful generic error.
                 restricted_error = next(
@@ -710,8 +809,9 @@ def download_metadata(
                 _check_deadline(deadline)
                 return result
             except Exception as error:
-                last_error = error
                 _remove_attempt_files(output_folder, out_prefix)
+                _raise_if_source_rate_limited(metadata.url, error)
+                last_error = error
                 LOG.info(
                     "media format failed phase=%s client=%s candidate=%s error=%s detail=%s",
                     phase,
@@ -745,6 +845,7 @@ def download_metadata(
                 if not isinstance(fresh_info, dict):
                     raise RuntimeError("extractor returned no metadata")
             except Exception as error:
+                _raise_if_source_rate_limited(metadata.url, error)
                 last_error = error
                 LOG.info(
                     "YouTube fallback extraction failed client=%s error=%s detail=%s",
@@ -781,6 +882,7 @@ def download_metadata(
             if result is not None:
                 return result
         except Exception as error:
+            _raise_if_source_rate_limited(metadata.url, error)
             last_error = error
             _check_deadline(deadline)
 

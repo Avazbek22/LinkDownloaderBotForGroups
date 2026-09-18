@@ -19,6 +19,7 @@ import telebot
 from app.download_backend import (
     InstagramContentRestrictedError,
     MediaMetadata,
+    SourceRateLimitedError,
     display_source_name,
     download_metadata,
     extract_metadata,
@@ -32,6 +33,7 @@ from app.jobs import Flight, FlightCoordinator, Job, MediaKind
 from app.logging_setup import configure_logging
 from app.media_cache import DiskMediaCache
 from app.settings import Settings, load_settings
+from app.source_limits import SourceAccess, SourceCooldowns, source_platform
 from app.storage import Storage
 from app.url_security import (
     UnsafeUrlError,
@@ -43,7 +45,7 @@ from app.url_security import (
 
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-RETRYABLE_REACTIONS = frozenset({"👎", "🙈"})
+RETRYABLE_REACTIONS = frozenset({"👎", "🙈", "😴"})
 FAILED_RETRY_TTL_SECONDS = 7 * 24 * 60 * 60
 FAILED_RETRY_MAX_ITEMS = 1_000
 GROUP_NOTIFICATION_RETRY_SECONDS = 5 * 60
@@ -81,6 +83,10 @@ class BotApplication:
             ttl_seconds=settings.disk_cache_ttl,
         )
         self.coordinator = FlightCoordinator()
+        self.source_cooldowns = SourceCooldowns(
+            settings.source_cooldown_initial_seconds,
+            settings.source_cooldown_max_seconds,
+        )
         self.queue: queue.Queue[Flight | None] = queue.Queue(maxsize=settings.max_queue)
         self.stop_event = threading.Event()
         self.upload_slots = threading.BoundedSemaphore(settings.upload_workers)
@@ -216,6 +222,23 @@ class BotApplication:
             except Exception:
                 self.log.exception("group access maintenance failed")
 
+    def _activate_source_cooldown(
+        self,
+        error: SourceRateLimitedError,
+        access: SourceAccess | None = None,
+    ) -> None:
+        if access is not None and access.source != error.source:
+            self.source_cooldowns.complete(access)
+            access = None
+        update = self.source_cooldowns.limited(error.source, access)
+        self.log.warning(
+            "source cooldown active source=%s retry_after=%.0f failures=%s extended=%s",
+            error.source,
+            update.retry_after,
+            update.failure_count,
+            update.extended,
+        )
+
     def _process_flight(self, flight: Flight) -> None:
         first = next((job for job in flight.jobs if self._job_access_allowed(job)), None)
         if first is None:
@@ -257,21 +280,42 @@ class BotApplication:
                     self.log.info("Telegram cache hit job_id=%s media_key=%s", first.job_id, media_key)
                     return
 
+        source = source_platform(first.url)
+        source_access = self.source_cooldowns.acquire(source) if source is not None else None
+        if source_access is not None and not source_access.allowed:
+            self.log.info(
+                "source request skipped during cooldown source=%s retry_after=%.0f job_id=%s",
+                source_access.source,
+                source_access.retry_after,
+                first.job_id,
+            )
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_source_rate_limit_many(retry_jobs)
+            return
+
         try:
             validate_public_url(first.url)
             metadata = extract_metadata(first.url, self.settings.cookies_file, deadline, first.media_kind)
             final_url = metadata.info.get("webpage_url")
             if isinstance(final_url, str):
                 validate_public_url(final_url)
+        except SourceRateLimitedError as exc:
+            self._activate_source_cooldown(exc, source_access)
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_source_rate_limit_many(retry_jobs)
+            return
         except InstagramContentRestrictedError:
+            self.source_cooldowns.complete(source_access)
             self.log.info(
                 "link hidden by Instagram content controls job_id=%s url=%s",
                 first.job_id,
                 safe_url_for_log(first.url),
             )
-            self._after_instagram_restriction_many(self.coordinator.abort(flight))
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_instagram_restriction_many(retry_jobs)
             return
         except Exception as exc:
+            self.source_cooldowns.complete(source_access)
             self.log.info(
                 "link ignored after media probe job_id=%s url=%s error=%s detail=%s",
                 first.job_id,
@@ -279,8 +323,10 @@ class BotApplication:
                 type(exc).__name__,
                 safe_error_for_log(exc),
             )
-            self._after_probe_failure_many(self.coordinator.abort(flight))
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_probe_failure_many(retry_jobs)
             return
+        self.source_cooldowns.complete(source_access)
 
         has_requested_media = (
             has_downloadable_audio(metadata.info)
@@ -294,7 +340,8 @@ class BotApplication:
                 first.job_id,
                 safe_url_for_log(first.url),
             )
-            self._after_no_media_many(self.coordinator.abort(flight))
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_no_media_many(retry_jobs)
             return
 
         media_key = f"{metadata.media_key}:{cache_profile}"
@@ -307,35 +354,46 @@ class BotApplication:
             file_id = self.storage.get_file_id(media_key, self.settings.file_id_cache_ttl_days)
         file_path = self.disk_cache.get(media_key) if self.settings.media_cache_enabled else None
 
-        while True:
-            batch = self._filter_active_jobs(retry_jobs or self.coordinator.pending(flight))
-            retry_jobs = []
-            if batch:
-                if file_id:
-                    retry = self._send_by_file_id(batch, file_id, metadata, media_key)
-                    if retry:
-                        file_id = None
+        source_jobs: list[Job] = []
+        try:
+            while True:
+                batch = self._filter_active_jobs(retry_jobs or self.coordinator.pending(flight))
+                retry_jobs = []
+                if batch:
+                    if file_id:
+                        retry = self._send_by_file_id(batch, file_id, metadata, media_key)
+                        if retry:
+                            file_id = None
+                            if file_path is None:
+                                source_jobs = retry
+                                file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
+                                source_jobs = []
+                            file_id = self._send_from_file(
+                                retry,
+                                file_path,
+                                metadata,
+                                media_key,
+                                {f"{key}|{cache_profile}" for key in flight.url_keys},
+                            )
+                    else:
                         if file_path is None:
+                            source_jobs = batch
                             file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
+                            source_jobs = []
                         file_id = self._send_from_file(
-                            retry,
+                            batch,
                             file_path,
                             metadata,
                             media_key,
                             {f"{key}|{cache_profile}" for key in flight.url_keys},
                         )
-                else:
-                    if file_path is None:
-                        file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
-                    file_id = self._send_from_file(
-                        batch,
-                        file_path,
-                        metadata,
-                        media_key,
-                        {f"{key}|{cache_profile}" for key in flight.url_keys},
-                    )
-            if self.coordinator.finish_if_idle(flight):
-                break
+                if self.coordinator.finish_if_idle(flight):
+                    break
+        except SourceRateLimitedError as exc:
+            self._activate_source_cooldown(exc)
+            source_jobs.extend(self.coordinator.abort(flight))
+            self._after_source_rate_limit_many(source_jobs)
+            return
 
         self.disk_cache.maintain()
         self.log.info(
@@ -537,6 +595,23 @@ class BotApplication:
     def _after_failure_many(self, jobs: list[Job]) -> None:
         for job in jobs:
             self._after_failure(job)
+
+    def _after_source_rate_limit(self, job: Job) -> None:
+        if not self._job_access_allowed(job):
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+            return
+        if self._set_status_reaction(job, "😴"):
+            self._remember_failed_retry(job, "😴")
+        elif self._set_status_reaction(job, "👎"):
+            self._remember_failed_retry(job, "👎")
+        else:
+            self._forget_failed_retry(job)
+            self._clear_status_reaction(job)
+
+    def _after_source_rate_limit_many(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            self._after_source_rate_limit(job)
 
     def _after_instagram_restriction(self, job: Job) -> None:
         if not self._job_access_allowed(job):
