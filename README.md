@@ -160,7 +160,7 @@ flowchart LR
 
 The bot uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports a large number of video websites.
 
-For Telegram video delivery, it prefers the highest-quality H.264 MP4 candidate that fits the configured size limit. `/audio` selects the best available audio source and converts it to a size-planned MP3. Every completed file is checked with ffprobe before upload, so an incompatible or partial download is never cached.
+For Telegram video delivery, it prefers the highest-quality H.264 MP4 candidate that fits the configured size limit. When YouTube exposes multiple audio tracks, the source's original track is preferred over automatic dubs even when a dub has a higher bitrate; a translated/default track is used only when no original candidate is available. The same rule applies to `/audio`, which converts the selected source to a size-planned MP3. Every completed file is checked with ffprobe before upload, so an incompatible or partial download is never cached.
 
 Common examples:
 

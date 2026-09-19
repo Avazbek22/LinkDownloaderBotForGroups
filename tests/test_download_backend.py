@@ -262,6 +262,188 @@ def test_audio_plan_chooses_highest_mp3_bitrate_with_headroom() -> None:
     assert select_audio_format_candidates({**info, "duration": 10_000}, 10_000_000) == []
 
 
+def test_audio_plan_prefers_original_source_over_higher_bitrate_auto_dub() -> None:
+    info = {
+        "duration": 60,
+        "formats": [
+            {
+                "format_id": "dubbed",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 192,
+                "language_preference": 5,
+                "format_note": "English - dubbed-auto (default)",
+            },
+            {
+                "format_id": "original",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 128,
+                "language_preference": 10,
+                "format_note": "Russian - original",
+            },
+        ],
+    }
+
+    plans = select_audio_format_candidates(info, 10_000_000)
+
+    assert [plan.format_spec for plan in plans] == ["original", "dubbed"]
+    assert {plan.audio_bitrate_kbps for plan in plans} == {192}
+
+
+def test_video_plan_prefers_original_audio_over_higher_bitrate_auto_dub() -> None:
+    info = {
+        "formats": [
+            {
+                "format_id": "video",
+                "ext": "mp4",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "height": 1080,
+                "filesize": 30_000_000,
+            },
+            {
+                "format_id": "dubbed",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 192,
+                "filesize": 5_000_000,
+                "language": "en-US",
+                "language_preference": 5,
+                "format_note": "English - dubbed-auto (default)",
+            },
+            {
+                "format_id": "original",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 128,
+                "filesize": 5_000_000,
+                "language": "ru",
+                "language_preference": 10,
+                "format_note": "Russian - original",
+            },
+        ]
+    }
+
+    plans = select_format_candidates(info, 50_000_000)
+
+    assert [plan.format_spec for plan in plans[:2]] == ["video+original", "video+dubbed"]
+
+
+def test_caption_language_identifies_original_when_youtube_does_not_label_track() -> None:
+    info = {
+        "duration": 60,
+        "automatic_captions": {
+            "ru-orig": [{"name": "Russian (Original)"}],
+            "en": [{"name": "English"}],
+        },
+        "formats": [
+            {
+                "format_id": "video",
+                "ext": "mp4",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "height": 1080,
+                "filesize": 30_000_000,
+            },
+            {
+                "format_id": "regional-default",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 192,
+                "filesize": 5_000_000,
+                "language": "en-US",
+                "language_preference": 5,
+                "format_note": "English (United States) (default)",
+            },
+            {
+                "format_id": "source-language",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 128,
+                "filesize": 5_000_000,
+                "language": "ru",
+                "language_preference": -1,
+                "format_note": "Russian",
+            },
+        ],
+    }
+
+    assert select_format(info, 50_000_000) == ("video+source-language", "mp4")
+    assert [plan.format_spec for plan in select_audio_format_candidates(info, 50_000_000)[:2]] == [
+        "source-language",
+        "regional-default",
+    ]
+
+
+def test_original_progressive_audio_wins_over_higher_resolution_dub() -> None:
+    info = {
+        "formats": [
+            {
+                "format_id": "dubbed-720",
+                "ext": "mp4",
+                "vcodec": "avc1.64001f",
+                "acodec": "mp4a.40.2",
+                "height": 720,
+                "tbr": 2_000,
+                "filesize": 25_000_000,
+                "format_note": "English - auto-dubbed (default)",
+            },
+            {
+                "format_id": "original-360",
+                "ext": "mp4",
+                "vcodec": "avc1.42001e",
+                "acodec": "mp4a.40.2",
+                "height": 360,
+                "tbr": 500,
+                "filesize": 8_000_000,
+                "format_note": "Russian - original",
+            },
+        ]
+    }
+
+    assert select_format(info, 50_000_000) == ("original-360", None)
+
+
+def test_video_plan_uses_dub_when_original_cannot_fit() -> None:
+    info = {
+        "formats": [
+            {
+                "format_id": "video",
+                "ext": "mp4",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "height": 1080,
+                "filesize": 43_000_000,
+            },
+            {
+                "format_id": "original-too-large",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "filesize": 8_000_000,
+                "language_preference": 10,
+            },
+            {
+                "format_id": "dubbed-fallback",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "filesize": 4_000_000,
+                "format_note": "English - dubbed-auto (default)",
+            },
+        ]
+    }
+
+    assert select_format(info, 50_000_000) == ("video+dubbed-fallback", "mp4")
+
+
 def test_site_detection_accepts_explicit_ports_and_trailing_dot() -> None:
     assert is_youtube_url("https://youtube.com:443/watch?v=video")
     assert is_youtube_url("https://www.youtube.com./watch?v=video")
@@ -600,6 +782,15 @@ def test_youtube_player_client_is_passed_to_extractor_args(monkeypatch) -> None:
 
     assert options["extractor_args"] == {"youtube": {"player_client": ["android"]}}
     assert options["js_runtimes"] == {"node": {}}
+    assert options["format_sort"] == ["lang"]
+    assert options["format_sort_force"] is True
+
+    localized = download_backend._site_options(
+        "https://www.youtube.com/watch?v=video",
+        youtube_player_client="android",
+        youtube_language="ru",
+    )
+    assert localized["extractor_args"] == {"youtube": {"player_client": ["android"], "lang": ["ru"]}}
 
 
 def test_youtube_client_configuration_preserves_web_alias_and_legacy(monkeypatch) -> None:
@@ -645,6 +836,131 @@ def test_youtube_metadata_uses_client_fallback(monkeypatch) -> None:
 
     assert metadata.media_key == "youtube:video"
     assert clients_seen == ["default", "android"]
+
+
+def test_youtube_metadata_reextracts_regional_dub_in_original_caption_language(monkeypatch) -> None:
+    languages_seen: list[str | None] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            language = options.get("extractor_args", {}).get("youtube", {}).get("lang", [None])[0]
+            self.language = language
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            languages_seen.append(self.language)
+            language = self.language or "en-US"
+            return {
+                "id": "video",
+                "extractor_key": "Youtube",
+                "automatic_captions": {"ru-orig": [{"name": "Russian (Original)"}]},
+                "formats": [
+                    {
+                        "format_id": "18",
+                        "ext": "mp4",
+                        "vcodec": "avc1",
+                        "acodec": "mp4a",
+                        "language": language,
+                        "language_preference": -1 if self.language else 5,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.youtube.com/watch?v=video")
+
+    assert languages_seen == [None, "ru"]
+    assert metadata.original_audio_language == "ru"
+    assert metadata.info["formats"][0]["language"] == "ru"
+
+
+def test_youtube_metadata_keeps_original_track_without_extra_request(monkeypatch) -> None:
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "id": "video",
+                "extractor_key": "Youtube",
+                "automatic_captions": {"ru-orig": [{"name": "Russian (Original)"}]},
+                "formats": [
+                    {
+                        "format_id": "18",
+                        "ext": "mp4",
+                        "vcodec": "avc1",
+                        "acodec": "mp4a",
+                        "language": "ru",
+                        "language_preference": -1,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.youtube.com/watch?v=video")
+
+    assert calls == 1
+    assert metadata.original_audio_language == "ru"
+
+
+def test_youtube_metadata_falls_back_when_original_track_is_not_exposed(monkeypatch) -> None:
+    languages_seen: list[str | None] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.language = options.get("extractor_args", {}).get("youtube", {}).get("lang", [None])[0]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            languages_seen.append(self.language)
+            return {
+                "id": "video",
+                "extractor_key": "Youtube",
+                "automatic_captions": {"ru-orig": [{"name": "Russian (Original)"}]},
+                "formats": [
+                    {
+                        "format_id": "18",
+                        "ext": "mp4",
+                        "vcodec": "avc1",
+                        "acodec": "mp4a",
+                        "language": "en-US",
+                        "language_preference": 5,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(download_backend.env_config, "YTDLP_YOUTUBE_PLAYER_CLIENTS", "default")
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.youtube.com/watch?v=video")
+
+    assert languages_seen == [None, "ru"]
+    assert metadata.original_audio_language == "ru"
+    assert metadata.info["formats"][0]["language"] == "en-US"
 
 
 def test_youtube_metadata_skips_client_without_video_formats(monkeypatch) -> None:
@@ -937,6 +1253,58 @@ def test_rejects_audio_only_attempt_and_uses_next_candidate(monkeypatch, tmp_pat
     assert formats_seen == ["bad", "good"]
     assert not (tmp_path / "candidate.m4a").exists()
     assert (tmp_path / "candidate.mp4").exists()
+
+
+def test_youtube_download_reuses_discovered_original_language(monkeypatch, tmp_path: Path) -> None:
+    options_seen: list[dict] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+            options_seen.append(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            (tmp_path / "original.mp4").write_bytes(b"video")
+            return {"id": "video"}
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(download_backend, "_validate_downloaded_video", lambda *_args, **_kwargs: None)
+    metadata = MediaMetadata(
+        url="https://www.youtube.com/watch?v=video",
+        info={
+            "id": "video",
+            "formats": [
+                {
+                    "format_id": "18",
+                    "ext": "mp4",
+                    "vcodec": "avc1",
+                    "acodec": "mp4a",
+                    "language": "ru",
+                    "filesize": 4_000_000,
+                }
+            ],
+        },
+        media_key="youtube:video",
+        source_name="YouTube",
+        original_audio_language="ru",
+    )
+
+    result = download_metadata(
+        metadata,
+        "original",
+        tmp_path,
+        max_send_bytes=10_000_000,
+        concurrent_fragments=2,
+    )
+
+    assert result["id"] == "video"
+    assert options_seen[0]["extractor_args"] == {"youtube": {"lang": ["ru"]}}
 
 
 def test_audio_download_uses_size_planned_mp3_postprocessor(monkeypatch, tmp_path: Path) -> None:

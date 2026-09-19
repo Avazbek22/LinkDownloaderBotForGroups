@@ -480,6 +480,59 @@ def test_audio_request_uploads_and_reuses_only_audio_cache(tmp_path, monkeypatch
     assert fake.deletes == [(-100, 42), (-200, 43)]
 
 
+def test_youtube_cache_profiles_do_not_reuse_preference_agnostic_audio(tmp_path) -> None:
+    max_filesize = _settings(tmp_path).max_filesize
+
+    assert main._media_cache_profile("https://youtu.be/video", "video", max_filesize) == (
+        f"mp4-h264-v2-youtube-original-audio-v1:{max_filesize}"
+    )
+    assert main._media_cache_profile("https://www.youtube.com/watch?v=audio", "audio", max_filesize) == (
+        f"mp3-v1-youtube-original-audio-v1:{max_filesize}"
+    )
+    assert main._media_cache_profile("https://example.com/video", "video", max_filesize) == (
+        f"mp4-h264-v2:{max_filesize}"
+    )
+
+
+def test_youtube_request_bypasses_old_translated_video_cache(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://www.youtube.com/watch?v=original"
+    old_profile = f"mp4-h264-v2:{app.settings.max_filesize}"
+    app.storage.put_file_id(
+        "youtube:original:old-profile",
+        "translated-file-id",
+        app.settings.file_id_cache_max_items,
+        source_name="YouTube",
+        url_keys={f"{url}|{old_profile}"},
+    )
+    metadata = MediaMetadata(
+        url=url,
+        info={
+            "id": "original",
+            "formats": [{"format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        },
+        media_key="youtube:original",
+        source_name="YouTube",
+    )
+    video_path = tmp_path / "original.mp4"
+    video_path.write_bytes(b"video")
+    job = Job("original", -100, None, 42, 7, url, url, "User", True)
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args, **_kwargs: metadata)
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    assert len(fake.sends) == 1
+    assert fake.sends[0][0] != "translated-file-id"
+    new_profile = main._media_cache_profile(url, "video", app.settings.max_filesize)
+    assert app.storage.get_cached_by_url(f"{url}|{new_profile}", app.settings.file_id_cache_ttl_days) is not None
+
+
 def test_status_reaction_lifecycle_for_retained_link(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
     fake = FakeBot()

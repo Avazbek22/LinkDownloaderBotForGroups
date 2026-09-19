@@ -66,6 +66,15 @@ def extract_first_url(text: str) -> str | None:
     return match.group(0).rstrip(").,;:!?]}>\"'")
 
 
+def _media_cache_profile(url: str, media_kind: MediaKind, max_filesize: int) -> str:
+    delivery_profile = "mp3-v1" if media_kind == "audio" else "mp4-h264-v2"
+    if source_platform(url) == "youtube":
+        # Keep files selected before original-audio preference out of both the
+        # URL alias cache and the media/disk cache after this behavior changes.
+        delivery_profile = f"{delivery_profile}-youtube-original-audio-v1"
+    return f"{delivery_profile}:{max_filesize}"
+
+
 class BotApplication:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -254,11 +263,7 @@ class BotApplication:
         )
         # Bump the profile whenever delivery compatibility changes so an old,
         # already-uploaded Telegram file_id cannot bypass the new validation.
-        cache_profile = (
-            f"mp3-v1:{self.settings.max_filesize}"
-            if first.media_kind == "audio"
-            else f"mp4-h264-v2:{self.settings.max_filesize}"
-        )
+        cache_profile = _media_cache_profile(first.url, first.media_kind, self.settings.max_filesize)
         cached = (
             self.storage.get_cached_by_url(f"{first.url_key}|{cache_profile}", self.settings.file_id_cache_ttl_days)
             if self.settings.media_cache_enabled
