@@ -11,6 +11,7 @@ from app.download_backend import (
     FormatPlan,
     InstagramContentRestrictedError,
     MediaMetadata,
+    RequestedMediaNotFoundError,
     SourceRateLimitedError,
     display_source_name,
     download_metadata,
@@ -73,6 +74,135 @@ def test_instagram_probe_preserves_restriction_across_fallback(monkeypatch) -> N
         download_backend.extract_metadata("https://www.instagram.com/reel/restricted/")
 
 
+def test_instagram_no_video_detection_is_specific_and_follows_wrapped_errors() -> None:
+    no_video = RuntimeError("ERROR: [Instagram] post: There is no video in this post")
+    wrapped = RuntimeError("Instagram metadata probe failed")
+    wrapped.__cause__ = no_video
+
+    assert download_backend._is_requested_media_not_found(
+        "https://www.instagram.com/p/image-only/",
+        wrapped,
+    )
+    assert not download_backend._is_requested_media_not_found(
+        "https://www.youtube.com/watch?v=image-only",
+        wrapped,
+    )
+    assert not download_backend._is_requested_media_not_found(
+        "https://www.instagram.com/p/unknown/",
+        RuntimeError("extractor returned metadata without downloadable video"),
+    )
+
+
+def test_instagram_no_video_probe_still_uses_successful_fallback(monkeypatch) -> None:
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("ERROR: [Instagram] post: There is no video in this post")
+            return {
+                "id": "carousel-video",
+                "extractor_key": "Instagram",
+                "formats": [
+                    {
+                        "format_id": "video",
+                        "ext": "mp4",
+                        "vcodec": "avc1",
+                        "acodec": "aac",
+                        "url": "https://cdn.example/video.mp4",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    metadata = extract_metadata("https://www.instagram.com/p/carousel-video/")
+
+    assert metadata.media_key == "instagram:carousel-video"
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        (
+            RuntimeError("ERROR: [Instagram] post: There is no video in this post"),
+            RuntimeError("generic fallback error"),
+        ),
+        (
+            RuntimeError("generic primary error"),
+            RuntimeError("ERROR: [Instagram] post: There is no video in this post"),
+        ),
+    ],
+)
+def test_instagram_no_video_is_classified_after_both_probes_fail(monkeypatch, errors) -> None:
+    remaining_errors = iter(errors)
+    calls = 0
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise next(remaining_errors)
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(RequestedMediaNotFoundError):
+        extract_metadata("https://www.instagram.com/p/image-only/")
+
+    assert calls == 2
+
+
+def test_instagram_restriction_takes_precedence_over_no_video(monkeypatch) -> None:
+    errors = iter(
+        [
+            RuntimeError(
+                "ERROR: [Instagram] post: Instagram sent an empty media response. "
+                "Check if this post is accessible in your browser without being logged-in."
+            ),
+            RuntimeError("ERROR: [Instagram] post: There is no video in this post"),
+        ]
+    )
+
+    class FakeYDL:
+        def __init__(self, _options: dict) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def extract_info(self, *_args, **_kwargs):
+            raise next(errors)
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(InstagramContentRestrictedError):
+        extract_metadata("https://www.instagram.com/p/restricted/")
+
+
 def test_rate_limit_detection_is_specific_and_follows_wrapped_errors() -> None:
     instagram_limit = RuntimeError(
         "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
@@ -97,8 +227,27 @@ def test_rate_limit_detection_is_specific_and_follows_wrapped_errors() -> None:
     )
 
 
-def test_instagram_anonymous_limit_stops_before_fallback_request(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("errors", "expected_calls"),
+    [
+        (
+            (RuntimeError("ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"),),
+            1,
+        ),
+        (
+            (
+                RuntimeError("ERROR: [Instagram] post: There is no video in this post"),
+                RuntimeError(
+                    "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
+                ),
+            ),
+            2,
+        ),
+    ],
+)
+def test_instagram_anonymous_limit_stops_further_probe_requests(monkeypatch, errors, expected_calls) -> None:
     calls = 0
+    remaining_errors = iter(errors)
 
     class FakeYDL:
         def __init__(self, _options: dict) -> None:
@@ -113,9 +262,7 @@ def test_instagram_anonymous_limit_stops_before_fallback_request(monkeypatch) ->
         def extract_info(self, *_args, **_kwargs):
             nonlocal calls
             calls += 1
-            raise RuntimeError(
-                "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
-            )
+            raise next(remaining_errors)
 
     monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
 
@@ -123,7 +270,7 @@ def test_instagram_anonymous_limit_stops_before_fallback_request(monkeypatch) ->
         extract_metadata("https://www.instagram.com/reel/rate-limited/")
 
     assert raised.value.source == "instagram"
-    assert calls == 1
+    assert calls == expected_calls
 
 
 def test_youtube_bot_challenge_stops_client_fallback(monkeypatch) -> None:

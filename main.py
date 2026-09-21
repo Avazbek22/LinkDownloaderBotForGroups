@@ -19,6 +19,7 @@ import telebot
 from app.download_backend import (
     InstagramContentRestrictedError,
     MediaMetadata,
+    RequestedMediaNotFoundError,
     SourceRateLimitedError,
     display_source_name,
     download_metadata,
@@ -308,6 +309,17 @@ class BotApplication:
             self._activate_source_cooldown(exc, source_access)
             retry_jobs.extend(self.coordinator.abort(flight))
             self._after_source_rate_limit_many(retry_jobs)
+            return
+        except RequestedMediaNotFoundError:
+            self.source_cooldowns.complete(source_access)
+            self.log.info(
+                "link ignored because requested %s was not found during media probe job_id=%s url=%s",
+                first.media_kind,
+                first.job_id,
+                safe_url_for_log(first.url),
+            )
+            retry_jobs.extend(self.coordinator.abort(flight))
+            self._after_no_media_many(retry_jobs)
             return
         except InstagramContentRestrictedError:
             self.source_cooldowns.complete(source_access)

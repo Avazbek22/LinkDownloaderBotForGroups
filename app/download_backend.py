@@ -57,6 +57,10 @@ class SourceRateLimitedError(RuntimeError):
         super().__init__(f"{display_source_name(source)} temporarily rate-limited source access")
 
 
+class RequestedMediaNotFoundError(RuntimeError):
+    """The extractor positively reported that the requested media is absent."""
+
+
 class DownloadDeadlineExceeded(RuntimeError):
     """The configured end-to-end download deadline has elapsed."""
 
@@ -564,6 +568,13 @@ def _normalized_error_text(error: BaseException) -> str:
     return " ".join(str(error).casefold().translate(translation).split())
 
 
+def _is_requested_media_not_found(url: str, error: BaseException) -> bool:
+    """Recognize explicit, terminal no-media responses without guessing from generic failures."""
+    if not is_instagram_url(url):
+        return False
+    return any("there is no video in this post" in _normalized_error_text(item) for item in _error_chain(error))
+
+
 def _is_source_rate_limit(error: BaseException, source: SourcePlatform) -> bool:
     """Recognize explicit throttling without treating ordinary login errors as limits."""
     messages: list[str] = []
@@ -867,6 +878,18 @@ def extract_metadata(
                     raise InstagramContentRestrictedError(
                         "Instagram did not expose this content to the bot"
                     ) from restricted_error
+                missing_error = next(
+                    (
+                        error
+                        for error in (primary_error, fallback_error)
+                        if _is_requested_media_not_found(url, error)
+                    ),
+                    None,
+                )
+                if missing_error is not None:
+                    raise RequestedMediaNotFoundError(
+                        "Instagram reported that this post contains no video"
+                    ) from missing_error
                 raise
     _check_deadline(deadline)
     if not isinstance(info, dict):

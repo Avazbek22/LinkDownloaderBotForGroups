@@ -80,6 +80,7 @@ After expiry, only one request is allowed to probe recovery. Another explicit li
 the configured maximum. If a chat does not permit 😴, the bot falls back to 👎 instead of silently clearing 👀.
 
 If the link does not contain the requested video or audio, the bot replaces 👀 with 🤷 and leaves the message untouched.
+This also covers an Instagram image-only post or a carousel that the extractor explicitly reports as containing no video.
 
 When everything succeeds, the original link can be removed automatically.
 

@@ -6,7 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
-from app.download_backend import InstagramContentRestrictedError, MediaMetadata, SourceRateLimitedError
+from app.download_backend import (
+    InstagramContentRestrictedError,
+    MediaMetadata,
+    RequestedMediaNotFoundError,
+    SourceRateLimitedError,
+)
 from app.jobs import Job
 from app.settings import Settings
 
@@ -964,6 +969,38 @@ def test_instagram_content_restriction_replaces_eyes_with_monkey(tmp_path, monke
     app._process_flight(flight)
 
     assert [item[2] for item in fake.reactions] == ["👀", "🙈"]
+    assert fake.sends == []
+    assert fake.deletes == []
+
+
+def test_explicit_instagram_no_video_replaces_eyes_with_no_media_reaction(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    job = Job(
+        "image-only",
+        -100,
+        None,
+        42,
+        7,
+        "https://www.instagram.com/p/image-only/",
+        "https://www.instagram.com/p/image-only",
+        "User",
+        True,
+    )
+    app._set_status_reaction(job, "👀")
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    monkeypatch.setattr(
+        main,
+        "extract_metadata",
+        lambda *_args: (_ for _ in ()).throw(RequestedMediaNotFoundError("no video")),
+    )
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "🤷"]
     assert fake.sends == []
     assert fake.deletes == []
 
