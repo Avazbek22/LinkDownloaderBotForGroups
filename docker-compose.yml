@@ -1,8 +1,9 @@
-name: ${COMPOSE_PROJECT_NAME:-linkdownloaderbotforgroups}
+name: ${APP_SLUG:-linkdownloaderbotforgroups}
 
 services:
   linkdownloaderbot:
-    image: linkdownloaderbotforgroups:local
+    # Deployment builds candidates as :candidate; :local is the running release.
+    image: ${APP_SLUG:-linkdownloaderbotforgroups}:${APP_IMAGE_TAG:-local}
     build:
       context: .
     restart: unless-stopped
@@ -17,4 +18,5 @@ services:
       - /tmp:size=128m,mode=1777
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 30s
+    # Longer than one long-polling cycle, so shutdown never needs SIGKILL.
+    stop_grace_period: 45s

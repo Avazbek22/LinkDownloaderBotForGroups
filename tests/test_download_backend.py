@@ -231,7 +231,11 @@ def test_rate_limit_detection_is_specific_and_follows_wrapped_errors() -> None:
     ("errors", "expected_calls"),
     [
         (
-            (RuntimeError("ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"),),
+            (
+                RuntimeError(
+                    "ERROR: [Instagram] post: You have exceeded the rate-limit for accessing posts anonymously"
+                ),
+            ),
             1,
         ),
         (

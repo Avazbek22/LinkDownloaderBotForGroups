@@ -879,11 +879,7 @@ def extract_metadata(
                         "Instagram did not expose this content to the bot"
                     ) from restricted_error
                 missing_error = next(
-                    (
-                        error
-                        for error in (primary_error, fallback_error)
-                        if _is_requested_media_not_found(url, error)
-                    ),
+                    (error for error in (primary_error, fallback_error) if _is_requested_media_not_found(url, error)),
                     None,
                 )
                 if missing_error is not None:

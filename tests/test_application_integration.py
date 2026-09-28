@@ -803,6 +803,9 @@ def test_reaction_handler_is_registered(tmp_path) -> None:
 
 def test_polling_explicitly_requests_reaction_updates(tmp_path, monkeypatch) -> None:
     class PollingBot(FakeBot):
+        def get_updates(self, *args, **kwargs) -> list:
+            return []
+
         def infinity_polling(self, **kwargs) -> None:
             self.polling_options = kwargs
 
@@ -816,6 +819,7 @@ def test_polling_explicitly_requests_reaction_updates(tmp_path, monkeypatch) -> 
     app = main.BotApplication(_settings(tmp_path))
     fake = PollingBot()
     app.bot = fake
+    app.health_marker = tmp_path / "health"
     monkeypatch.setattr(app, "initialize_identity", lambda: None)
     monkeypatch.setattr(app, "_set_commands", lambda: None)
     monkeypatch.setattr(main.threading, "Thread", DormantThread)
