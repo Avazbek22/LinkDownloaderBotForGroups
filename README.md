@@ -196,9 +196,9 @@ sudo git clone \
 sudo bash /opt/linkdownloaderbot/install.sh
 ```
 
-The installer asks for the Telegram bot token and whether new groups must be approved by the bot owner. It then builds the container, starts the bot, and prepares automatic updates when systemd is available.
+The installer asks for the Telegram bot token and whether new groups must be approved by the bot owner. It then builds and checks the container, starts the bot, and enables automatic updates: every push to `main` is deployed once its CI checks pass, and yt-dlp is refreshed every night.
 
-To update an existing installation, run the same command again:
+To repair an existing installation, run the same command again:
 
 ```bash
 sudo bash /opt/linkdownloaderbot/install.sh
@@ -484,30 +484,26 @@ logging:
 
 Video websites change frequently, so yt-dlp may need regular updates.
 
-On systemd-based installations, the installer can enable:
+The installer enables two systemd timers:
 
-- a nightly yt-dlp update;
-- automatic application updates from the installation repository.
+- `linkdownloaderbotforgroups-deploy.timer` checks the repository every two minutes and deploys a new commit once its GitHub checks pass (or after 30 minutes if CI never starts);
+- `linkdownloaderbotforgroups-rebuild.timer` rebuilds the running version every night with the newest yt-dlp and restarts the bot only when yt-dlp actually has a new version.
 
-Updates are tested before the running bot is replaced. If the new version fails to start correctly, the previous version is restored.
+Every update is built and checked (imports, ffmpeg, Node, yt-dlp, Telegram `getMe`) before the running bot is replaced, and it must report healthy afterwards. The bot counts as healthy only while Telegram answers its `getUpdates` requests. If anything fails — including during the first ten minutes after an update — the previous version and the exact image it ran are restored automatically. Both schedules live in [`deploy.conf`](deploy.conf).
 
 Your token, settings, logs, and persistent data are not replaced.
 
 <details>
 <summary><strong>Useful update commands</strong></summary>
 
-```bash
-systemctl status linkdownloaderbotforgroups-yt-dlp-update.timer
-
-sudo systemctl start \
-  linkdownloaderbotforgroups-yt-dlp-update.service
-```
+Run these from the installation directory, for example `/opt/linkdownloaderbot`:
 
 ```bash
-systemctl status linkdownloaderbotforgroups-deploy.timer
-
-sudo systemctl start \
-  linkdownloaderbotforgroups-deploy.service
+sudo bash scripts/status.sh            # running version, previous version, pending update
+sudo bash scripts/deploy.sh            # deploy now instead of waiting for the timer
+sudo bash scripts/deploy.sh --retry    # try a failed update again
+sudo bash scripts/deploy.sh --rebuild  # refresh yt-dlp now
+sudo bash scripts/rollback.sh          # return to the previous version (run again to undo)
 ```
 
 Disable automatic application updates:
@@ -554,11 +550,10 @@ Grant the bot permission to delete messages, or use:
 
 ### A website suddenly stops working
 
-Update yt-dlp and inspect the logs:
+Refresh yt-dlp and inspect the logs:
 
 ```bash
-sudo systemctl start \
-  linkdownloaderbotforgroups-yt-dlp-update.service
+sudo bash scripts/deploy.sh --rebuild
 
 docker compose logs --tail=200
 ```

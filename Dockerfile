@@ -34,10 +34,10 @@ COPY requirements.txt /app/requirements.txt
 RUN sed '/^yt-dlp/d' /app/requirements.txt > /tmp/requirements-base.txt \
     && pip install --no-cache-dir -r /tmp/requirements-base.txt
 
-# The updater changes this argument to refresh yt-dlp without invalidating the
-# slower OS and stable Python dependency layers.
-ARG YTDLP_CACHEBUST=initial
-RUN echo "$YTDLP_CACHEBUST" >/tmp/ytdlp-cachebust \
+# Scheduled rebuilds (deploy.conf) pass a new REBUILD_STAMP, which refreshes
+# yt-dlp without invalidating the slower OS and stable Python dependency layers.
+ARG REBUILD_STAMP=initial
+RUN echo "$REBUILD_STAMP" >/tmp/rebuild-stamp \
     && pip install --no-cache-dir --upgrade 'yt-dlp[default,curl-cffi]'
 
 COPY app /app/app
@@ -55,3 +55,7 @@ ENV XDG_CACHE_HOME=/tmp/.cache
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "-u", "/app/main.py"]
+
+# Healthy while Telegram answers the bot's getUpdates requests (app/healthcheck.py).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "-m", "app.healthcheck"]

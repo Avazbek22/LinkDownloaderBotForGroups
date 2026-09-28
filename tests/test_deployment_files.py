@@ -15,13 +15,14 @@ def test_installer_enables_main_updater_and_detects_a_fork() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
 
     assert "remote get-url origin" in installer
-    assert 'BRANCH="main"' in installer
-    assert "linkdownloaderbotforgroups-deploy.timer" in installer
+    assert "release_commit" in installer
+    assert "install_units" in installer
+    assert 'DEFAULT_APP_SLUG="linkdownloaderbotforgroups"' in installer
     assert "INSTALL_APP_UPDATER" not in installer
 
-    deployer = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
-    assert 'DEPLOY_BRANCH="main"' in deployer
-    assert "production-ready" not in deployer
+    deploy_conf = (ROOT / "deploy.conf").read_text(encoding="utf-8")
+    assert "DEPLOY_BRANCH=main" in deploy_conf
+    assert 'REBUILD_VERSION_CMD="python -m yt_dlp --version"' in deploy_conf
 
 
 def test_installer_configures_optional_owner_approval_without_a_password() -> None:
@@ -40,23 +41,33 @@ def test_installer_configures_optional_owner_approval_without_a_password() -> No
 
 def test_systemd_invokes_scripts_through_bash() -> None:
     systemd_dir = ROOT / "scripts/systemd"
-    deploy_service = (systemd_dir / "linkdownloaderbotforgroups-deploy.service").read_text(encoding="utf-8")
-    ytdlp_service = (systemd_dir / "linkdownloaderbotforgroups-yt-dlp-update.service").read_text(encoding="utf-8")
+    deploy_service = (systemd_dir / "telegram-bot-deploy.service").read_text(encoding="utf-8")
+    rebuild_service = (systemd_dir / "telegram-bot-rebuild.service").read_text(encoding="utf-8")
 
     assert "ExecStart=/usr/bin/env bash" in deploy_service
     assert "scripts/deploy.sh" in deploy_service
-    assert "ExecStart=/usr/bin/env bash" in ytdlp_service
+    assert "ExecStart=/usr/bin/env bash" in rebuild_service
+    assert "--rebuild" in rebuild_service
 
 
 def test_compose_has_a_stable_default_project_name() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert compose.startswith("name: ${COMPOSE_PROJECT_NAME:-linkdownloaderbotforgroups}\n")
+    assert compose.startswith("name: ${APP_SLUG:-linkdownloaderbotforgroups}\n")
+    assert "image: ${APP_SLUG:-linkdownloaderbotforgroups}:${APP_IMAGE_TAG:-local}" in compose
 
 
-def test_ytdlp_updater_shell_test_is_wired_into_ci() -> None:
+def test_image_reports_health_from_polling() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert '["python", "-m", "app.healthcheck"]' in dockerfile
+    assert "ARG REBUILD_STAMP" in dockerfile
+
+
+def test_deployment_shell_tests_are_wired_into_ci() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
-    assert (ROOT / "tests/shell/test-update-ytdlp.sh").is_file()
+    assert (ROOT / "tests/shell/test-deploy.sh").is_file()
+    assert (ROOT / "tests/shell/test-install.sh").is_file()
     assert "for test_script in tests/shell/test-*.sh" in workflow
     assert 'bash "$test_script"' in workflow

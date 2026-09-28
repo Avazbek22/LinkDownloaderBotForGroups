@@ -29,6 +29,7 @@ from app.download_backend import (
     has_downloadable_video,
 )
 from app.group_registry import ACTIVE_TELEGRAM_STATUSES, GroupRegistry, normalize_telegram_status
+from app.healthcheck import HEALTH_MARKER
 from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job, MediaKind
 from app.logging_setup import configure_logging
@@ -104,6 +105,7 @@ class BotApplication:
         self._failed_retries: OrderedDict[tuple[int, int], FailedRetry] = OrderedDict()
         self._retries_in_progress: set[tuple[int, int]] = set()
         self.bot = telebot.TeleBot(settings.token, threaded=True)
+        self.health_marker = HEALTH_MARKER
         self.bot_id = 0
         self.bot_username = ""
         self.workers: list[threading.Thread] = []
@@ -134,6 +136,9 @@ class BotApplication:
         if self.settings.cookies_file and not self.settings.cookies_file.is_file():
             self.log.warning("cookies file does not exist path=%s", self.settings.cookies_file)
         self.initialize_identity()
+        self._mark_healthy_after_each_poll()
+        # getMe has just proven the token and the network; polling keeps it fresh.
+        self._write_health_marker()
         self._refresh_group_registry()
         self._maintain_group_access()
         self._set_commands()
@@ -163,6 +168,8 @@ class BotApplication:
         if self.stop_event.is_set():
             return
         self.stop_event.set()
+        with suppress(OSError):
+            self.health_marker.unlink(missing_ok=True)
         self.bot.stop_polling()
         for _ in self.workers:
             try:
@@ -177,6 +184,27 @@ class BotApplication:
             self.maintenance_thread.join(timeout=2)
         self.disk_cache.maintain()
         self.log.info("bot stopped")
+
+    def _mark_healthy_after_each_poll(self) -> None:
+        """Keep the health marker fresh only while Telegram answers getUpdates.
+
+        A revoked token, a network outage, or a second instance polling the same
+        token (HTTP 409) stops these refreshes, so Docker reports the container
+        unhealthy and a fresh release is rolled back automatically.
+        """
+        get_updates = self.bot.get_updates
+
+        def get_updates_and_mark_healthy(*args: Any, **kwargs: Any) -> Any:
+            updates = get_updates(*args, **kwargs)
+            if not self.stop_event.is_set():
+                self._write_health_marker()
+            return updates
+
+        self.bot.get_updates = get_updates_and_mark_healthy  # type: ignore[method-assign]
+
+    def _write_health_marker(self) -> None:
+        with suppress(OSError):
+            self.health_marker.touch()
 
     def _worker(self) -> None:
         while not self.stop_event.is_set():
