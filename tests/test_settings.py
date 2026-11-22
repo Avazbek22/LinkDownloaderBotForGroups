@@ -136,3 +136,17 @@ def test_unset_remote_components_keeps_default(monkeypatch) -> None:
         else:
             os.environ["YTDLP_REMOTE_COMPONENTS"] = previous
         env_config.reload_from_environment()
+
+
+def test_upload_timeout_defaults_to_five_minutes_and_is_bounded(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.delenv("UPLOAD_TIMEOUT_SECONDS", raising=False)
+
+    assert load_settings(tmp_path).upload_timeout == 300
+
+    monkeypatch.setenv("UPLOAD_TIMEOUT_SECONDS", "900")
+    assert load_settings(tmp_path).upload_timeout == 900
+
+    monkeypatch.setenv("UPLOAD_TIMEOUT_SECONDS", "10")
+    with pytest.raises(RuntimeError, match="UPLOAD_TIMEOUT_SECONDS"):
+        load_settings(tmp_path)

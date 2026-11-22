@@ -110,6 +110,7 @@ class Settings:
     group_bootstrap_chat_ids: tuple[int, ...] = ()
     source_cooldown_initial_seconds: int = 15 * 60
     source_cooldown_max_seconds: int = 6 * 60 * 60
+    upload_timeout: int = 5 * 60
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -182,4 +183,5 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         group_bootstrap_chat_ids=_chat_ids("GROUP_BOOTSTRAP_CHAT_IDS"),
         source_cooldown_initial_seconds=source_cooldown_initial_seconds,
         source_cooldown_max_seconds=source_cooldown_max_seconds,
+        upload_timeout=_integer("UPLOAD_TIMEOUT_SECONDS", 5 * 60, 30, 60 * 60),
     )

@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import requests
 import telebot
 
 from app.download_backend import (
@@ -509,7 +510,7 @@ class BotApplication:
                     self.storage.remove_file_id(media_key)
                     self.log.warning("invalid Telegram file_id media_key=%s", media_key)
                     return jobs[index:]
-                self.log.exception("cached send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+                self._log_send_failure("cached send failed", job, exc)
                 self._after_failure(job)
         return []
 
@@ -545,10 +546,23 @@ class BotApplication:
                                 url_keys=url_keys,
                             )
                 self._after_success(job)
-            except Exception:
-                self.log.exception("media send failed job_id=%s chat_id=%s", job.job_id, job.chat_id)
+            except Exception as exc:
+                self._log_send_failure("media send failed", job, exc)
                 self._after_failure(job)
         return file_id
+
+    def _log_send_failure(self, event: str, job: Job, exc: Exception) -> None:
+        if isinstance(exc, requests.exceptions.ReadTimeout):
+            # The request reached Telegram, so the media may still appear in the chat.
+            # The Bot API cannot read chat history to confirm it, so the job stays retryable.
+            self.log.warning(
+                "%s: Telegram did not answer, delivery unconfirmed job_id=%s chat_id=%s",
+                event,
+                job.job_id,
+                job.chat_id,
+            )
+            return
+        self.log.exception("%s job_id=%s chat_id=%s", event, job.job_id, job.chat_id)
 
     def _send_media(self, job: Job, media: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
         if job.media_kind == "audio":
@@ -575,7 +589,7 @@ class BotApplication:
             kwargs["message_thread_id"] = job.message_thread_id
         if upload:
             with self.upload_slots, Path(video).open("rb") as handle:
-                return self.bot.send_video(video=handle, **kwargs)
+                return self.bot.send_video(video=handle, timeout=self.settings.upload_timeout, **kwargs)
         return self.bot.send_video(video=video, **kwargs)
 
     def _send_audio(self, job: Job, audio: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
@@ -608,7 +622,7 @@ class BotApplication:
             kwargs["message_thread_id"] = job.message_thread_id
         if upload:
             with self.upload_slots, Path(audio).open("rb") as handle:
-                return self.bot.send_audio(audio=handle, **kwargs)
+                return self.bot.send_audio(audio=handle, timeout=self.settings.upload_timeout, **kwargs)
         return self.bot.send_audio(audio=audio, **kwargs)
 
     def _after_success(self, job: Job) -> None:

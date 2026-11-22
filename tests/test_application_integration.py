@@ -1382,3 +1382,69 @@ def test_telegram_commands_offer_only_short_language_switches(tmp_path) -> None:
     assert "en" in names
     assert "ru" in names
     assert "language" not in names
+
+
+def _video_metadata(url: str) -> MediaMetadata:
+    return MediaMetadata(
+        url=url,
+        info={
+            "id": "video",
+            "extractor": "Test",
+            "formats": [{"format_id": "video", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        },
+        media_key="test:video",
+        source_name="Test",
+    )
+
+
+def test_uploads_wait_for_the_configured_timeout_but_file_id_sends_do_not(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), upload_timeout=420))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    flight = None
+    for index in range(2):
+        job = Job(str(index), -(index + 1), None, index + 10, index + 20, url, url, "User", True)
+        flight = app.coordinator.submit(job) or flight
+    assert flight is not None
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: _video_metadata(url))
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    assert fake.sends[0][1]["timeout"] == 420
+    assert fake.sends[1][0] == "telegram-file-id"
+    assert "timeout" not in fake.sends[1][1]
+
+
+def test_upload_timeout_is_reported_as_unconfirmed_and_stays_retryable(tmp_path, monkeypatch, caplog) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+
+    def timed_out_upload(*, video, **kwargs):
+        fake.sends.append((video, kwargs))
+        raise main.requests.exceptions.ReadTimeout("Read timed out. (read timeout=300)")
+
+    fake.send_video = timed_out_upload
+    app.bot = fake
+    url = "https://example.com/video"
+    job = Job("slow", -100, None, 42, 7, url, url, "User", True)
+    flight = app.coordinator.submit(job)
+    assert flight is not None
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: _video_metadata(url))
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    with caplog.at_level("WARNING", logger="link_downloader_bot.app"):
+        app._process_flight(flight)
+
+    assert fake.deletes == []
+    assert [item[2] for item in fake.reactions] == ["👎"]
+    assert "delivery unconfirmed job_id=slow" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert app._claim_failed_retry(_reaction_update("👎")) is not None

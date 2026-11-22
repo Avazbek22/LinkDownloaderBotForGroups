@@ -321,6 +321,7 @@ The most useful options are:
 | `MAX_FILESIZE` | `52428800` | Maximum delivered video or audio size in bytes |
 | `WORKERS` | `2` | Simultaneous downloads |
 | `UPLOAD_WORKERS` | `2` | Simultaneous Telegram uploads |
+| `UPLOAD_TIMEOUT_SECONDS` | `300` | Time to wait for Telegram to accept an upload |
 | `MAX_QUEUE` | `200` | Number of waiting requests |
 | `JOB_TIMEOUT_SECONDS` | `900` | Maximum processing time |
 | `MEDIA_CACHE_ENABLED` | `true` | Reuse recent and previously uploaded media |
