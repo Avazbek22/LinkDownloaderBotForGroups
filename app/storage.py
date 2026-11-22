@@ -157,23 +157,18 @@ class Storage:
         users = self.users.snapshot().get("opt_out", {}).get(str(chat_id), {})
         return bool(users.get(str(user_id), False)) if isinstance(users, dict) else False
 
-    def toggle_opt_out(self, chat_id: int, user_id: int) -> bool:
-        result = False
-
+    def set_opt_out(self, chat_id: int, user_id: int, opted_out: bool) -> None:
         def mutate(data: dict[str, Any]) -> None:
-            nonlocal result
             root = data.setdefault("opt_out", {})
             users = root.setdefault(str(chat_id), {})
-            result = not bool(users.get(str(user_id), False))
-            if result:
+            if opted_out:
                 users[str(user_id)] = True
-            else:
-                users.pop(str(user_id), None)
-                if not users:
-                    root.pop(str(chat_id), None)
+                return
+            users.pop(str(user_id), None)
+            if not users:
+                root.pop(str(chat_id), None)
 
         self.users.update(mutate)
-        return result
 
     def was_welcomed(self, kind: str, identity: int) -> bool:
         key = "welcomed_groups" if kind == "group" else "welcomed_private"

@@ -54,11 +54,13 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "already_welcomed": "The instructions were already sent. Use /help to show them again.",
         "private_hint": "Use /help to see the instructions.",
-        "opted_out": (
-            "{who}, automatic downloads are now disabled for you.\n"
-            "Mention {bot_mention} together with a link to download it."
-        ),
-        "opted_in": "{who}, automatic downloads are enabled again. You can simply post links.",
+        "auto_download_off_question": "{who}, turn off auto-download for your links?",
+        "auto_download_on_question": "{who}, turn auto-download for your links back on?",
+        "auto_download_off_done": "Done: auto-download for your links is off.",
+        "auto_download_on_done": "Done: auto-download for your links is back on.",
+        "auto_download_not_yours": "This question isn't for you.",
+        "yes": "Yes",
+        "no": "No",
         "language_changed": "Language changed to English.",
         "language_admin_only": "Only group administrators can change the language.",
         "admin_only": "Only group administrators can change this setting.",
@@ -129,11 +131,13 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "already_welcomed": "Инструкция уже отправлялась. Используйте /help, чтобы показать её снова.",
         "private_hint": "Используйте /help, чтобы увидеть инструкцию.",
-        "opted_out": (
-            "{who}, автоматическое скачивание для Вас отключено.\n"
-            "Для загрузки упомяните {bot_mention} вместе со ссылкой."
-        ),
-        "opted_in": "{who}, автоматическое скачивание снова включено. Можно просто отправлять ссылки.",
+        "auto_download_off_question": "{who}, отключить автоскачивание ваших ссылок?",
+        "auto_download_on_question": "{who}, снова включить автоскачивание ваших ссылок?",
+        "auto_download_off_done": "Готово: автоскачивание ваших ссылок отключено.",
+        "auto_download_on_done": "Готово: автоскачивание ваших ссылок снова включено.",
+        "auto_download_not_yours": "Этот вопрос не для вас.",
+        "yes": "Да",
+        "no": "Нет",
         "language_changed": "Язык изменён на русский.",
         "language_admin_only": "Изменять язык могут только администраторы группы.",
         "admin_only": "Изменять эту настройку могут только администраторы группы.",

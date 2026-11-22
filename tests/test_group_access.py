@@ -453,7 +453,7 @@ def test_membership_and_callback_handlers_are_registered(tmp_path) -> None:
     app = main.BotApplication(_settings(tmp_path))
 
     assert len(app.bot.my_chat_member_handlers) == 1
-    assert len(app.bot.callback_query_handlers) == 2
+    assert len(app.bot.callback_query_handlers) == 3
 
 
 def test_owner_can_pause_and_resume_group_without_group_messages(tmp_path, monkeypatch) -> None:

@@ -59,6 +59,9 @@ FAILED_RETRY_MAX_ITEMS = 1_000
 GROUP_NOTIFICATION_RETRY_SECONDS = 5 * 60
 GROUP_APPROVAL_ADMIN_LIMIT = 8
 MESSAGE_CLEANUP_INTERVAL_SECONDS = 1.0
+AUTO_DOWNLOAD_QUESTION_TTL_SECONDS = 60
+AUTO_DOWNLOAD_DONE_TTL_SECONDS = 10
+AUTO_DOWNLOAD_CALLBACK_PREFIX = "ad:"
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,9 @@ class BotApplication:
         self.stop_event = threading.Event()
         self.upload_slots = threading.BoundedSemaphore(settings.upload_workers)
         self._failed_retry_lock = threading.RLock()
+        self._question_lock = threading.Lock()
+        # The latest open auto-download question per (chat, user), so a new one replaces it.
+        self._auto_download_questions: dict[tuple[int, int], int] = {}
         self._failed_retries: OrderedDict[tuple[int, int], FailedRetry] = OrderedDict()
         self._retries_in_progress: set[tuple[int, int]] = set()
         self.bot = telebot.TeleBot(settings.token, threaded=True)
@@ -2202,6 +2208,12 @@ class BotApplication:
         def group_access_callback(call: Any) -> None:
             self._handle_group_access_callback(call)
 
+        @bot.callback_query_handler(
+            func=lambda call: str(getattr(call, "data", "") or "").startswith(AUTO_DOWNLOAD_CALLBACK_PREFIX)
+        )
+        def auto_download_callback(call: Any) -> None:
+            self._handle_auto_download_callback(call)
+
         @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("gm:"))
         def group_management_callback(call: Any) -> None:
             self._handle_group_management_callback(call)
@@ -2376,18 +2388,10 @@ class BotApplication:
             chat_id = int(message.chat.id)
             user_id = int(message.from_user.id)
             media_kind: MediaKind = "audio" if command == "audio" else "video"
-            mentioned = bool(self.bot_username and re.search(rf"(^|\s)@{re.escape(self.bot_username)}\b", text.lower()))
-            username = getattr(message.from_user, "username", None)
-            if mentioned and self._self_mention(text, username):
-                opted_out = self.storage.toggle_opt_out(chat_id, user_id)
-                who = f"@{username}" if username else self._sender_name(message)
-                key = "opted_out" if opted_out else "opted_in"
-                self._safe_message(
-                    chat_id,
-                    tr(self.storage.chat_language(chat_id), key, who=who, bot_mention=self.mention),
-                    getattr(message, "message_thread_id", None),
-                )
+            if command is None and self._is_bare_mention(message):
+                self._ask_about_auto_download(message)
                 return
+            mentioned = bool(self.bot_username and re.search(rf"(^|\s)@{re.escape(self.bot_username)}\b", text.lower()))
             url = extract_first_url(text)
             if url is None:
                 if media_kind == "audio":
@@ -2476,12 +2480,114 @@ class BotApplication:
             return None
         return target
 
-    @staticmethod
-    def _self_mention(text: str, username: str | None) -> bool:
-        lowered = text.lower()
-        if re.search(r"(^|\s)(me|я)(\s|$)", lowered):
-            return True
-        return bool(username and re.search(rf"(^|\s)@{re.escape(username.lower())}\b", lowered))
+    def _is_bare_mention(self, message: Any) -> bool:
+        """Return whether the message is the bot's mention alone, with no link and no other words."""
+        text = getattr(message, "text", None)
+        return bool(self.bot_username) and isinstance(text, str) and text.strip().lower() == f"@{self.bot_username}"
+
+    def _ask_about_auto_download(self, message: Any) -> None:
+        chat_id = int(message.chat.id)
+        user_id = int(message.from_user.id)
+        language = self.storage.chat_language(chat_id)
+        opted_out = self.storage.is_opted_out(chat_id, user_id)
+        # The answer names the target state, so a repeated or late press cannot flip it back.
+        target = "on" if opted_out else "off"
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                tr(language, "yes"),
+                callback_data=f"{AUTO_DOWNLOAD_CALLBACK_PREFIX}{user_id}:{target}",
+            ),
+            telebot.types.InlineKeyboardButton(
+                tr(language, "no"),
+                callback_data=f"{AUTO_DOWNLOAD_CALLBACK_PREFIX}{user_id}:no",
+            ),
+        )
+        kwargs: dict[str, Any] = {"parse_mode": "HTML", "reply_markup": markup, "disable_notification": True}
+        thread_id = getattr(message, "message_thread_id", None)
+        if isinstance(thread_id, int):
+            kwargs["message_thread_id"] = thread_id
+        question = "auto_download_on_question" if opted_out else "auto_download_off_question"
+        try:
+            sent = self.bot.send_message(chat_id, tr(language, question, who=self._user_link(message)), **kwargs)
+        except Exception:
+            self.log.exception("auto-download question failed chat_id=%s", chat_id)
+            return
+        question_id = getattr(sent, "message_id", None)
+        if isinstance(question_id, int):
+            self.janitor.schedule(chat_id, question_id, AUTO_DOWNLOAD_QUESTION_TTL_SECONDS)
+            previous = self._replace_auto_download_question(chat_id, user_id, question_id)
+            if previous is not None:
+                self.janitor.delete_now(chat_id, previous)
+        self.janitor.delete_now(chat_id, int(message.message_id))
+
+    def _replace_auto_download_question(self, chat_id: int, user_id: int, question_id: int) -> int | None:
+        with self._question_lock:
+            previous = self._auto_download_questions.get((chat_id, user_id))
+            self._auto_download_questions[(chat_id, user_id)] = question_id
+        return previous if previous != question_id else None
+
+    def _close_auto_download_question(self, chat_id: int, user_id: int, question_id: int) -> None:
+        with self._question_lock:
+            if self._auto_download_questions.get((chat_id, user_id)) == question_id:
+                del self._auto_download_questions[(chat_id, user_id)]
+
+    def _handle_auto_download_callback(self, call: Any) -> None:
+        callback_id = getattr(call, "id", None)
+        parts = str(getattr(call, "data", "") or "").removeprefix(AUTO_DOWNLOAD_CALLBACK_PREFIX).split(":")
+        message = getattr(call, "message", None)
+        chat = getattr(message, "chat", None)
+        try:
+            owner_id = int(parts[0])
+            presser_id = int(call.from_user.id)
+            chat_id = int(chat.id)
+            question_id = int(message.message_id)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            self._answer_callback(callback_id, "")
+            return
+        answer = parts[1] if len(parts) == 2 else ""
+        if answer not in {"on", "off", "no"} or getattr(chat, "type", "") not in {"group", "supergroup"}:
+            self._answer_callback(callback_id, "")
+            return
+        if not self._record_group_access(chat):
+            self._answer_callback(callback_id, "")
+            return
+        language = self.storage.chat_language(chat_id)
+        if presser_id != owner_id:
+            self._answer_callback(callback_id, tr(language, "auto_download_not_yours"), alert=True)
+            return
+        self._close_auto_download_question(chat_id, owner_id, question_id)
+        if answer == "no":
+            self.janitor.delete_now(chat_id, question_id)
+            self._answer_callback(callback_id, "")
+            return
+        opted_out = answer == "off"
+        self.storage.set_opt_out(chat_id, owner_id, opted_out)
+        self.log.info(
+            "auto-download changed chat_id=%s user_id=%s enabled=%s",
+            chat_id,
+            owner_id,
+            not opted_out,
+        )
+        try:
+            self.bot.edit_message_text(
+                tr(language, "auto_download_off_done" if opted_out else "auto_download_on_done"),
+                chat_id=chat_id,
+                message_id=question_id,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            self.log.info("auto-download answer was not shown chat_id=%s error=%s", chat_id, type(exc).__name__)
+        self.janitor.schedule(chat_id, question_id, AUTO_DOWNLOAD_DONE_TTL_SECONDS)
+        self._answer_callback(callback_id, "")
+
+    @classmethod
+    def _user_link(cls, message: Any) -> str:
+        username = getattr(message.from_user, "username", None)
+        if username:
+            return f"@{html.escape(str(username), quote=False)}"
+        name = html.escape(cls._sender_name(message), quote=False)
+        return f'<a href="tg://user?id={int(message.from_user.id)}">{name}</a>'
 
     @staticmethod
     def _sender_name(message: Any) -> str:

@@ -300,11 +300,6 @@ def test_pausing_group_clears_and_disables_existing_failure_retry(tmp_path) -> N
     assert app.queue.empty()
 
 
-def test_self_mention_requires_a_message_token() -> None:
-    assert main.BotApplication._self_mention("hello @alice", "alice")
-    assert not main.BotApplication._self_mention("https://example.com/@alice/video", "alice")
-
-
 def test_group_command_recognizes_only_commands_for_this_bot() -> None:
     assert main.BotApplication._group_command(" /SKIP https://example.com", "downloader") == "skip"
     assert main.BotApplication._group_command("/skip@Downloader https://example.com", "downloader") == "skip"
@@ -371,7 +366,7 @@ def test_audio_command_queues_one_audio_request_even_for_opted_out_user(tmp_path
     fake = FakeBot()
     app.bot = fake
     app.bot_username = "downloader"
-    app.storage.toggle_opt_out(-100, 7)
+    app.storage.set_opt_out(-100, 7, True)
     message = SimpleNamespace(
         chat=SimpleNamespace(id=-100, type="supergroup"),
         from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
@@ -1881,3 +1876,243 @@ def test_paused_group_ignores_cancel_reactions(tmp_path, monkeypatch) -> None:
     assert fake.reactions == reactions_before
     assert not app.coordinator.is_cancelled(flight.jobs[0])
     app.coordinator.abort(flight)
+
+
+class PromptBot(FakeBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.next_message_id = 500
+        self.edits = []
+        self.answers = []
+
+    def send_message(self, chat_id, text, **kwargs):
+        self.next_message_id += 1
+        self.messages.append((chat_id, text, kwargs))
+        return SimpleNamespace(message_id=self.next_message_id)
+
+    def edit_message_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
+        return True
+
+    def answer_callback_query(self, callback_id, **kwargs):
+        self.answers.append((callback_id, kwargs))
+        return True
+
+
+def _prompt_app(tmp_path) -> tuple[main.BotApplication, PromptBot]:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = PromptBot()
+    app.bot = fake
+    app.bot_username = "downloader"
+    return app, fake
+
+
+def _mention(text: str = "@Downloader", *, user_id: int = 7, username: str | None = "alice", **extra):
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=user_id, is_bot=False, first_name="Alice", last_name="", username=username),
+        text=text,
+        caption=None,
+        message_id=42,
+        **extra,
+    )
+
+
+def _press(message_id: int, data: str, *, user_id: int = 7) -> SimpleNamespace:
+    return SimpleNamespace(
+        id="callback",
+        data=data,
+        from_user=SimpleNamespace(id=user_id, is_bot=False),
+        message=SimpleNamespace(chat=SimpleNamespace(id=-100, type="supergroup"), message_id=message_id),
+    )
+
+
+def _buttons(kwargs: dict) -> list[tuple[str, str]]:
+    return [(button.text, button.callback_data) for row in kwargs["reply_markup"].keyboard for button in row]
+
+
+def test_bare_mention_asks_to_turn_auto_download_off(tmp_path, monkeypatch) -> None:
+    app, fake = _prompt_app(tmp_path)
+    scheduled = []
+    monkeypatch.setattr(app.janitor, "schedule", lambda *args: scheduled.append(args))
+
+    app._handle_group_message(_mention("  @Downloader  ", message_thread_id=5))
+
+    [(chat_id, text, kwargs)] = fake.messages
+    assert chat_id == -100
+    assert text == "@alice, turn off auto-download for your links?"
+    assert _buttons(kwargs) == [("Yes", "ad:7:off"), ("No", "ad:7:no")]
+    assert kwargs["message_thread_id"] == 5
+    assert kwargs["parse_mode"] == "HTML"
+    assert scheduled == [(-100, 501, main.AUTO_DOWNLOAD_QUESTION_TTL_SECONDS)]
+    assert fake.deletes == [(-100, 42)]
+    assert app.queue.empty()
+    assert fake.reactions == []
+
+
+def test_opted_out_member_is_asked_to_turn_it_back_on_in_the_group_language(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app.storage.set_chat_language(-100, "ru")
+    app.storage.set_opt_out(-100, 7, True)
+
+    app._handle_group_message(_mention())
+
+    [(_chat_id, text, kwargs)] = fake.messages
+    assert text == "@alice, снова включить автоскачивание ваших ссылок?"
+    assert _buttons(kwargs) == [("Да", "ad:7:on"), ("Нет", "ad:7:no")]
+
+
+def test_member_without_username_is_named_with_a_safe_profile_link(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    message = _mention(username=None)
+    message.from_user.first_name = "<Bob>"
+
+    app._handle_group_message(message)
+
+    assert fake.messages[0][1] == '<a href="tg://user?id=7">&lt;Bob&gt;</a>, turn off auto-download for your links?'
+
+
+def test_mention_with_any_words_is_ignored_and_old_toggle_words_do_nothing(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    for text in ("@Downloader me", "@Downloader я", "@Downloader @alice", "hi @Downloader", "@Downloader thanks"):
+        app._handle_group_message(_mention(text))
+
+    caption = _mention()
+    caption.text = None
+    caption.caption = "@Downloader"
+    app._handle_group_message(caption)
+
+    assert fake.messages == []
+    assert fake.deletes == []
+    assert not app.storage.is_opted_out(-100, 7)
+
+
+def test_mention_with_a_link_downloads_even_while_auto_download_is_off(tmp_path, monkeypatch) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app.storage.set_opt_out(-100, 7, True)
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    app._handle_group_message(_mention("@Downloader https://example.com/video"))
+    app._handle_group_message(_mention("https://example.com/other"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert [job.url for job in flight.jobs] == ["https://example.com/video"]
+    assert app.queue.empty()
+    assert fake.messages == []
+    app.coordinator.abort(flight)
+
+
+def test_yes_turns_auto_download_off_and_the_answer_disappears_soon(tmp_path, monkeypatch) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app._handle_group_message(_mention())
+    scheduled = []
+    monkeypatch.setattr(app.janitor, "schedule", lambda *args: scheduled.append(args))
+
+    app._handle_auto_download_callback(_press(501, "ad:7:off"))
+
+    assert app.storage.is_opted_out(-100, 7)
+    assert fake.edits == [
+        (
+            "Done: auto-download for your links is off.",
+            {"chat_id": -100, "message_id": 501, "reply_markup": None},
+        )
+    ]
+    assert scheduled == [(-100, 501, main.AUTO_DOWNLOAD_DONE_TTL_SECONDS)]
+    assert fake.answers == [("callback", {"text": "", "show_alert": False})]
+
+
+def test_yes_sets_the_asked_state_so_repeated_or_late_presses_never_flip_it(tmp_path) -> None:
+    app, _fake = _prompt_app(tmp_path)
+
+    app._handle_auto_download_callback(_press(501, "ad:7:off"))
+    app._handle_auto_download_callback(_press(501, "ad:7:off"))
+    assert app.storage.is_opted_out(-100, 7)
+
+    app._handle_auto_download_callback(_press(502, "ad:7:on"))
+    app._handle_auto_download_callback(_press(502, "ad:7:on"))
+    assert not app.storage.is_opted_out(-100, 7)
+
+
+def test_no_removes_the_question_and_changes_nothing(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app._handle_group_message(_mention())
+
+    app._handle_auto_download_callback(_press(501, "ad:7:no"))
+
+    assert not app.storage.is_opted_out(-100, 7)
+    assert fake.deletes == [(-100, 42), (-100, 501)]
+    assert fake.edits == []
+
+
+def test_only_the_asked_member_can_answer(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app.storage.set_chat_language(-100, "ru")
+    app._handle_group_message(_mention())
+
+    app._handle_auto_download_callback(_press(501, "ad:7:off", user_id=8))
+
+    assert not app.storage.is_opted_out(-100, 7)
+    assert not app.storage.is_opted_out(-100, 8)
+    assert fake.answers == [("callback", {"text": "Этот вопрос не для вас.", "show_alert": True})]
+    assert fake.edits == []
+    assert fake.deletes == [(-100, 42)]
+
+
+def test_new_question_replaces_the_previous_one(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+
+    app._handle_group_message(_mention())
+    app._handle_group_message(_mention())
+
+    assert fake.deletes == [(-100, 42), (-100, 501), (-100, 42)]
+
+
+def test_unanswered_question_is_removed_after_its_lifetime(tmp_path, monkeypatch) -> None:
+    app, fake = _prompt_app(tmp_path)
+    now = [1_000.0]
+    monkeypatch.setattr(app.janitor, "_clock", lambda: now[0])
+    app._handle_group_message(_mention())
+
+    now[0] += main.AUTO_DOWNLOAD_QUESTION_TTL_SECONDS - 1
+    app.janitor.run_due()
+    assert (-100, 501) not in fake.deletes
+
+    now[0] += 1
+    app.janitor.run_due()
+    assert (-100, 501) in fake.deletes
+
+
+def test_malformed_or_foreign_presses_change_nothing(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    presses = [_press(501, "ad:7:maybe"), _press(501, "ad:x:off"), _press(501, "ad:7")]
+    private = _press(501, "ad:7:off")
+    private.message.chat.type = "private"
+    presses.append(private)
+
+    for press in presses:
+        app._handle_auto_download_callback(press)
+
+    assert not app.storage.is_opted_out(-100, 7)
+    assert fake.edits == []
+    assert len(fake.answers) == len(presses)
+
+
+def test_paused_group_ignores_bare_mentions_and_answers(tmp_path) -> None:
+    app, fake = _prompt_app(tmp_path)
+    app.group_registry.record_bootstrap_result(-100, title="Paused", chat_type="supergroup", telegram_status="member")
+    result, _group = app.group_registry.set_runtime_mode(-100, "soft", 42, expected_revision=0)
+    assert result == "changed"
+
+    app._handle_group_message(_mention())
+    app._handle_auto_download_callback(_press(501, "ad:7:off"))
+
+    assert fake.messages == []
+    assert not app.storage.is_opted_out(-100, 7)
+
+
+def test_auto_download_callbacks_have_their_own_handler(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    filters = [handler["filters"]["func"] for handler in app.bot.callback_query_handlers]
+
+    assert [check(SimpleNamespace(data="ad:7:off")) for check in filters].count(True) == 1
