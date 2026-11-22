@@ -37,6 +37,7 @@ from app.i18n import tr
 from app.jobs import Flight, FlightCoordinator, Job, MediaKind
 from app.logging_setup import configure_logging
 from app.media_cache import DiskMediaCache
+from app.message_janitor import MessageJanitor
 from app.settings import Settings, load_settings
 from app.source_limits import SourceAccess, SourceCooldowns, source_platform
 from app.storage import Storage
@@ -57,6 +58,7 @@ FAILED_RETRY_TTL_SECONDS = 7 * 24 * 60 * 60
 FAILED_RETRY_MAX_ITEMS = 1_000
 GROUP_NOTIFICATION_RETRY_SECONDS = 5 * 60
 GROUP_APPROVAL_ADMIN_LIMIT = 8
+MESSAGE_CLEANUP_INTERVAL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -110,11 +112,14 @@ class BotApplication:
         self._failed_retries: OrderedDict[tuple[int, int], FailedRetry] = OrderedDict()
         self._retries_in_progress: set[tuple[int, int]] = set()
         self.bot = telebot.TeleBot(settings.token, threaded=True)
+        # Resolve the bot on every call so a replaced client is still the one that deletes.
+        self.janitor = MessageJanitor(lambda chat_id, message_id: self.bot.delete_message(chat_id, message_id))
         self.health_marker = HEALTH_MARKER
         self.bot_id = 0
         self.bot_username = ""
         self.workers: list[threading.Thread] = []
         self.maintenance_thread: threading.Thread | None = None
+        self.cleanup_thread: threading.Thread | None = None
         self._register_handlers()
 
     @property
@@ -157,6 +162,12 @@ class BotApplication:
             daemon=True,
         )
         self.maintenance_thread.start()
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="message-cleanup",
+            daemon=True,
+        )
+        self.cleanup_thread.start()
         self.log.info(
             "bot started username=%s workers=%s uploads=%s",
             self.bot_username,
@@ -187,6 +198,9 @@ class BotApplication:
             thread.join(timeout=min(10.0, remaining))
         if self.maintenance_thread is not None:
             self.maintenance_thread.join(timeout=2)
+        if self.cleanup_thread is not None:
+            self.cleanup_thread.join(timeout=2)
+        self.janitor.flush()
         self.disk_cache.maintain()
         self.log.info("bot stopped")
 
@@ -267,6 +281,13 @@ class BotApplication:
                 self._maintain_group_access()
             except Exception:
                 self.log.exception("group access maintenance failed")
+
+    def _cleanup_loop(self) -> None:
+        while not self.stop_event.wait(MESSAGE_CLEANUP_INTERVAL_SECONDS):
+            try:
+                self.janitor.run_due()
+            except Exception:
+                self.log.exception("message cleanup failed")
 
     def _activate_source_cooldown(
         self,
