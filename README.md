@@ -74,6 +74,17 @@ When the bot leaves 🙈, 😴, or 👎, a group member can add the same reactio
 be a group administrator to receive reaction updates. A retry replaces the bot's failure reaction with 👀 and
 runs through the normal queue, validation, and download pipeline again.
 
+While 👀 is shown, the person who posted the link can add 👀 too (in Telegram, just tap the bot's 👀) to cancel it.
+The bot removes its 👀 and leaves the message as it was:
+
+- a queued link is dropped before any website request;
+- a running download stops, unless someone else in any group is waiting for the same file;
+- if the upload was already on its way, the posted video or audio is deleted as soon as it arrives.
+
+Only the sender can cancel their own link; 👀 from anyone else is ignored. Once the bot has posted the media or left
+a final reaction, 👀 no longer changes anything. Telegram does not let bots remove other people's reactions, so the
+sender's own 👀 stays on the message.
+
 The 😴 status is protected by a per-platform cooldown shared across all groups. Cached Telegram media is still
 delivered immediately, while uncached requests make no Instagram or YouTube request until the cooldown expires.
 After expiry, only one request is allowed to probe recovery. Another explicit limit doubles the cooldown up to
@@ -252,6 +263,8 @@ To publish one link without triggering the bot, put `/skip` before it:
 ```
 
 The bot stays completely silent for that message: it does not validate or download the URL, add a reaction, delete the message, or change the sender's personal preference. In groups, Telegram's explicit `/skip@BotName <link>` form works as well.
+
+Already posted the link without `/skip`? Add 👀 to it while the bot is still working on it, as described in the reactions section above.
 
 ### Commands
 
