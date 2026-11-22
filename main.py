@@ -564,6 +564,17 @@ class BotApplication:
             return
         self.log.exception("%s job_id=%s chat_id=%s", event, job.job_id, job.chat_id)
 
+    @staticmethod
+    def _place_in_conversation(kwargs: dict[str, Any], job: Job) -> None:
+        if job.message_thread_id is not None:
+            kwargs["message_thread_id"] = job.message_thread_id
+        if job.reply_to_message_id is not None:
+            # A deleted reply target must not cost the delivery itself.
+            kwargs["reply_parameters"] = telebot.types.ReplyParameters(
+                message_id=job.reply_to_message_id,
+                allow_sending_without_reply=True,
+            )
+
     def _send_media(self, job: Job, media: Path | str, metadata: MediaMetadata, *, upload: bool) -> Any:
         if job.media_kind == "audio":
             return self._send_audio(job, media, metadata, upload=upload)
@@ -585,8 +596,7 @@ class BotApplication:
             "supports_streaming": True,
             "disable_notification": True,
         }
-        if job.message_thread_id is not None:
-            kwargs["message_thread_id"] = job.message_thread_id
+        self._place_in_conversation(kwargs, job)
         if upload:
             with self.upload_slots, Path(video).open("rb") as handle:
                 return self.bot.send_video(video=handle, timeout=self.settings.upload_timeout, **kwargs)
@@ -618,8 +628,7 @@ class BotApplication:
         duration = metadata.info.get("duration")
         if isinstance(duration, (int, float)) and duration > 0:
             kwargs["duration"] = int(duration)
-        if job.message_thread_id is not None:
-            kwargs["message_thread_id"] = job.message_thread_id
+        self._place_in_conversation(kwargs, job)
         if upload:
             with self.upload_slots, Path(audio).open("rb") as handle:
                 return self.bot.send_audio(audio=handle, timeout=self.settings.upload_timeout, **kwargs)
@@ -2299,6 +2308,7 @@ class BotApplication:
                 delete_original=self.storage.delete_original(chat_id),
                 runtime_revision=self.group_registry.runtime_revision(group),
                 media_kind=media_kind,
+                reply_to_message_id=self._reply_target(message),
             )
             self._set_status_reaction(job, "👀")
             flight = self.coordinator.submit(job)
@@ -2343,6 +2353,20 @@ class BotApplication:
         if target and target != (bot_username or "").lower():
             return ""
         return command
+
+    @staticmethod
+    def _reply_target(message: Any) -> int | None:
+        """Return the message a link answers, so the media can answer it too."""
+        replied = getattr(message, "reply_to_message", None)
+        target = getattr(replied, "message_id", None)
+        if not isinstance(target, int):
+            return None
+        # Inside a forum topic every message replies to the topic's service message.
+        if getattr(replied, "forum_topic_created", None) is not None:
+            return None
+        if getattr(message, "is_topic_message", False) and target == getattr(message, "message_thread_id", None):
+            return None
+        return target
 
     @staticmethod
     def _self_mention(text: str, username: str | None) -> bool:

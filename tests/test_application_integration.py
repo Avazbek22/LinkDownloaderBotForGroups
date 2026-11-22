@@ -1448,3 +1448,118 @@ def test_upload_timeout_is_reported_as_unconfirmed_and_stays_retryable(tmp_path,
     assert "delivery unconfirmed job_id=slow" in caplog.text
     assert "Traceback" not in caplog.text
     assert app._claim_failed_retry(_reaction_update("👎")) is not None
+
+
+def _group_link_message(**extra) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        from_user=SimpleNamespace(id=7, is_bot=False, first_name="User", last_name="", username="user"),
+        text="https://example.com/video",
+        caption=None,
+        message_id=42,
+        **extra,
+    )
+
+
+def _queued_job(app: main.BotApplication, message: SimpleNamespace) -> Job:
+    app._handle_group_message(message)
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    job = flight.jobs[0]
+    app.coordinator.abort(flight)
+    return job
+
+
+def test_link_posted_as_reply_remembers_the_replied_message(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    app.bot = FakeBot()
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+
+    replied = _queued_job(app, _group_link_message(reply_to_message=SimpleNamespace(message_id=30)))
+    plain = _queued_job(app, _group_link_message())
+
+    assert replied.reply_to_message_id == 30
+    assert plain.reply_to_message_id is None
+
+
+def test_forum_topic_root_is_not_treated_as_a_reply(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    app.bot = FakeBot()
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    topic_root = SimpleNamespace(message_id=5, forum_topic_created=SimpleNamespace(name="Videos"))
+
+    in_topic = _queued_job(
+        app,
+        _group_link_message(is_topic_message=True, message_thread_id=5, reply_to_message=topic_root),
+    )
+    replied_in_topic = _queued_job(
+        app,
+        _group_link_message(
+            is_topic_message=True,
+            message_thread_id=5,
+            reply_to_message=SimpleNamespace(message_id=30, forum_topic_created=None),
+        ),
+    )
+
+    assert in_topic.message_thread_id == 5
+    assert in_topic.reply_to_message_id is None
+    assert replied_in_topic.message_thread_id == 5
+    assert replied_in_topic.reply_to_message_id == 30
+
+
+def test_every_delivery_answers_its_own_reply_target(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    jobs = [
+        Job("upload", -100, None, 42, 7, url, url, "User", True, reply_to_message_id=30),
+        Job("cached", -200, 9, 43, 8, url, url, "User", True, reply_to_message_id=31),
+        Job("plain", -300, None, 44, 9, url, url, "User", True),
+    ]
+    flight = None
+    for job in jobs:
+        flight = app.coordinator.submit(job) or flight
+    assert flight is not None
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: _video_metadata(url))
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    upload, cached, plain = (kwargs for _video, kwargs in fake.sends)
+    assert upload["reply_parameters"].message_id == 30
+    assert upload["reply_parameters"].allow_sending_without_reply is True
+    assert cached["reply_parameters"].message_id == 31
+    assert cached["message_thread_id"] == 9
+    assert "reply_parameters" not in plain
+    assert fake.deletes == [(-100, 42), (-200, 43), (-300, 44)]
+
+
+def test_audio_delivery_answers_the_reply_target(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    job = Job("audio", -100, None, 42, 7, url, url, "User", True, media_kind="audio", reply_to_message_id=30)
+
+    app._send_media(job, "telegram-audio-file-id", _video_metadata(url), upload=False)
+
+    assert fake.audio_sends[0][1]["reply_parameters"].message_id == 30
+
+
+def test_reaction_retry_keeps_the_reply_target(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    app.bot = FakeBot()
+    url = "https://example.com/video"
+    app._after_failure(Job("failed", -100, None, 42, 7, url, url, "User", True, reply_to_message_id=30))
+
+    app._handle_retry_reaction(_reaction_update("👎"))
+
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    assert flight.jobs[0].job_id != "failed"
+    assert flight.jobs[0].reply_to_message_id == 30
+    app.coordinator.abort(flight)

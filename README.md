@@ -102,6 +102,8 @@ If several people request the same format at the same time, the bot downloads it
 
 A link posted in a topic is replaced with a video in that same topic. The bot does not move the conversation somewhere else.
 
+The same goes for replies: when a link is posted as a reply, the video is posted as a reply to the same message. If that message has been deleted in the meantime, the video is still posted.
+
 ### Self-hosted and under your control
 
 You run the bot on your own VPS:
@@ -129,8 +131,9 @@ This project is useful for:
 2. The bot marks it with 👀.
 3. The video is downloaded and posted silently.
 4. The caption keeps a link to the original source and the sender's name.
-5. After a successful upload, the original link is removed when the bot has permission.
-6. If something fails, the original message remains available.
+5. If the link was a reply, the video answers the same message.
+6. After a successful upload, the original link is removed when the bot has permission.
+7. If something fails, the original message remains available.
 
 For a one-time audio request, `/audio <link>` follows the same pipeline but extracts an MP3 and sends it through Telegram's native audio player. The bot chooses the highest standard bitrate from 192 to 32 kbps that fits the configured limit with safety headroom. If the duration is unknown or even 32 kbps cannot fit, the request fails safely instead of uploading an oversized file.
 

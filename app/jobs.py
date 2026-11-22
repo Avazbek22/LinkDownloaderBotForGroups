@@ -20,6 +20,7 @@ class Job:
     delete_original: bool
     runtime_revision: int = 0
     media_kind: MediaKind = "video"
+    reply_to_message_id: int | None = None
 
 
 @dataclass
