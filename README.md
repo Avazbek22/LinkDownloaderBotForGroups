@@ -228,9 +228,11 @@ Create a bot through [@BotFather](https://t.me/BotFather), then:
 2. Open **Group Privacy**.
 3. Disable Group Privacy.
 4. Add the bot to your Telegram group.
-5. Grant **Delete messages** permission when you want original links removed.
+5. Make the bot an administrator with the **Delete messages** permission.
 
-No other administrator rights are required.
+Without administrator rights the bot still downloads and posts videos, but Telegram does not send it reaction
+updates, so retrying with 👎, 🙈 or 😴 and cancelling with 👀 do not work. It also cannot remove original links or
+the mention message after an auto-download question. No other administrator rights are required.
 
 After startup, send:
 
