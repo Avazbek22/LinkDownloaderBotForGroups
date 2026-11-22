@@ -7,6 +7,7 @@ import pytest
 
 from app import download_backend
 from app.download_backend import (
+    DownloadCancelled,
     DownloadDeadlineExceeded,
     FormatPlan,
     InstagramContentRestrictedError,
@@ -1352,6 +1353,84 @@ def test_download_deadline_stops_fallback_after_progress_hook(monkeypatch, tmp_p
         )
 
     assert process_calls == 1
+
+
+def _youtube_video_metadata() -> MediaMetadata:
+    return MediaMetadata(
+        url="https://www.youtube.com/watch?v=video",
+        info={
+            "formats": [
+                {
+                    "format_id": "video",
+                    "ext": "mp4",
+                    "vcodec": "avc1",
+                    "acodec": "mp4a",
+                    "filesize": 4_000_000,
+                }
+            ]
+        },
+        media_key="youtube:video",
+        source_name="YouTube",
+    )
+
+
+def test_unwanted_download_stops_inside_the_attempt_and_tries_nothing_else(monkeypatch, tmp_path: Path) -> None:
+    unwanted = False
+    process_calls = 0
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def process_ie_result(self, *_args, **_kwargs):
+            nonlocal unwanted, process_calls
+            process_calls += 1
+            (tmp_path / "unwanted.mp4.part").write_bytes(b"partial")
+            unwanted = True
+            self.options["progress_hooks"][0]({})
+            raise AssertionError("the progress hook must stop the attempt")
+
+        def extract_info(self, *_args, **_kwargs):
+            raise AssertionError("a stopped download must not fall back to another client")
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", FakeYDL)
+
+    with pytest.raises(DownloadCancelled):
+        download_metadata(
+            _youtube_video_metadata(),
+            "unwanted",
+            tmp_path,
+            max_send_bytes=10_000_000,
+            concurrent_fragments=2,
+            should_stop=lambda: unwanted,
+        )
+
+    assert process_calls == 1
+    assert list(tmp_path.glob("unwanted.*")) == []
+
+
+def test_download_nobody_waits_for_never_starts(monkeypatch, tmp_path: Path) -> None:
+    class UnexpectedYDL:
+        def __init__(self, _options: dict) -> None:
+            raise AssertionError("yt-dlp must not start for an unwanted download")
+
+    monkeypatch.setattr(download_backend.yt_dlp, "YoutubeDL", UnexpectedYDL)
+
+    with pytest.raises(DownloadCancelled):
+        download_metadata(
+            _youtube_video_metadata(),
+            "unwanted",
+            tmp_path,
+            max_send_bytes=10_000_000,
+            concurrent_fragments=2,
+            should_stop=lambda: True,
+        )
 
 
 def test_rejects_audio_only_attempt_and_uses_next_candidate(monkeypatch, tmp_path: Path) -> None:

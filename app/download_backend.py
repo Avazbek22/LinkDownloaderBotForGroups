@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -63,6 +64,10 @@ class RequestedMediaNotFoundError(RuntimeError):
 
 class DownloadDeadlineExceeded(RuntimeError):
     """The configured end-to-end download deadline has elapsed."""
+
+
+class DownloadCancelled(RuntimeError):
+    """Nobody waits for the file any more, so the download was stopped."""
 
 
 _SOURCE_NAMES = {
@@ -920,6 +925,7 @@ def download_metadata(
     cookie_file: Path | None = None,
     deadline: float | None = None,
     media_kind: MediaKind = "video",
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     if media_kind not in {"video", "audio"}:
         raise ValueError(f"unsupported media kind: {media_kind}")
@@ -928,11 +934,17 @@ def download_metadata(
     is_youtube = is_youtube_url(metadata.url)
     is_instagram = is_instagram_url(metadata.url)
 
+    def ensure_running() -> None:
+        _check_deadline(deadline)
+        if should_stop is not None and should_stop():
+            raise DownloadCancelled("download is no longer wanted")
+
     def progress_hook(_status: dict[str, Any]) -> None:
         try:
-            _check_deadline(deadline)
-        except DownloadDeadlineExceeded:
-            raise yt_dlp.utils.DownloadError("download deadline exceeded") from None
+            ensure_running()
+        except (DownloadDeadlineExceeded, DownloadCancelled) as error:
+            # yt-dlp aborts an attempt only on its own error type; the cause is re-raised after cleanup.
+            raise yt_dlp.utils.DownloadError(str(error)) from None
 
     def extraction_options(
         *,
@@ -1011,7 +1023,7 @@ def download_metadata(
             )
         )
         for index, plan in enumerate(plans, start=1):
-            _check_deadline(deadline)
+            ensure_running()
             _remove_attempt_files(output_folder, out_prefix)
             LOG.info(
                 "trying media format phase=%s client=%s candidate=%s total=%s",
@@ -1043,7 +1055,7 @@ def download_metadata(
                     raise RuntimeError("downloaded file not found")
                 validator = _validate_downloaded_audio if media_kind == "audio" else _validate_downloaded_video
                 validator(path, max_send_bytes)
-                _check_deadline(deadline)
+                ensure_running()
                 return result
             except Exception as error:
                 _remove_attempt_files(output_folder, out_prefix)
@@ -1057,10 +1069,10 @@ def download_metadata(
                     type(error).__name__,
                     safe_error_for_log(error),
                 )
-                _check_deadline(deadline)
+                ensure_running()
         return None
 
-    _check_deadline(deadline)
+    ensure_running()
     result = try_info(
         metadata.info,
         phase="initial",
@@ -1074,7 +1086,7 @@ def download_metadata(
         # different extractor_args merely retries the same CDN URLs, so each
         # fallback client gets one fresh extraction and its own format plans.
         for player_client in _youtube_player_clients():
-            _check_deadline(deadline)
+            ensure_running()
             _remove_attempt_files(output_folder, out_prefix)
             try:
                 with yt_dlp.YoutubeDL(extraction_options(youtube_player_client=player_client)) as ydl:
@@ -1090,7 +1102,7 @@ def download_metadata(
                     type(error).__name__,
                     safe_error_for_log(error),
                 )
-                _check_deadline(deadline)
+                ensure_running()
                 continue
             result = try_info(
                 fresh_info,
@@ -1103,7 +1115,7 @@ def download_metadata(
     elif is_instagram:
         # Instagram is sensitive to duplicate requests, so retain only one
         # fallback extraction without browser impersonation.
-        _check_deadline(deadline)
+        ensure_running()
         _remove_attempt_files(output_folder, out_prefix)
         try:
             with yt_dlp.YoutubeDL(extraction_options(instagram_impersonate=False)) as ydl:
@@ -1121,10 +1133,10 @@ def download_metadata(
         except Exception as error:
             _raise_if_source_rate_limited(metadata.url, error)
             last_error = error
-            _check_deadline(deadline)
+            ensure_running()
 
     _remove_attempt_files(output_folder, out_prefix)
-    _check_deadline(deadline)
+    ensure_running()
     raise RuntimeError(f"no compatible {media_kind} format fits the configured size limit") from last_error
 
 
