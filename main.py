@@ -128,10 +128,6 @@ class BotApplication:
         self.cleanup_thread: threading.Thread | None = None
         self._register_handlers()
 
-    @property
-    def mention(self) -> str:
-        return f"@{self.bot_username}" if self.bot_username else "@bot"
-
     def initialize_identity(self) -> None:
         last_error: Exception | None = None
         for attempt in range(1, 6):
@@ -1094,7 +1090,7 @@ class BotApplication:
         language = self.storage.chat_language(chat_id)
         if private:
             return tr(language, "private_help", repo_url=html.escape(REPO_URL, quote=True))
-        return tr(language, "group_help", bot_mention=html.escape(self.mention, quote=False))
+        return tr(language, "group_help")
 
     @property
     def _approval_required(self) -> bool:

@@ -286,19 +286,24 @@ Language and group settings can be changed only by group administrators.
 
 ### Personal opt-out
 
-A member can disable automatic downloads only for themselves:
+A member can turn automatic downloads off only for themselves. They send a message that contains nothing but the
+bot's mention:
 
 ```text
-@BotName me
+@BotName
 ```
 
-or:
+The bot asks that member whether to turn auto-download of their links off (or back on, if it is already off), with
+**Yes** and **No** buttons:
 
-```text
-@BotName я
-```
+- only the member who was asked can answer; anyone else who presses a button gets a "This question isn't for you"
+  pop-up;
+- **Yes** applies the offered choice, briefly confirms it and removes the confirmation after 10 seconds;
+- **No** removes the question at once, and an unanswered question disappears after a minute;
+- the mention itself is deleted when the bot may delete messages, and a newer question replaces an older one.
 
-After opting out, that member can still request a download manually:
+A mention followed by any other words is ignored. While auto-download is off, that member can still request a
+download manually by mentioning the bot together with a link:
 
 ```text
 @BotName https://example.com/video
@@ -306,7 +311,7 @@ After opting out, that member can still request a download manually:
 
 An explicit `/audio <link>` request also works while that member's automatic video downloads are disabled.
 
-Other members are not affected.
+Other members are not affected. The choice is stored per group and survives restarts.
 
 ## Manual Docker installation
 

@@ -34,10 +34,10 @@ def test_error_summary_redacts_url_query_and_newlines() -> None:
 def test_group_help_is_split_into_matching_sections_in_every_language() -> None:
     sections = {}
     for language in ("en", "ru"):
-        text = tr(language, "group_help", bot_mention="@bot")
+        text = tr(language, "group_help")
         sections[language] = text.split("\n\n")
         assert all(part.strip() for part in sections[language])
-        for marker in ("/audio", "/skip", "/en", "/ru", "@bot", "👀", "🙈", "😴", "🤷", "👎", "👍"):
+        for marker in ("/audio", "/skip", "/en", "/ru", "👀", "🙈", "😴", "🤷", "👎", "👍"):
             assert marker in text
 
     assert len(sections["en"]) == len(sections["ru"]) == 6
