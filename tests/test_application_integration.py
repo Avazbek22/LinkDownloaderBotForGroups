@@ -5,8 +5,11 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import main
 from app.download_backend import (
+    DownloadCancelled,
     InstagramContentRestrictedError,
     MediaMetadata,
     RequestedMediaNotFoundError,
@@ -1562,4 +1565,319 @@ def test_reaction_retry_keeps_the_reply_target(tmp_path) -> None:
     assert flight is not None
     assert flight.jobs[0].job_id != "failed"
     assert flight.jobs[0].reply_to_message_id == 30
+    app.coordinator.abort(flight)
+
+
+def _sender_reaction(emoji: str = "👀", *, user_id: int = 7, old: tuple[str, ...] = ()) -> SimpleNamespace:
+    return _reaction_update(emoji, user_id=user_id, old=old)
+
+
+def _accepted_link(app: main.BotApplication, monkeypatch, **extra):
+    monkeypatch.setattr(main, "validate_public_url", lambda url: url)
+    app._handle_group_message(_group_link_message(**extra))
+    flight = app.queue.get_nowait()
+    assert flight is not None
+    return flight
+
+
+def _probe_returns_video(monkeypatch) -> None:
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: _video_metadata("https://example.com/video"))
+
+
+def _write_download(app: main.BotApplication, prefix: str) -> dict:
+    (app.settings.output_dir / f"{prefix}.mp4").write_bytes(b"video")
+    return {"id": "video"}
+
+
+def test_sender_eyes_cancel_a_queued_link_before_any_website_request(tmp_path, monkeypatch, caplog) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probed")))
+
+    with caplog.at_level("INFO", logger="link_downloader_bot.app"):
+        app._handle_reaction(_sender_reaction())
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+    assert fake.sends == []
+    assert fake.deletes == []
+    assert "job cancelled by sender" in caplog.text
+
+
+def test_eyes_from_anyone_but_the_sender_do_not_cancel(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    bot_update = _sender_reaction()
+    bot_update.user.is_bot = True
+
+    app._handle_reaction(_sender_reaction(user_id=99))
+    app._handle_reaction(bot_update)
+    app._handle_reaction(_sender_reaction("👍"))
+
+    assert [item[2] for item in fake.reactions] == ["👀"]
+    assert not app.coordinator.is_cancelled(flight.jobs[0])
+    app.coordinator.abort(flight)
+
+
+def test_cancel_during_probe_leaves_no_failure_reaction(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+
+    def probe_then_fail(*_args):
+        app._handle_reaction(_sender_reaction())
+        raise RuntimeError("extractor failed")
+
+    monkeypatch.setattr(main, "extract_metadata", probe_then_fail)
+
+    app._process_flight(flight)
+
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+    assert app._claim_failed_retry(_reaction_update("👎")) is None
+
+
+def test_cancel_after_probe_skips_the_download(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+
+    def probe_then_cancel(*_args):
+        app._handle_reaction(_sender_reaction())
+        return _video_metadata("https://example.com/video")
+
+    monkeypatch.setattr(main, "extract_metadata", probe_then_cancel)
+    monkeypatch.setattr(main, "download_metadata", lambda *_args, **_kwargs: pytest.fail("downloaded"))
+
+    app._process_flight(flight)
+
+    assert fake.sends == []
+    assert fake.deletes == []
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+
+
+def test_cancel_during_download_stops_it_and_keeps_the_link(tmp_path, monkeypatch, caplog) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    _probe_returns_video(monkeypatch)
+
+    def download(_metadata, _prefix, _folder, *, should_stop, **_kwargs):
+        assert not should_stop()
+        app._handle_reaction(_sender_reaction())
+        assert should_stop()
+        raise DownloadCancelled("download is no longer wanted")
+
+    monkeypatch.setattr(main, "download_metadata", download)
+
+    with caplog.at_level("INFO", logger="link_downloader_bot.app"):
+        app._process_flight(flight)
+
+    assert fake.sends == []
+    assert fake.deletes == []
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+    assert "download stopped because every request was cancelled" in caplog.text
+    assert app.coordinator.jobs_for_chat(-100) == []
+
+
+def test_one_sender_cancelling_a_shared_download_does_not_stop_it_for_others(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    cancelled = Job("cancelled", -100, None, 42, 7, url, url, "User", True)
+    kept = Job("kept", -200, None, 43, 8, url, url, "Other", True)
+    flight = app.coordinator.submit(cancelled)
+    assert flight is not None
+    assert app.coordinator.submit(kept) is None
+    _probe_returns_video(monkeypatch)
+
+    def download(_metadata, prefix, _folder, *, should_stop, **_kwargs):
+        app._handle_reaction(_sender_reaction())
+        assert not should_stop()
+        return _write_download(app, prefix)
+
+    monkeypatch.setattr(main, "download_metadata", download)
+
+    app._process_flight(flight)
+
+    assert [kwargs["chat_id"] for _video, kwargs in fake.sends] == [-200]
+    assert fake.deletes == [(-200, 43)]
+
+
+def test_link_joining_a_cancelled_download_keeps_it_running(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    flight = app.coordinator.submit(Job("cancelled", -100, None, 42, 7, url, url, "User", True))
+    assert flight is not None
+    _probe_returns_video(monkeypatch)
+
+    def download(_metadata, prefix, _folder, *, should_stop, **_kwargs):
+        app._handle_reaction(_sender_reaction())
+        assert should_stop()
+        assert app.coordinator.submit(Job("joined", -200, None, 43, 8, url, url, "Other", True)) is None
+        assert not should_stop()
+        return _write_download(app, prefix)
+
+    monkeypatch.setattr(main, "download_metadata", download)
+
+    app._process_flight(flight)
+
+    assert [kwargs["chat_id"] for _video, kwargs in fake.sends] == [-200]
+    assert fake.deletes == [(-200, 43)]
+
+
+def test_cancel_during_upload_withdraws_the_posted_video_and_keeps_the_link(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+
+    def upload_while_sender_cancels(*, video, **kwargs):
+        fake.sends.append((video, kwargs))
+        app._handle_reaction(_sender_reaction())
+        return SimpleNamespace(message_id=500, video=SimpleNamespace(file_id="telegram-file-id"))
+
+    fake.send_video = upload_while_sender_cancels
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    job = flight.jobs[0]
+    _probe_returns_video(monkeypatch)
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    assert len(fake.sends) == 1
+    assert fake.deletes == [(-100, 500)]
+    assert [item[2] for item in fake.reactions] == ["👀", None]
+    profile = main._media_cache_profile(job.url, job.media_kind, app.settings.max_filesize)
+    # The upload still feeds the cache, so the next request for this link is instant.
+    assert app.storage.get_cached_by_url(f"{job.url_key}|{profile}", 30) is not None
+
+
+def test_cancelled_job_in_a_shared_flight_gets_no_cached_copy(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    url = "https://example.com/video"
+    first = Job("first", -200, None, 43, 8, url, url, "Other", True)
+    second = Job("second", -100, None, 42, 7, url, url, "User", True)
+
+    def upload_while_second_sender_cancels(*, video, **kwargs):
+        fake.sends.append((video, kwargs))
+        if kwargs["chat_id"] == -200:
+            app._handle_reaction(_sender_reaction())
+        return SimpleNamespace(message_id=500, video=SimpleNamespace(file_id="telegram-file-id"))
+
+    fake.send_video = upload_while_second_sender_cancels
+    app.bot = fake
+    flight = app.coordinator.submit(first)
+    assert flight is not None
+    assert app.coordinator.submit(second) is None
+    _probe_returns_video(monkeypatch)
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    monkeypatch.setattr(main, "validate_public_url", lambda value: value)
+    monkeypatch.setattr(app, "_obtain_file", lambda *_args: video_path)
+
+    app._process_flight(flight)
+
+    assert [kwargs["chat_id"] for _video, kwargs in fake.sends] == [-200]
+    assert fake.deletes == [(-200, 43)]
+
+
+def test_eyes_after_delivery_change_nothing(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), delete_original=False))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    job = flight.jobs[0]
+
+    app._after_success(job, SimpleNamespace(message_id=500))
+    app._handle_reaction(_sender_reaction())
+    app.coordinator.abort(flight)
+    app._handle_reaction(_sender_reaction(old=("👀",)))
+
+    assert [item[2] for item in fake.reactions] == ["👀", "👍"]
+    assert fake.deletes == []
+    assert not app.coordinator.is_cancelled(job)
+
+
+def test_status_reaction_racing_a_cancel_never_outlives_it(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    job = flight.jobs[0]
+    original_set = fake.set_message_reaction
+
+    def cancel_while_reacting(chat_id, message_id, reaction, **kwargs):
+        result = original_set(chat_id, message_id, reaction, **kwargs)
+        if reaction and reaction[0].emoji == "🙈":
+            app.coordinator.cancel(-100, 42, 7)
+        return result
+
+    fake.set_message_reaction = cancel_while_reacting
+
+    app._after_instagram_restriction(job)
+
+    assert [item[2] for item in fake.reactions] == ["👀", "🙈", None]
+    assert app._claim_failed_retry(_reaction_update("🙈")) is None
+    app.coordinator.abort(flight)
+
+
+def test_sender_can_cancel_a_reaction_retry(tmp_path) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    url = "https://example.com/video"
+    app._after_failure(Job("failed", -100, None, 42, 7, url, url, "User", True))
+    app._handle_reaction(_reaction_update("👎", user_id=7))
+    flight = app.queue.get_nowait()
+    assert flight is not None
+
+    app._handle_reaction(_sender_reaction(old=("👎",)))
+    app._process_flight(flight)
+    app._handle_reaction(_reaction_update("👎", user_id=99))
+
+    assert [item[2] for item in fake.reactions] == ["👎", "👀", None]
+    assert app.queue.empty()
+
+
+def test_cancel_works_without_status_reactions(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(replace(_settings(tmp_path), status_reactions=False))
+    fake = FakeBot()
+    app.bot = fake
+    flight = _accepted_link(app, monkeypatch)
+    monkeypatch.setattr(main, "extract_metadata", lambda *_args: (_ for _ in ()).throw(AssertionError("probed")))
+
+    app._handle_reaction(_sender_reaction())
+    app._process_flight(flight)
+
+    assert fake.reactions == []
+    assert fake.sends == []
+    assert fake.deletes == []
+
+
+def test_paused_group_ignores_cancel_reactions(tmp_path, monkeypatch) -> None:
+    app = main.BotApplication(_settings(tmp_path))
+    fake = FakeBot()
+    app.bot = fake
+    app.group_registry.record_bootstrap_result(-100, title="Paused", chat_type="supergroup", telegram_status="member")
+    flight = _accepted_link(app, monkeypatch)
+    result, _group = app.group_registry.set_runtime_mode(-100, "soft", 42, expected_revision=0)
+    assert result == "changed"
+    reactions_before = list(fake.reactions)
+
+    app._handle_reaction(_sender_reaction())
+
+    assert fake.reactions == reactions_before
+    assert not app.coordinator.is_cancelled(flight.jobs[0])
     app.coordinator.abort(flight)

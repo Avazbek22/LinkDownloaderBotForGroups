@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +19,7 @@ import requests
 import telebot
 
 from app.download_backend import (
+    DownloadCancelled,
     InstagramContentRestrictedError,
     MediaMetadata,
     RequestedMediaNotFoundError,
@@ -49,6 +51,8 @@ from app.url_security import (
 REPO_URL = "https://github.com/Avazbek22/LinkDownloaderBotForGroups"
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 RETRYABLE_REACTIONS = frozenset({"👎", "🙈", "😴"})
+# The sender echoes the bot's processing reaction to stop their own link.
+CANCEL_REACTION = "👀"
 FAILED_RETRY_TTL_SECONDS = 7 * 24 * 60 * 60
 FAILED_RETRY_MAX_ITEMS = 1_000
 GROUP_NOTIFICATION_RETRY_SECONDS = 5 * 60
@@ -235,10 +239,13 @@ class BotApplication:
             self.group_registry.runtime_revision_for(job.chat_id) == job.runtime_revision
         )
 
+    def _job_wanted(self, job: Job) -> bool:
+        return not self.coordinator.is_cancelled(job) and self._job_access_allowed(job)
+
     def _filter_active_jobs(self, jobs: list[Job]) -> list[Job]:
         active: list[Job] = []
         for job in jobs:
-            if self._job_access_allowed(job):
+            if self._job_wanted(job):
                 active.append(job)
             else:
                 self._forget_failed_retry(job)
@@ -279,7 +286,7 @@ class BotApplication:
         )
 
     def _process_flight(self, flight: Flight) -> None:
-        first = next((job for job in flight.jobs if self._job_access_allowed(job)), None)
+        first = next((job for job in flight.jobs if self._job_wanted(job)), None)
         if first is None:
             self._clear_status_many(self.coordinator.abort(flight))
             return
@@ -412,27 +419,29 @@ class BotApplication:
                             file_id = None
                             if file_path is None:
                                 source_jobs = retry
-                                file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
+                                file_path = self._download_for(flight, retry, metadata, media_key, deadline)
                                 source_jobs = []
+                            if file_path is not None:
+                                file_id = self._send_from_file(
+                                    retry,
+                                    file_path,
+                                    metadata,
+                                    media_key,
+                                    {f"{key}|{cache_profile}" for key in flight.url_keys},
+                                )
+                    else:
+                        if file_path is None:
+                            source_jobs = batch
+                            file_path = self._download_for(flight, batch, metadata, media_key, deadline)
+                            source_jobs = []
+                        if file_path is not None:
                             file_id = self._send_from_file(
-                                retry,
+                                batch,
                                 file_path,
                                 metadata,
                                 media_key,
                                 {f"{key}|{cache_profile}" for key in flight.url_keys},
                             )
-                    else:
-                        if file_path is None:
-                            source_jobs = batch
-                            file_path = self._obtain_file(metadata, media_key, deadline, first.media_kind)
-                            source_jobs = []
-                        file_id = self._send_from_file(
-                            batch,
-                            file_path,
-                            metadata,
-                            media_key,
-                            {f"{key}|{cache_profile}" for key in flight.url_keys},
-                        )
                 if self.coordinator.finish_if_idle(flight):
                     break
         except SourceRateLimitedError as exc:
@@ -450,12 +459,32 @@ class BotApplication:
             time.monotonic() - started,
         )
 
+    def _download_for(
+        self,
+        flight: Flight,
+        jobs: list[Job],
+        metadata: MediaMetadata,
+        media_key: str,
+        deadline: float,
+    ) -> Path | None:
+        """Download the file for jobs, or return None once every sender waiting for it has cancelled."""
+
+        def nobody_waits() -> bool:
+            return not self.coordinator.wanted(flight, jobs)
+
+        try:
+            return self._obtain_file(metadata, media_key, deadline, flight.media_kind, nobody_waits)
+        except DownloadCancelled:
+            self.log.info("download stopped because every request was cancelled media_key=%s", media_key)
+            return None
+
     def _obtain_file(
         self,
         metadata: MediaMetadata,
         media_key: str,
         deadline: float,
         media_kind: MediaKind = "video",
+        should_stop: Callable[[], bool] | None = None,
     ) -> Path:
         cached = self.disk_cache.get(media_key)
         if cached is not None:
@@ -471,6 +500,7 @@ class BotApplication:
             cookie_file=self.settings.cookies_file,
             deadline=deadline,
             media_kind=media_kind,
+            should_stop=should_stop,
         )
         preferred_suffixes = (".mp3",) if media_kind == "audio" else (".mp4",)
         path = find_downloaded_file(
@@ -498,13 +528,13 @@ class BotApplication:
         media_key: str,
     ) -> list[Job]:
         for index, job in enumerate(jobs):
-            if not self._job_access_allowed(job):
+            if not self._job_wanted(job):
                 self._forget_failed_retry(job)
                 self._clear_status_reaction(job)
                 continue
             try:
-                self._send_media(job, file_id, metadata, upload=False)
-                self._after_success(job)
+                sent = self._send_media(job, file_id, metadata, upload=False)
+                self._after_success(job, sent)
             except Exception as exc:
                 if self._is_invalid_file_id(exc):
                     self.storage.remove_file_id(media_key)
@@ -524,16 +554,16 @@ class BotApplication:
     ) -> str | None:
         file_id: str | None = None
         for job in jobs:
-            if not self._job_access_allowed(job):
+            if not self._job_wanted(job):
                 self._forget_failed_retry(job)
                 self._clear_status_reaction(job)
                 continue
             try:
                 if file_id:
-                    self._send_media(job, file_id, metadata, upload=False)
+                    sent = self._send_media(job, file_id, metadata, upload=False)
                 else:
-                    response = self._send_media(job, path, metadata, upload=True)
-                    sent_media = getattr(response, job.media_kind, None)
+                    sent = self._send_media(job, path, metadata, upload=True)
+                    sent_media = getattr(sent, job.media_kind, None)
                     candidate = getattr(sent_media, "file_id", None)
                     if isinstance(candidate, str) and candidate:
                         file_id = candidate
@@ -545,7 +575,7 @@ class BotApplication:
                                 source_name=metadata.source_name,
                                 url_keys=url_keys,
                             )
-                self._after_success(job)
+                self._after_success(job, sent)
             except Exception as exc:
                 self._log_send_failure("media send failed", job, exc)
                 self._after_failure(job)
@@ -634,7 +664,10 @@ class BotApplication:
                 return self.bot.send_audio(audio=handle, timeout=self.settings.upload_timeout, **kwargs)
         return self.bot.send_audio(audio=audio, **kwargs)
 
-    def _after_success(self, job: Job) -> None:
+    def _after_success(self, job: Job, sent: Any = None) -> None:
+        if self.coordinator.settle(job):
+            self._withdraw_cancelled_delivery(job, sent)
+            return
         if not self._job_access_allowed(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
@@ -649,8 +682,22 @@ class BotApplication:
         if not self._set_status_reaction(job, "👍"):
             self._clear_status_reaction(job)
 
+    def _withdraw_cancelled_delivery(self, job: Job, sent: Any) -> None:
+        # The sender cancelled while the upload was already on its way to Telegram.
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int):
+            try:
+                self.bot.delete_message(job.chat_id, message_id)
+            except Exception:
+                self.log.warning(
+                    "cancelled delivery could not be removed job_id=%s chat_id=%s",
+                    job.job_id,
+                    job.chat_id,
+                )
+        self.log.info("delivery withdrawn after cancel job_id=%s chat_id=%s", job.job_id, job.chat_id)
+
     def _after_failure(self, job: Job) -> None:
-        if not self._job_access_allowed(job):
+        if self.coordinator.settle(job) or not self._job_access_allowed(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
             return
@@ -665,7 +712,7 @@ class BotApplication:
             self._after_failure(job)
 
     def _after_source_rate_limit(self, job: Job) -> None:
-        if not self._job_access_allowed(job):
+        if not self._job_wanted(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
             return
@@ -682,7 +729,7 @@ class BotApplication:
             self._after_source_rate_limit(job)
 
     def _after_instagram_restriction(self, job: Job) -> None:
-        if not self._job_access_allowed(job):
+        if not self._job_wanted(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
             return
@@ -697,7 +744,7 @@ class BotApplication:
             self._after_instagram_restriction(job)
 
     def _after_no_media(self, job: Job) -> None:
-        if not self._job_access_allowed(job):
+        if not self._job_wanted(job):
             self._forget_failed_retry(job)
             self._clear_status_reaction(job)
             return
@@ -819,6 +866,37 @@ class BotApplication:
             else:
                 self._clear_status_reaction(job)
 
+    def _handle_reaction(self, update: Any) -> None:
+        if not self._handle_cancel_reaction(update):
+            self._handle_retry_reaction(update)
+
+    def _handle_cancel_reaction(self, update: Any) -> bool:
+        """Stop a link whose sender echoed the bot's processing reaction; return whether it was handled."""
+        chat = getattr(update, "chat", None)
+        user = getattr(update, "user", None)
+        if getattr(chat, "type", "") not in {"group", "supergroup"}:
+            return False
+        if user is None or getattr(user, "is_bot", False):
+            return False
+        added = self._reaction_emojis(getattr(update, "new_reaction", None)) - self._reaction_emojis(
+            getattr(update, "old_reaction", None)
+        )
+        if CANCEL_REACTION not in added:
+            return False
+        try:
+            chat_id, message_id, user_id = int(chat.id), int(update.message_id), int(user.id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if not self._record_group_access(chat):
+            return True
+        job = self.coordinator.cancel(chat_id, message_id, user_id)
+        if job is None:
+            return False
+        self._forget_failed_retry(job)
+        self._remove_status_reaction(job)
+        self.log.info("job cancelled by sender job_id=%s chat_id=%s", job.job_id, job.chat_id)
+        return True
+
     def _handle_retry_reaction(self, update: Any) -> None:
         failed = self._claim_failed_retry(update)
         if failed is None:
@@ -867,7 +945,7 @@ class BotApplication:
             )
 
     def _set_status_reaction(self, job: Job, emoji: str) -> bool:
-        if not self.settings.status_reactions or not self._job_access_allowed(job):
+        if not self.settings.status_reactions or not self._job_wanted(job):
             return False
         method = getattr(self.bot, "set_message_reaction", None)
         if method is None:
@@ -879,7 +957,6 @@ class BotApplication:
                 [telebot.types.ReactionTypeEmoji(emoji=emoji)],
                 is_big=False,
             )
-            return True
         except Exception as exc:
             # Reactions may be disabled or restricted per chat. They are only
             # a best-effort status hint and must never affect the download.
@@ -890,8 +967,18 @@ class BotApplication:
                 type(exc).__name__,
             )
             return False
+        if self.coordinator.is_cancelled(job):
+            # The cancel landed while this reaction was on its way, so it must not outlive the cancel.
+            self._remove_status_reaction(job)
+            return False
+        return True
 
     def _clear_status_reaction(self, job: Job) -> None:
+        # Cancelling already removed this job's reaction; later stages must not repeat the call.
+        if not self.coordinator.is_cancelled(job):
+            self._remove_status_reaction(job)
+
+    def _remove_status_reaction(self, job: Job) -> None:
         if not self.settings.status_reactions:
             return
         method = getattr(self.bot, "set_message_reaction", None)
@@ -2099,8 +2186,8 @@ class BotApplication:
             self._handle_group_management_callback(call)
 
         @bot.message_reaction_handler(func=lambda _update: True)
-        def retry_reaction(update: Any) -> None:
-            self._handle_retry_reaction(update)
+        def reaction_changed(update: Any) -> None:
+            self._handle_reaction(update)
 
         @bot.message_handler(content_types=["new_chat_members"])
         def new_members(message: Any) -> None:
